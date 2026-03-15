@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 
+// Shared trigger schema and CEL evaluation helpers live in this crate.
+
 /// Represents a monitoring event from the host.
 /// This is a generic event struct - concrete event types (schemas, validation)
 /// are defined on the application side.
