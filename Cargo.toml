@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "remi-client-sdk",
+    "remi-things-crdt",
+    "rule-trigger-engine",
+]
+resolver = "2"
+
+[profile.dev.package.automerge]
+opt-level = 3
+
+[profile.test.package.automerge]
+opt-level = 3
