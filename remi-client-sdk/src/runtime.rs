@@ -1,5 +1,6 @@
 use crate::context_prompt;
 use crate::events_events::EventsEvent;
+use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
 use crate::storage::Storage;
 use crate::things_crdt::{
     ThingCollectionEntry, ThingCollectionUpsert, ThingEntry, ThingUpsert, ThingsSnapshot,
@@ -7,12 +8,13 @@ use crate::things_crdt::{
 use crate::things_events::ThingsEvent;
 use crate::trigger_events::TriggerEvent;
 use crate::types::{
-    EventPayload, NotificationEntry, NotificationGroup, NotificationSource, StoredTrigger,
+    EventPayload, NotificationSource, StoredTrigger,
     ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
     ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption,
     TriggerExecutionSummary, TriggerInfo, TriggerLogLevel, TriggerRegistration,
     TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
+use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
 use croner::Cron;
@@ -61,6 +63,7 @@ pub struct TriggerSdk {
     things_event_tx: broadcast::Sender<ThingsEvent>,
     trigger_event_tx: broadcast::Sender<TriggerEvent>,
     events_event_tx: broadcast::Sender<EventsEvent>,
+    realtime: Arc<SupabaseRealtimeManager>,
 }
 
 impl TriggerSdk {
@@ -74,6 +77,7 @@ impl TriggerSdk {
             things_event_tx,
             trigger_event_tx,
             events_event_tx,
+            realtime: Arc::new(SupabaseRealtimeManager::new()),
         })
     }
 
@@ -87,6 +91,14 @@ impl TriggerSdk {
 
     pub fn events_subscribe(&self) -> broadcast::Receiver<EventsEvent> {
         self.events_event_tx.subscribe()
+    }
+
+    pub fn realtime_manager(&self) -> Arc<SupabaseRealtimeManager> {
+        self.realtime.clone()
+    }
+
+    pub fn realtime_subscribe(&self) -> broadcast::Receiver<RemiRealtimeEvent> {
+        self.realtime.subscribe()
     }
 
     pub(crate) fn emit_things_event(&self, event: ThingsEvent) {

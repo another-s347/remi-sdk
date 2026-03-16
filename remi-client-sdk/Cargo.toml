@@ -23,8 +23,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "sync", "time", "net", "fs"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+url = "2"
 urlencoding = "2.1"
 tonic = { version = "0.14", features = ["transport"] }
 tonic_conn = { git = "https://github.com/another-s347/decenet.git", rev = "d37d9a6cb9319f3cd8979555bc21498f1f914b40" }

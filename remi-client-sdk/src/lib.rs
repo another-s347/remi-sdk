@@ -13,6 +13,7 @@ mod local_wasm;
 pub mod location_service;
 pub mod profile;
 pub mod push_tokens;
+pub mod realtime;
 pub mod remi_uri;
 mod runtime;
 #[cfg(feature = "sentry-integration")]
@@ -48,6 +49,7 @@ pub use location_service::{
     LocationService, LocationServiceError, haversine_distance, is_within_range,
 };
 pub use profile::{AvatarUploadInfo, MediaUploadInfo, ProfileClient, ProfileInfo};
+pub use realtime::{RealtimeConfig, RemiRealtimeEvent, SupabaseRealtimeManager};
 pub use remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 pub use runtime::{NotificationCallback, TriggerCallback, TriggerSdk};
 pub use things_client::ThingsClient;
