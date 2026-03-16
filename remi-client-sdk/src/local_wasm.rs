@@ -116,6 +116,9 @@ async fn loop_input_from_start(
         temperature: None,
         max_tokens: None,
         metadata,
+        message_metadata: None,
+        user_name: None,
+        user_state: None,
     })
 }
 
@@ -149,7 +152,9 @@ async fn history_message_from_proto(
         content: content_from_proto(message.content, message.content_parts).await?,
         tool_calls: tool_calls_from_proto(&message.tool_calls)?,
         tool_call_id: trim_to_option(message.tool_call_id),
+        name: None,
         reasoning_content: trim_to_option(message.reasoning_content),
+        metadata: None,
     })
 }
 
