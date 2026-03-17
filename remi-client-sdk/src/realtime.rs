@@ -225,7 +225,9 @@ async fn run_single_connection(
     let topic = format!("realtime:user:{}:events", session.user_id);
     let join_ref = "1".to_string();
     let mut next_ref = 2_u64;
-    let mut current_token = session.jwt.clone();
+    let mut current_token = crate::auth::auth_get_access_token()
+        .await
+        .unwrap_or_else(|| session.jwt.clone());
 
     send_frame(
         &mut writer,

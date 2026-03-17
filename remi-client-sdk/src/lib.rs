@@ -34,7 +34,7 @@ pub mod uri_resolver;
 pub mod url_handlers;
 
 pub use app_keys_client::AppKeysClient;
-pub use auth::{AuthClient, AuthCredentials, SdkBearerAuthMode};
+pub use auth::{AuthClient, AuthCredentials, SecureSessionStore, SdkBearerAuthMode};
 pub use chat_client::{
     ChatClient, ChatHistoryMessage, ChatInputMessage, ChatStreamEvent, ChatToolCall,
     ChatToolCallOutcome, chat_request, chat_stream_event,

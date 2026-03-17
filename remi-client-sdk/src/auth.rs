@@ -1,5 +1,6 @@
 use anyhow::Result;
 use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -36,6 +37,13 @@ pub enum SdkBearerAuthMode {
     AppKey,
 }
 
+/// Platform-provided secure persistence for SDK-managed auth sessions.
+pub trait SecureSessionStore: Send + Sync {
+    fn load_session(&self) -> Result<Option<AuthCredentials>, String>;
+    fn save_session(&self, credentials: &AuthCredentials) -> Result<(), String>;
+    fn clear_session(&self) -> Result<(), String>;
+}
+
 /// Authentication client for user login/logout
 #[derive(Clone)]
 pub struct AuthClient {
@@ -50,7 +58,7 @@ struct AuthClientState {
 }
 
 /// Stored authentication credentials
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthCredentials {
     pub access_token: String,
     pub refresh_token: String,
@@ -97,6 +105,51 @@ fn should_force_local_logout_after_error(message: &str) -> bool {
         "expired jwt",
         "token is expired",
         "signature has expired",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn should_complete_local_logout_after_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "operation is not implemented or not supported",
+        "operation not implemented",
+        "not implemented or not supported",
+        "unimplemented",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn should_clear_session_after_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "refresh_token_already_used",
+        "invalid refresh token",
+        "refresh token: already used",
+        "invalidjwttoken",
+        "token has expired",
+        "jwt expired",
+        "expired jwt",
+        "token is expired",
+        "signature has expired",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn should_defer_restore_validation_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "operation is not implemented or not supported",
+        "operation not implemented",
+        "not implemented or not supported",
+        "not implemented",
+        "unimplemented",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -200,7 +253,10 @@ impl AuthClient {
             expires_in: login_response.expires_in,
             expires_at_unix_ms: compute_expires_at_unix_ms(login_response.expires_in),
         };
-        *self.credentials.write().await = Some(credentials);
+        *self.credentials.write().await = Some(credentials.clone());
+        persist_credentials_to_store(&credentials)
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         Ok(login_response)
     }
@@ -227,7 +283,10 @@ impl AuthClient {
                 expires_in: signup_response.expires_in,
                 expires_at_unix_ms: compute_expires_at_unix_ms(signup_response.expires_in),
             };
-            *self.credentials.write().await = Some(credentials);
+            *self.credentials.write().await = Some(credentials.clone());
+            persist_credentials_to_store(&credentials)
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
         }
 
         Ok(signup_response)
@@ -246,10 +305,27 @@ impl AuthClient {
         match self.logout_with_access_token(access_token).await {
             Ok(response) => {
                 self.clear_credentials().await;
+                clear_credentials_from_store()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err))?;
                 Ok(response)
             }
             Err(logout_err) => {
-                if !should_force_local_logout_after_error(&logout_err.to_string()) {
+                let logout_message = logout_err.to_string();
+
+                if should_complete_local_logout_after_error(&logout_message) {
+                    tracing::warn!(
+                        error = %logout_err,
+                        "Remote logout is not supported by the current backend; clearing local session only",
+                    );
+                    self.clear_credentials().await;
+                    clear_credentials_from_store()
+                        .await
+                        .map_err(|err| anyhow::anyhow!(err))?;
+                    return Ok(local_logout_response());
+                }
+
+                if !should_force_local_logout_after_error(&logout_message) {
                     return Err(logout_err);
                 }
 
@@ -275,6 +351,9 @@ impl AuthClient {
                 match retry_result {
                     Ok(response) => {
                         self.clear_credentials().await;
+                        clear_credentials_from_store()
+                            .await
+                            .map_err(|err| anyhow::anyhow!(err))?;
                         Ok(response)
                     }
                     Err(retry_err) => {
@@ -283,6 +362,9 @@ impl AuthClient {
                             "Remote logout could not be completed after session expiry; clearing local session only",
                         );
                         self.clear_credentials().await;
+                        clear_credentials_from_store()
+                            .await
+                            .map_err(|err| anyhow::anyhow!(err))?;
                         Ok(local_logout_response())
                     }
                 }
@@ -310,12 +392,22 @@ impl AuthClient {
 
         // Update stored credentials
         let mut creds = self.credentials.write().await;
+        let mut persisted_credentials = None;
         if let Some(credentials) = creds.as_mut() {
             credentials.access_token = refresh_response.access_token.clone();
             credentials.refresh_token = refresh_response.refresh_token.clone();
             credentials.expires_in = refresh_response.expires_in;
             credentials.expires_at_unix_ms =
                 compute_expires_at_unix_ms(refresh_response.expires_in);
+            persisted_credentials = Some(credentials.clone());
+        }
+
+        drop(creds);
+
+        if let Some(credentials) = persisted_credentials.as_ref() {
+            persist_credentials_to_store(credentials)
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
         }
 
         Ok(refresh_response)
@@ -400,12 +492,18 @@ impl AuthClient {
             expires_in,
             expires_at_unix_ms,
         };
-        *self.credentials.write().await = Some(credentials);
+        *self.credentials.write().await = Some(credentials.clone());
+
+        if let Err(error) = persist_credentials_to_store(&credentials).await {
+            tracing::warn!(%error, "Failed to persist restored auth credentials");
+        }
     }
 }
 
 static AUTH_CLIENT: OnceCell<Arc<RwLock<Option<Arc<AuthClient>>>>> = OnceCell::new();
 static CURRENT_APP_KEY: OnceCell<Arc<RwLock<Option<String>>>> = OnceCell::new();
+static SECURE_SESSION_STORE: OnceCell<Arc<RwLock<Option<Arc<dyn SecureSessionStore>>>>> =
+    OnceCell::new();
 
 fn auth_client_store() -> &'static Arc<RwLock<Option<Arc<AuthClient>>>> {
     AUTH_CLIENT.get_or_init(|| Arc::new(RwLock::new(None)))
@@ -413,6 +511,31 @@ fn auth_client_store() -> &'static Arc<RwLock<Option<Arc<AuthClient>>>> {
 
 fn app_key_store() -> &'static Arc<RwLock<Option<String>>> {
     CURRENT_APP_KEY.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+fn secure_session_store() -> &'static Arc<RwLock<Option<Arc<dyn SecureSessionStore>>>> {
+    SECURE_SESSION_STORE.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+async fn current_secure_session_store() -> Option<Arc<dyn SecureSessionStore>> {
+    let guard = secure_session_store().read().await;
+    guard.clone()
+}
+
+async fn persist_credentials_to_store(credentials: &AuthCredentials) -> Result<(), String> {
+    if let Some(store) = current_secure_session_store().await {
+        store.save_session(credentials)?;
+    }
+
+    Ok(())
+}
+
+async fn clear_credentials_from_store() -> Result<(), String> {
+    if let Some(store) = current_secure_session_store().await {
+        store.clear_session()?;
+    }
+
+    Ok(())
 }
 
 async fn get_auth_client() -> Result<Arc<AuthClient>, String> {
@@ -423,6 +546,27 @@ async fn get_auth_client() -> Result<Arc<AuthClient>, String> {
         .ok_or_else(|| "Auth client is not configured".to_string())
 }
 
+pub async fn auth_set_secure_session_store(
+    store: Arc<dyn SecureSessionStore>,
+) -> Result<(), String> {
+    let mut guard = secure_session_store().write().await;
+    guard.replace(store);
+    drop(guard);
+
+    if auth_client_store().read().await.is_some() {
+        if let Err(error) = auth_restore_persisted_session().await {
+            tracing::warn!(%error, "Failed to restore persisted auth session after registering secure session store");
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn auth_clear_secure_session_store() {
+    let mut guard = secure_session_store().write().await;
+    guard.take();
+}
+
 pub async fn configure_auth_client(config_json: String) -> Result<(), String> {
     tracing::info!("[auth] configure_auth_client: creating new AuthClient + shared transport");
     let transport = configure_shared_transport(&config_json).await?;
@@ -430,6 +574,12 @@ pub async fn configure_auth_client(config_json: String) -> Result<(), String> {
 
     let mut guard = auth_client_store().write().await;
     guard.replace(client);
+    drop(guard);
+
+    if let Err(error) = auth_restore_persisted_session().await {
+        tracing::warn!(%error, "Failed to restore persisted auth session after configuring auth client");
+    }
+
     tracing::info!("[auth] configure_auth_client: done");
     Ok(())
 }
@@ -450,6 +600,62 @@ pub async fn auth_logout() -> Result<LogoutResponse, String> {
 pub async fn auth_refresh_token() -> Result<RefreshTokenResponse, String> {
     let client = get_auth_client().await?;
     client.refresh_token().await.map_err(|err| err.to_string())
+}
+
+pub async fn auth_clear_local_session() -> Result<(), String> {
+    if let Ok(client) = get_auth_client().await {
+        client.clear_credentials().await;
+    }
+
+    clear_credentials_from_store().await
+}
+
+pub async fn auth_get_credentials() -> Option<AuthCredentials> {
+    let client = get_auth_client().await.ok()?;
+    client.get_credentials().await
+}
+
+pub async fn auth_restore_persisted_session() -> Result<Option<AuthCredentials>, String> {
+    let Some(store) = current_secure_session_store().await else {
+        return Ok(None);
+    };
+
+    let Some(credentials) = store.load_session()? else {
+        return Ok(None);
+    };
+
+    let client = get_auth_client().await?;
+    client
+        .restore_credentials(
+            credentials.access_token,
+            credentials.refresh_token,
+            credentials.user_id,
+            credentials.expires_in,
+            credentials.expires_at_unix_ms,
+        )
+        .await;
+
+    match client.get_access_token_auto_refresh().await {
+        Ok(_) => Ok(client.get_credentials().await),
+        Err(error) => {
+            let message = error.to_string();
+            if should_clear_session_after_error(&message) {
+                client.clear_credentials().await;
+                clear_credentials_from_store().await?;
+                return Ok(None);
+            }
+
+            if should_defer_restore_validation_error(&message) {
+                tracing::info!(
+                    %message,
+                    "Deferring persisted auth session validation until the backend supports token refresh"
+                );
+                return Ok(client.get_credentials().await);
+            }
+
+            Err(message)
+        }
+    }
 }
 
 pub fn auth_is_app_key(token: &str) -> bool {
@@ -596,10 +802,37 @@ pub async fn auth_restore_credentials(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
     use super::{
-        auth_is_app_key, resolve_bearer_token_value, resolve_user_access_token_value,
+        AuthCredentials, SecureSessionStore, auth_clear_secure_session_store,
+        auth_is_app_key, auth_set_secure_session_store, clear_credentials_from_store,
+        persist_credentials_to_store, resolve_bearer_token_value,
+        resolve_user_access_token_value, should_clear_session_after_error,
+        should_complete_local_logout_after_error, should_defer_restore_validation_error,
         should_force_local_logout_after_error,
     };
+
+    #[derive(Default)]
+    struct TestSessionStore {
+        state: StdMutex<Option<AuthCredentials>>,
+    }
+
+    impl SecureSessionStore for TestSessionStore {
+        fn load_session(&self) -> Result<Option<AuthCredentials>, String> {
+            Ok(self.state.lock().unwrap().clone())
+        }
+
+        fn save_session(&self, credentials: &AuthCredentials) -> Result<(), String> {
+            *self.state.lock().unwrap() = Some(credentials.clone());
+            Ok(())
+        }
+
+        fn clear_session(&self) -> Result<(), String> {
+            *self.state.lock().unwrap() = None;
+            Ok(())
+        }
+    }
 
     #[test]
     fn resolves_bearer_token_with_expected_precedence() {
@@ -666,5 +899,71 @@ mod tests {
         assert!(!should_force_local_logout_after_error(
             "transport error: connection refused",
         ));
+    }
+
+    #[test]
+    fn stale_refresh_token_errors_clear_session() {
+        assert!(should_clear_session_after_error(
+            "Supabase refresh failed: 400 Bad Request - {\"error_code\":\"refresh_token_already_used\"}",
+        ));
+        assert!(should_clear_session_after_error(
+            "Supabase refresh failed: invalid refresh token",
+        ));
+    }
+
+    #[test]
+    fn unsupported_restore_validation_errors_are_deferred() {
+        assert!(should_defer_restore_validation_error(
+            "status: Unimplemented, message: \"Operation is not implemented or not supported\"",
+        ));
+        assert!(should_defer_restore_validation_error(
+            "code: 'Operation is not implemented or not supported'",
+        ));
+    }
+
+    #[test]
+    fn unsupported_logout_errors_fall_back_to_local_logout() {
+        assert!(should_complete_local_logout_after_error(
+            "status: Unimplemented, message: \"Operation is not implemented or not supported\"",
+        ));
+        assert!(should_complete_local_logout_after_error(
+            "code: 'Operation is not implemented or not supported'",
+        ));
+    }
+
+    #[tokio::test]
+    async fn secure_session_store_persists_and_clears_credentials() {
+        auth_clear_secure_session_store().await;
+
+        let store = Arc::new(TestSessionStore::default());
+        auth_set_secure_session_store(store.clone())
+            .await
+            .expect("store registration should succeed");
+
+        let credentials = AuthCredentials {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            user_id: "user-1".to_string(),
+            expires_in: 3600,
+            expires_at_unix_ms: 123456,
+        };
+
+        persist_credentials_to_store(&credentials)
+            .await
+            .expect("credentials should persist");
+        assert_eq!(
+            store.load_session().expect("store load should succeed"),
+            Some(credentials)
+        );
+
+        clear_credentials_from_store()
+            .await
+            .expect("clearing store should succeed");
+        assert_eq!(
+            store.load_session().expect("store load should succeed"),
+            None
+        );
+
+        auth_clear_secure_session_store().await;
     }
 }

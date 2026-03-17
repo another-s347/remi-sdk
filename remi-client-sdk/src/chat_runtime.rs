@@ -402,8 +402,11 @@ async fn open_chat_stream(
 ) -> Result<ChatEventStream, String> {
     match backend {
         ChatExecutionBackend::RemoteSharedTransport => {
+            let current_access_token = crate::auth::auth_get_access_token()
+                .await
+                .unwrap_or_else(|| access_token.to_string());
             tracing::info!(session_id = %session_id, "[ChatRuntime] creating ChatClient via shared transport");
-            let mut client = ChatClient::new_with_shared_transport(access_token)
+            let mut client = ChatClient::new_with_shared_transport(current_access_token)
                 .await
                 .map_err(|e| {
                     tracing::error!(session_id = %session_id, error = %e, "[ChatRuntime] failed to create ChatClient");
