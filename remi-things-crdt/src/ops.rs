@@ -228,6 +228,10 @@ fn set_tombstone(doc: &mut AutoCommit, entity_obj: &ObjId, actor: &str) -> Resul
     Ok(())
 }
 
+fn clear_tombstone(doc: &mut AutoCommit, entity_obj: &ObjId) {
+    let _ = doc.delete(entity_obj, "tombstone");
+}
+
 fn apply_trigger_update(
     doc: &mut AutoCommit,
     entity_obj: &ObjId,
@@ -282,6 +286,7 @@ fn upsert_collection(
     let _ = ensure_map_key(doc, &obj, "edit_clock");
 
     bump_entity_clock(doc, &obj, actor)?;
+    clear_tombstone(doc, &obj);
 
     if let Some(t) = title {
         put_string(doc, &obj, "title", t)?;
@@ -388,6 +393,7 @@ fn upsert_thing(
     let _ = ensure_map_key(doc, &obj, "edit_clock");
 
     bump_entity_clock(doc, &obj, actor)?;
+    clear_tombstone(doc, &obj);
 
     put_string(doc, &obj, "collection_id", collection_id)?;
     if let Some(dt) = datatype {
@@ -926,6 +932,7 @@ pub fn apply_collection_op(
         } => {
             let meta_obj = ensure_map_key(&mut doc, &automerge::ROOT, Schema::KEY_META)?;
             bump_entity_clock(&mut doc, &meta_obj, actor)?;
+            clear_tombstone(&mut doc, &meta_obj);
 
             if let Some(t) = title {
                 put_string(&mut doc, &meta_obj, "title", &t)?;
@@ -971,6 +978,7 @@ pub fn apply_collection_op(
             let _ = ensure_map_key(&mut doc, &thing_obj, "edit_clock");
 
             bump_entity_clock(&mut doc, &thing_obj, actor)?;
+            clear_tombstone(&mut doc, &thing_obj);
 
             if let Some(dt) = datatype {
                 put_string(&mut doc, &thing_obj, "datatype", dt.as_str())?;

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use automerge::{AutoCommit, ReadDoc, Value as AmValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use remi_things_crdt::{
     CURRENT_SCHEMA_VERSION, CrdtDataType, Content, Op, Schema, ThingDatatype, TriggerUpdate,
@@ -600,7 +600,35 @@ impl ThingsDocumentSet {
             .documents
             .keys()
             .filter(|k| k.data_type == CrdtDataType::Collection && !root_uuids.contains(k.uuid.as_str()))
-            .map(|k| k.uuid.clone())
+            .filter_map(|k| {
+                match self.collection_view(&k.uuid) {
+                    Ok(view)
+                        if !view
+                            .meta
+                            .tombstone
+                            .as_ref()
+                            .map(|t| t.deleted)
+                            .unwrap_or(false) =>
+                    {
+                        Some(k.uuid.clone())
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            collection_uuid = k.uuid.as_str(),
+                            "repair_root_collection_linkage: skipping tombstoned collection"
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            collection_uuid = k.uuid.as_str(),
+                            error = %err,
+                            "repair_root_collection_linkage: failed to inspect collection, skipping relink"
+                        );
+                        None
+                    }
+                }
+            })
             .collect();
 
         if orphaned_colls.is_empty() {
@@ -616,6 +644,73 @@ impl ThingsDocumentSet {
         }
 
         Ok(orphaned_colls.len())
+    }
+
+    /// Return collection UUIDs that are still live and reachable from the root document.
+    pub fn live_collection_uuids_from_root(&self) -> Result<HashSet<String>> {
+        let root_view = self.root_view()?;
+        let mut live = HashSet::new();
+
+        for coll_uuid in root_view.collection_uuids {
+            let key = DocumentKey::collection(&coll_uuid);
+            match self.documents.get(&key) {
+                Some(_) => {
+                    let deleted = self
+                        .collection_view(&coll_uuid)?
+                        .meta
+                        .tombstone
+                        .as_ref()
+                        .map(|t| t.deleted)
+                        .unwrap_or(false);
+                    if !deleted {
+                        live.insert(coll_uuid);
+                    }
+                }
+                None => {
+                    // Root still references it; keep it reachable so Phase 2 can pull it.
+                    live.insert(coll_uuid);
+                }
+            }
+        }
+
+        Ok(live)
+    }
+
+    /// Return thing UUIDs that are still reachable through live collections.
+    pub fn live_thing_uuids_from_root(&self) -> Result<HashSet<String>> {
+        let live_collections = self.live_collection_uuids_from_root()?;
+        let mut live_things = HashSet::new();
+
+        for coll_uuid in &live_collections {
+            let key = DocumentKey::collection(coll_uuid);
+            let Some(state) = self.documents.get(&key) else {
+                continue;
+            };
+
+            let view = extract_collection_doc_view(&state.automerge_doc, coll_uuid)?;
+            if view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            for thing in &view.things {
+                if !thing
+                    .tombstone
+                    .as_ref()
+                    .map(|t| t.deleted)
+                    .unwrap_or(false)
+                {
+                    live_things.insert(thing.id.clone());
+                }
+            }
+        }
+
+        Ok(live_things)
     }
 
     // ===== V3 Compaction =====
@@ -818,6 +913,27 @@ impl ThingsDocumentSet {
             },
         )?;
         state.dirty = true;
+        Ok(())
+    }
+
+    /// Delete a collection by tombstoning its collection document and removing
+    /// the root reference. Child things become unreachable through the deleted
+    /// collection and are pruned from snapshots without deleting their docs.
+    pub fn delete_collection(&mut self, collection_uuid: &str) -> Result<()> {
+        self.get_or_init_collection(collection_uuid)?;
+
+        let key = DocumentKey::collection(collection_uuid);
+        let state = self.documents.get_mut(&key).unwrap();
+
+        state.automerge_doc = apply_collection_op(
+            &state.automerge_doc,
+            &self.device_id,
+            collection_uuid,
+            CollectionOp::Delete,
+        )?;
+        state.dirty = true;
+
+        self.remove_collection(collection_uuid)?;
         Ok(())
     }
 
@@ -1247,6 +1363,111 @@ mod tests_v3 {
         assert_eq!(snapshot.collections[0].title, "My Collection");
         assert_eq!(snapshot.things.len(), 1);
         assert_eq!(snapshot.things[0].title, "Task 1");
+    }
+
+    #[test]
+    fn test_deleted_collection_is_not_relinked_to_root() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+        docs.get_or_init_collection("coll-1").unwrap();
+        docs.update_collection_meta(
+            "coll-1",
+            Some("My Collection".to_string()),
+            None,
+            TriggerUpdate::Noop,
+        )
+        .unwrap();
+        docs.upsert_thing_meta(
+            "coll-1",
+            "thing-1",
+            Some(ThingDatatype::Markdown),
+            Some("none".to_string()),
+            Some("Task 1".to_string()),
+            None,
+            TriggerUpdate::Noop,
+        )
+        .unwrap();
+        docs.set_thing_content(
+            "thing-1",
+            Content::Markdown {
+                blocks: vec![remi_things_crdt::Block {
+                    id: "main".to_string(),
+                    r#type: "markdown".to_string(),
+                    attrs_json: None,
+                    text: Some("hello".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+
+        docs.delete_collection("coll-1").unwrap();
+
+        let root = docs.root_view().unwrap();
+        assert!(!root.collection_uuids.contains(&"coll-1".to_string()));
+
+        let coll = docs.collection_view("coll-1").unwrap();
+        assert!(
+            coll.meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false)
+        );
+        assert!(docs.get(&DocumentKey::collection("coll-1")).is_some());
+        assert!(docs.get(&DocumentKey::thing_markdown("thing-1")).is_some());
+
+        let repaired = docs.repair_root_collection_linkage().unwrap();
+        assert_eq!(repaired, 0);
+
+        let snapshot = docs
+            .extract_snapshot_with_options(SnapshotOptions {
+                include_content: false,
+            })
+            .unwrap();
+        assert!(snapshot.collections.is_empty());
+        assert!(snapshot.things.is_empty());
+    }
+
+    #[test]
+    fn test_live_reachability_skips_deleted_entities() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+        docs.get_or_init_collection("coll-1").unwrap();
+        docs.upsert_thing_meta(
+            "coll-1",
+            "thing-1",
+            Some(ThingDatatype::Markdown),
+            Some("none".to_string()),
+            Some("Task 1".to_string()),
+            None,
+            TriggerUpdate::Noop,
+        )
+        .unwrap();
+        docs.set_thing_content(
+            "thing-1",
+            Content::Markdown {
+                blocks: vec![remi_things_crdt::Block {
+                    id: "main".to_string(),
+                    r#type: "markdown".to_string(),
+                    attrs_json: None,
+                    text: Some("hello".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+
+        let live_collections = docs.live_collection_uuids_from_root().unwrap();
+        let live_things = docs.live_thing_uuids_from_root().unwrap();
+        assert!(live_collections.contains("coll-1"));
+        assert!(live_things.contains("thing-1"));
+
+        docs.delete_thing("coll-1", "thing-1").unwrap();
+        let live_things = docs.live_thing_uuids_from_root().unwrap();
+        assert!(!live_things.contains("thing-1"));
+
+        docs.delete_collection("coll-1").unwrap();
+        let live_collections = docs.live_collection_uuids_from_root().unwrap();
+        let live_things = docs.live_thing_uuids_from_root().unwrap();
+        assert!(!live_collections.contains("coll-1"));
+        assert!(!live_things.contains("thing-1"));
     }
 }
 

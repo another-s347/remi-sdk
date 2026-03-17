@@ -76,6 +76,123 @@ fn build_server_head_map(
     out
 }
 
+#[derive(Default)]
+struct LocalReachabilityFilters {
+    active_collections: Option<std::collections::HashSet<String>>,
+    active_things: Option<std::collections::HashSet<String>>,
+}
+
+fn build_local_reachability_filters(
+    sdk: &TriggerSdk,
+    device_id: &str,
+) -> Result<LocalReachabilityFilters> {
+    match sdk.crdt_get_document(remi_things_crdt::ROOT_DOC_UUID, "root") {
+        Ok(Some(row)) if row.last_sync_at.is_some() => {
+            let doc_set = load_document_set_from_storage(sdk, device_id)?;
+            Ok(LocalReachabilityFilters {
+                active_collections: Some(doc_set.live_collection_uuids_from_root()?),
+                active_things: Some(doc_set.live_thing_uuids_from_root()?),
+            })
+        }
+        _ => Ok(LocalReachabilityFilters::default()),
+    }
+}
+
+fn clean_document_should_receive(
+    uuid: &str,
+    data_type_str: &str,
+    doc_bytes: &[u8],
+    filters: &LocalReachabilityFilters,
+) -> bool {
+    match data_type_str {
+        "collection" => match &filters.active_collections {
+            Some(active) if !active.contains(uuid) => remi_things_crdt::extract_collection_doc_view(
+                doc_bytes,
+                uuid,
+            )
+            .map(|view| {
+                !view
+                    .meta
+                    .tombstone
+                    .as_ref()
+                    .map(|t| t.deleted)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true),
+            _ => true,
+        },
+        "thing_markdown" => filters
+            .active_things
+            .as_ref()
+            .map(|active| active.contains(uuid))
+            .unwrap_or(true),
+        _ => true,
+    }
+}
+
+fn should_pull_missing_document(
+    uuid: &str,
+    data_type_str: &str,
+    filters: &LocalReachabilityFilters,
+) -> bool {
+    match data_type_str {
+        "collection" => filters
+            .active_collections
+            .as_ref()
+            .map(|active| active.contains(uuid))
+            .unwrap_or(true),
+        "thing_markdown" => filters
+            .active_things
+            .as_ref()
+            .map(|active| active.contains(uuid))
+            .unwrap_or(true),
+        _ => true,
+    }
+}
+
+fn update_reachability_from_downloaded_doc(
+    uuid: &str,
+    data_type_str: &str,
+    doc_bytes: &[u8],
+    filters: &mut LocalReachabilityFilters,
+) {
+    match data_type_str {
+        "root" => {
+            if let Some(active_collections) = filters.active_collections.as_mut() {
+                if let Ok(view) = remi_things_crdt::extract_root_view(doc_bytes) {
+                    *active_collections = view.collection_uuids.into_iter().collect();
+                }
+            }
+        }
+        "collection" => {
+            let collection_is_active = filters
+                .active_collections
+                .as_ref()
+                .map(|active| active.contains(uuid))
+                .unwrap_or(true);
+            if !collection_is_active {
+                return;
+            }
+
+            if let Some(active_things) = filters.active_things.as_mut() {
+                if let Ok(view) = remi_things_crdt::extract_collection_doc_view(doc_bytes, uuid) {
+                    for thing in &view.things {
+                        if !thing
+                            .tombstone
+                            .as_ref()
+                            .map(|t| t.deleted)
+                            .unwrap_or(false)
+                        {
+                            active_things.insert(thing.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Sync all dirty v3 CRDT documents with the server in priority order,
 /// then pull any server-side documents that are missing locally.
 ///
@@ -243,6 +360,17 @@ pub async fn sync_v3_documents_with_server(
         .as_ref()
         .map(|keys| build_server_head_map(keys))
         .unwrap_or_default();
+    let reachability = match build_local_reachability_filters(sdk, device_id) {
+        Ok(filters) => filters,
+        Err(err) => {
+            tracing::warn!(
+                device_id = device_id,
+                error = %err,
+                "Failed to build local reachability filters for phase 1b; falling back to broad receive sync"
+            );
+            LocalReachabilityFilters::default()
+        }
+    };
 
     {
         let mut all_keys = sdk.crdt_list_document_keys().unwrap_or_default();
@@ -271,6 +399,23 @@ pub async fn sync_v3_documents_with_server(
                 Ok(Some(row)) => row,
                 _ => continue,
             };
+
+            if !doc_row.dirty
+                && !clean_document_should_receive(
+                    &uuid,
+                    &data_type_str,
+                    &doc_row.automerge_doc,
+                    &reachability,
+                )
+            {
+                tracing::debug!(
+                    device_id = device_id,
+                    uuid = uuid,
+                    data_type = data_type_str,
+                    "Phase 1b: skipping clean unreachable document"
+                );
+                continue;
+            }
 
             if !doc_row.dirty {
                 if let Some(server_head) =
@@ -385,56 +530,17 @@ async fn pull_missing_documents(
         .into_iter()
         .collect();
 
-    // ── Deletion-aware filter ────────────────────────────────────────────
-    // If we have a previously-synced root document, only pull documents for
-    // collections still referenced in root's collection_uuids.  Without
-    // this, collections/things that were intentionally deleted locally get
-    // re-downloaded because the server still holds their Automerge docs.
-    //
-    // When no synced root exists (e.g. first-ever sync), pull everything.
-    let active_collection_filter: Option<std::collections::HashSet<String>> = {
-        match sdk.crdt_get_document(remi_things_crdt::ROOT_DOC_UUID, "root") {
-            Ok(Some(row)) if row.last_sync_at.is_some() => {
-                match remi_things_crdt::extract_root_view(&row.automerge_doc) {
-                    Ok(view) => {
-                        let set: std::collections::HashSet<String> =
-                            view.collection_uuids.into_iter().collect();
-                        tracing::debug!(
-                            device_id = device_id,
-                            active_count = set.len(),
-                            "Pull filter: using root's collection_uuids to scope pull"
-                        );
-                        Some(set)
-                    }
-                    Err(_) => None,
-                }
-            }
-            _ => None,
+    let mut reachability = match build_local_reachability_filters(sdk, device_id) {
+        Ok(filters) => filters,
+        Err(err) => {
+            tracing::warn!(
+                device_id = device_id,
+                error = %err,
+                "Failed to build local reachability filters for phase 2; falling back to broad pull"
+            );
+            LocalReachabilityFilters::default()
         }
     };
-
-    // Build set of valid thing UUIDs from local collection documents so we
-    // can also skip orphaned thing_markdown documents.
-    let active_thing_filter: Option<std::collections::HashSet<String>> =
-        active_collection_filter.as_ref().map(|active_colls| {
-            let mut thing_uuids = std::collections::HashSet::new();
-            for (uuid, dt) in &local_keys {
-                if dt == "collection" && active_colls.contains(uuid) {
-                    if let Ok(Some(row)) = sdk.crdt_get_document(uuid, "collection") {
-                        if let Ok(view) =
-                            remi_things_crdt::extract_collection_doc_view(&row.automerge_doc, uuid)
-                        {
-                            for thing in &view.things {
-                                if !thing.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false) {
-                                    thing_uuids.insert(thing.id.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            thing_uuids
-        });
 
     // Ask the server for its full list of document keys unless the caller
     // already fetched them for phase 1b.
@@ -457,31 +563,6 @@ async fn pull_missing_documents(
         let dt_str = proto_data_type_to_str(proto_dt);
         if dt_str.is_empty() || local_keys.contains(&(uuid.clone(), dt_str.to_string())) {
             continue;
-        }
-
-        // Apply deletion-aware filter when available
-        if let Some(ref active_colls) = active_collection_filter {
-            match dt_str {
-                "collection" if !active_colls.contains(uuid) => {
-                    tracing::debug!(
-                        uuid = %uuid,
-                        "Skipping pull for collection not in root's collection_uuids (deleted locally)"
-                    );
-                    continue;
-                }
-                "thing_markdown" => {
-                    if let Some(ref active_things) = active_thing_filter {
-                        if !active_things.contains(uuid) {
-                            tracing::debug!(
-                                uuid = %uuid,
-                                "Skipping pull for thing_markdown not in any active collection"
-                            );
-                            continue;
-                        }
-                    }
-                }
-                _ => {}
-            }
         }
 
         missing.push((uuid.clone(), proto_dt));
@@ -512,6 +593,15 @@ async fn pull_missing_documents(
             "thing_markdown" => CrdtDataType::ThingMarkdown,
             _ => continue,
         };
+
+        if !should_pull_missing_document(uuid, dt_str, &reachability) {
+            tracing::debug!(
+                uuid = %uuid,
+                data_type = dt_str,
+                "Skipping pull for unreachable document"
+            );
+            continue;
+        }
 
         // Download snapshot from server
         match client
@@ -561,6 +651,13 @@ async fn pull_missing_documents(
                         )
                         .context("Failed to save pulled CRDT document")?;
 
+                        update_reachability_from_downloaded_doc(
+                            uuid,
+                            dt_str,
+                            &output.doc_bytes,
+                            &mut reachability,
+                        );
+
                         documents_pulled += 1;
                         if !output.last_sync_at.is_empty() {
                             last_sync_at = Some(output.last_sync_at);
@@ -583,6 +680,12 @@ async fn pull_missing_documents(
                             },
                         )
                         .context("Failed to save raw snapshot")?;
+                        update_reachability_from_downloaded_doc(
+                            uuid,
+                            dt_str,
+                            &doc_bytes_fallback,
+                            &mut reachability,
+                        );
                         documents_pulled += 1;
                         if !sync_at.is_empty() {
                             last_sync_at = Some(sync_at);
@@ -641,7 +744,7 @@ async fn sync_single_v3_document(
 
     let proto_data_type = data_type_to_proto(data_type);
 
-    for _round in 0..MAX_ROUNDS {
+    for round in 0..MAX_ROUNDS {
         if !server_msgs.is_empty() {
             session
                 .apply_server_messages(&server_msgs)
@@ -653,6 +756,13 @@ async fn sync_single_v3_document(
         let outgoing_for_compare = outgoing.clone();
 
         if outgoing.is_empty() {
+            tracing::debug!(
+                device_id = device_id,
+                uuid = uuid,
+                data_type = data_type.as_str(),
+                round = round + 1,
+                "sync_single_v3_document: converged with no outgoing message"
+            );
             break;
         }
 
@@ -679,7 +789,27 @@ async fn sync_single_v3_document(
         prev_server_msgs = next_server_msgs.clone();
         server_msgs = next_server_msgs;
 
+        let reply_bytes: usize = server_msgs.iter().map(|msg| msg.len()).sum();
+        tracing::debug!(
+            device_id = device_id,
+            uuid = uuid,
+            data_type = data_type.as_str(),
+            round = round + 1,
+            outgoing_bytes = prev_outgoing.len(),
+            reply_count = server_msgs.len(),
+            reply_bytes = reply_bytes,
+            stall_rounds = stall_rounds,
+            "sync_single_v3_document: round complete"
+        );
+
         if stall_rounds >= MAX_STALL_ROUNDS {
+            tracing::warn!(
+                device_id = device_id,
+                uuid = uuid,
+                data_type = data_type.as_str(),
+                round = round + 1,
+                "sync_single_v3_document: breaking after repeated identical handshake rounds"
+            );
             session
                 .apply_server_messages(&server_msgs)
                 .context("Failed to apply stalled server messages")?;

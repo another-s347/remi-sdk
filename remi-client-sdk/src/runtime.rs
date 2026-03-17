@@ -886,8 +886,10 @@ impl TriggerSdk {
             }
         }
 
-        // V3: Delete collection and associated documents from storage
-        doc_set.delete_collection_from_storage(&self.storage, uuid)?;
+        // V3: Tombstone the collection document and remove the root reference.
+        // Keep the collection/thing documents locally so the tombstone can sync
+        // to other devices instead of being re-discovered as a live orphan.
+        doc_set.delete_collection(uuid)?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
 
         // Emit incremental delete events (collection + cascade things).
@@ -1220,6 +1222,17 @@ impl TriggerSdk {
     ) -> Result<bool> {
         let mut doc_set = self.get_or_init_document_set(device_id)?;
 
+        let snapshot = doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+            include_content: false,
+        })?;
+        if !snapshot.things.iter().any(|t| t.uuid == thing_uuid) {
+            tracing::debug!(
+                thing_uuid,
+                "things_splice_text: refusing to edit deleted or unreachable thing"
+            );
+            return Ok(false);
+        }
+
         // V3: Get the thing markdown document before splice to check if it exists
         let md_view_before = doc_set.thing_markdown_view(thing_uuid)?;
         let has_content = md_view_before.content.is_some();
@@ -1284,6 +1297,12 @@ impl TriggerSdk {
         thing_uuid: &str,
     ) -> Result<Option<String>> {
         let doc_set = self.get_or_init_document_set(device_id)?;
+        let snapshot = doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+            include_content: false,
+        })?;
+        if !snapshot.things.iter().any(|t| t.uuid == thing_uuid) {
+            return Ok(None);
+        }
         let md_view = doc_set.thing_markdown_view(thing_uuid)?;
 
         // Extract markdown text from content
@@ -1646,22 +1665,13 @@ impl TriggerSdk {
             .cloned()
             .collect();
 
-        // V3: Delete thing from collection document
+        // V3: Delete thing from collection document.
+        // Keep markdown docs locally so the metadata tombstone can converge
+        // across devices and future reads stay consistent with reachability.
         doc_set.delete_thing(collection_uuid, uuid)?;
-        // V3: Also remove thing markdown document
-        let md_key = crate::things_crdt::DocumentKey::thing_markdown(uuid);
-        doc_set.remove_document(&md_key);
-        self.storage
-            .delete_crdt_document(uuid, "thing_markdown")
-            .ok();
         // Delete child things
         for child in &child_things {
             doc_set.delete_thing(collection_uuid, &child.uuid)?;
-            let child_md_key = crate::things_crdt::DocumentKey::thing_markdown(&child.uuid);
-            doc_set.remove_document(&child_md_key);
-            self.storage
-                .delete_crdt_document(&child.uuid, "thing_markdown")
-                .ok();
         }
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
 
