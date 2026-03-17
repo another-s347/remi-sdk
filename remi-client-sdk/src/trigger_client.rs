@@ -210,6 +210,13 @@ pub struct ServerTriggerInfo {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServerCrdtDocumentKey {
+    pub document_uuid: String,
+    pub data_type: i32,
+    pub canonical_head: Vec<u8>,
+}
+
 impl From<TriggerInfo> for ServerTriggerInfo {
     fn from(info: TriggerInfo) -> Self {
         Self {
@@ -304,8 +311,8 @@ impl TriggerClient {
         Ok((response.automerge_doc, response.last_sync_at))
     }
 
-    /// List all CRDT document keys for the user.
-    pub async fn list_crdt_document_keys(&mut self) -> Result<Vec<(String, i32)>> {
+    /// List all CRDT document keys for the user, including the current canonical server head.
+    pub async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>> {
         let request = Request::new(ListCrdtDocumentKeysRequest {});
 
         let request = self.add_auth_header(request).await?;
@@ -321,7 +328,11 @@ impl TriggerClient {
         Ok(response
             .keys
             .into_iter()
-            .map(|k| (k.document_uuid, k.data_type))
+            .map(|k| ServerCrdtDocumentKey {
+                document_uuid: k.document_uuid,
+                data_type: k.data_type,
+                canonical_head: k.canonical_head,
+            })
             .collect())
     }
 

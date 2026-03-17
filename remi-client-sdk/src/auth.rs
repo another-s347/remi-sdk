@@ -87,6 +87,27 @@ fn is_access_token_valid(creds: &AuthCredentials) -> bool {
     creds.expires_at_unix_ms > now.saturating_add(skew_ms)
 }
 
+fn should_force_local_logout_after_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "invalidjwttoken",
+        "token has expired",
+        "jwt expired",
+        "expired jwt",
+        "token is expired",
+        "signature has expired",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn local_logout_response() -> LogoutResponse {
+    LogoutResponse {
+        message: "Logged out locally after session expiry".to_string(),
+    }
+}
+
 fn normalize_token(token: Option<&str>) -> Option<&str> {
     token.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -139,6 +160,22 @@ impl AuthClient {
             .get_channel()
             .await
             .map_err(|err| anyhow::anyhow!(err))
+    }
+
+    async fn clear_credentials(&self) {
+        *self.credentials.write().await = None;
+    }
+
+    async fn logout_with_access_token(&self, access_token: String) -> Result<LogoutResponse> {
+        let request = tonic::Request::new(LogoutRequest { access_token });
+        let channel = self.get_channel().await?;
+        let mut client = PublicServiceClient::new(channel);
+        let response = timeout(self.state.request_timeout, client.logout(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("Auth logout timed out"))??
+            .into_inner();
+
+        Ok(response)
     }
 
     /// Login with email and password
@@ -206,18 +243,51 @@ impl AuthClient {
                 .ok_or_else(|| anyhow::anyhow!("Not logged in"))?
         };
 
-        let request = tonic::Request::new(LogoutRequest { access_token });
-        let channel = self.get_channel().await?;
-        let mut client = PublicServiceClient::new(channel);
-        let response = timeout(self.state.request_timeout, client.logout(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("Auth logout timed out"))??
-            .into_inner();
+        match self.logout_with_access_token(access_token).await {
+            Ok(response) => {
+                self.clear_credentials().await;
+                Ok(response)
+            }
+            Err(logout_err) => {
+                if !should_force_local_logout_after_error(&logout_err.to_string()) {
+                    return Err(logout_err);
+                }
 
-        // Clear stored credentials
-        *self.credentials.write().await = None;
+                tracing::warn!(
+                    error = %logout_err,
+                    "Logout failed because the access token is no longer valid; attempting refresh-backed logout",
+                );
 
-        Ok(response)
+                let retry_result = match self.refresh_token().await {
+                    Ok(refresh_response) => {
+                        self.logout_with_access_token(refresh_response.access_token)
+                            .await
+                    }
+                    Err(refresh_err) => {
+                        tracing::warn!(
+                            error = %refresh_err,
+                            "Refreshing the access token during logout failed; clearing local session only",
+                        );
+                        Err(refresh_err)
+                    }
+                };
+
+                match retry_result {
+                    Ok(response) => {
+                        self.clear_credentials().await;
+                        Ok(response)
+                    }
+                    Err(retry_err) => {
+                        tracing::warn!(
+                            error = %retry_err,
+                            "Remote logout could not be completed after session expiry; clearing local session only",
+                        );
+                        self.clear_credentials().await;
+                        Ok(local_logout_response())
+                    }
+                }
+            }
+        }
     }
 
     /// Refresh the access token using the refresh token
@@ -526,7 +596,10 @@ pub async fn auth_restore_credentials(
 
 #[cfg(test)]
 mod tests {
-    use super::{auth_is_app_key, resolve_bearer_token_value, resolve_user_access_token_value};
+    use super::{
+        auth_is_app_key, resolve_bearer_token_value, resolve_user_access_token_value,
+        should_force_local_logout_after_error,
+    };
 
     #[test]
     fn resolves_bearer_token_with_expected_precedence() {
@@ -573,5 +646,25 @@ mod tests {
     fn detects_app_key_prefix() {
         assert!(auth_is_app_key("remi_app_123"));
         assert!(!auth_is_app_key("eyJhbGciOi..."));
+    }
+
+    #[test]
+    fn expired_jwt_errors_allow_local_logout() {
+        assert!(should_force_local_logout_after_error(
+            "Logout failed: Supabase logout failed: 401 Unauthorized - {\"response\":{\"reason\":\"InvalidJWTToken: Token has expired 139839 seconds ago\"},\"status\":\"error\"}",
+        ));
+        assert!(should_force_local_logout_after_error(
+            "Status { code: Internal, message: \"Supabase logout failed: 401 Unauthorized - {\\\"code\\\":401,\\\"error_code\\\":\\\"bad_jwt\\\",\\\"msg\\\":\\\"invalid JWT: token is expired\\\"}\" }",
+        ));
+    }
+
+    #[test]
+    fn unrelated_logout_errors_still_surface() {
+        assert!(!should_force_local_logout_after_error(
+            "Auth logout timed out",
+        ));
+        assert!(!should_force_local_logout_after_error(
+            "transport error: connection refused",
+        ));
     }
 }

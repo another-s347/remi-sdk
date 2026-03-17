@@ -4,6 +4,7 @@ use crate::TriggerClient;
 use crate::TriggerSdk;
 use crate::crdt_sync;
 use crate::things_crdt::{DocumentKey, DocumentState, ThingsDocumentSet};
+use crate::trigger_client::ServerCrdtDocumentKey;
 
 use remi_things_crdt::CrdtDataType;
 
@@ -34,13 +35,54 @@ fn data_type_to_proto(data_type: &CrdtDataType) -> i32 {
     }
 }
 
+fn local_canonical_head(doc_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut doc = automerge::AutoCommit::load(doc_bytes).ok()?;
+    let heads = doc.get_heads();
+    if heads.len() != 1 {
+        return None;
+    }
+
+    Some(heads[0].as_ref().to_vec())
+}
+
+fn document_is_at_server_head(doc_bytes: &[u8], server_head: &[u8]) -> bool {
+    if server_head.is_empty() {
+        return false;
+    }
+
+    local_canonical_head(doc_bytes)
+        .as_deref()
+        .map(|local_head| local_head == server_head)
+        .unwrap_or(false)
+}
+
+fn build_server_head_map(
+    server_keys: &[ServerCrdtDocumentKey],
+) -> std::collections::HashMap<(String, String), Vec<u8>> {
+    let mut out = std::collections::HashMap::new();
+
+    for key in server_keys {
+        let dt_str = proto_data_type_to_str(key.data_type);
+        if dt_str.is_empty() || key.canonical_head.is_empty() {
+            continue;
+        }
+
+        out.insert(
+            (key.document_uuid.clone(), dt_str.to_string()),
+            key.canonical_head.clone(),
+        );
+    }
+
+    out
+}
+
 /// Sync all dirty v3 CRDT documents with the server in priority order,
 /// then pull any server-side documents that are missing locally.
 ///
 /// Phase 1 (push): Dirty documents synced in order: Root → Collections → ThingMarkdown.
-/// Phase 1b (receive): ALL existing local documents are synced with the server
-///   to receive changes made by other devices. Without this, clean docs that were
-///   modified on another device would never be downloaded.
+/// Phase 1b (receive): Existing local documents whose canonical head differs from the
+///   server's current head are re-synced to receive changes made by other devices.
+///   When head metadata is unavailable, this falls back to the previous full receive sync.
 /// Phase 2 (pull): Discover server-side documents via `list_crdt_document_keys`,
 ///   download any missing ones via `get_crdt_document_snapshot`, then sync them
 ///   through the Automerge protocol so both sides share a sync state.
@@ -102,7 +144,7 @@ pub async fn sync_v3_documents_with_server(
                 }
             }
 
-            let pulled = pull_missing_documents(sdk, client, device_id).await;
+            let pulled = pull_missing_documents(sdk, client, device_id, Some(&server_keys)).await;
             match pulled {
                 Ok((count, pull_last_sync)) => {
                     documents_pulled = count;
@@ -181,14 +223,27 @@ pub async fn sync_v3_documents_with_server(
     }
 
     // ── Phase 1b: receive updates from other devices for existing docs ───
-    // Phase 1 only syncs dirty (locally-modified) documents.  Clean docs
-    // that already exist locally are never re-synced, so changes made by
-    // OTHER devices (which the server already merged) are never downloaded.
-    //
-    // Fix: sync all remaining local documents (prioritising root first)
-    // so that e.g. Device B receives Device A's collection_uuids in the
-    // root doc, and then Phase 2 can discover and pull the actual
-    // collection / thing_markdown documents.
+    // Phase 1 only syncs dirty (locally-modified) documents. Clean docs that
+    // already exist locally still need a receive path for changes made by
+    // OTHER devices. Use the server's canonical head metadata to skip docs
+    // that are already converged, and fall back to a full receive sync when
+    // the metadata is unavailable.
+    let server_keys_after_push = match client.list_crdt_document_keys().await {
+        Ok(keys) => Some(keys),
+        Err(err) => {
+            tracing::warn!(
+                device_id = device_id,
+                error = %err,
+                "Failed to list server CRDT keys for phase 1b optimization; falling back to full receive sync"
+            );
+            None
+        }
+    };
+    let server_head_by_key = server_keys_after_push
+        .as_ref()
+        .map(|keys| build_server_head_map(keys))
+        .unwrap_or_default();
+
     {
         let mut all_keys = sdk.crdt_list_document_keys().unwrap_or_default();
 
@@ -200,12 +255,11 @@ pub async fn sync_v3_documents_with_server(
             _ => 3,
         });
 
-        let phase1b_candidates: Vec<_> = all_keys
-            .into_iter()
-            .filter(|k| !synced_in_phase1.contains(k))
-            .collect();
+        for (uuid, data_type_str) in all_keys {
+            if synced_in_phase1.contains(&(uuid.clone(), data_type_str.clone())) {
+                continue;
+            }
 
-        for (uuid, data_type_str) in phase1b_candidates {
             let data_type = match data_type_str.as_str() {
                 "root" => CrdtDataType::Root,
                 "collection" => CrdtDataType::Collection,
@@ -217,6 +271,22 @@ pub async fn sync_v3_documents_with_server(
                 Ok(Some(row)) => row,
                 _ => continue,
             };
+
+            if !doc_row.dirty {
+                if let Some(server_head) =
+                    server_head_by_key.get(&(uuid.clone(), data_type_str.clone()))
+                {
+                    if document_is_at_server_head(&doc_row.automerge_doc, server_head) {
+                        tracing::debug!(
+                            device_id = device_id,
+                            uuid = uuid,
+                            data_type = data_type_str,
+                            "Phase 1b: skipping clean document already at server canonical head"
+                        );
+                        continue;
+                    }
+                }
+            }
 
             let result = sync_single_v3_document(
                 client,
@@ -262,7 +332,7 @@ pub async fn sync_v3_documents_with_server(
 
     // ── Phase 2: pull any remaining missing server-side documents ────────
 
-    let pulled = pull_missing_documents(sdk, client, device_id).await;
+    let pulled = pull_missing_documents(sdk, client, device_id, server_keys_after_push.as_deref()).await;
     match pulled {
         Ok((count, pull_last_sync)) => {
             documents_pulled += count;
@@ -306,6 +376,7 @@ async fn pull_missing_documents(
     sdk: &TriggerSdk,
     client: &mut TriggerClient,
     device_id: &str,
+    prefetched_server_keys: Option<&[ServerCrdtDocumentKey]>,
 ) -> Result<(usize, Option<String>)> {
     // Get a set of all local document keys for fast lookup
     let local_keys: std::collections::HashSet<(String, String)> = sdk
@@ -365,16 +436,25 @@ async fn pull_missing_documents(
             thing_uuids
         });
 
-    // Ask the server for its full list of document keys
-    let server_keys = client
-        .list_crdt_document_keys()
-        .await
-        .context("Failed to list server CRDT document keys")?;
+    // Ask the server for its full list of document keys unless the caller
+    // already fetched them for phase 1b.
+    let fetched_server_keys;
+    let server_keys: &[ServerCrdtDocumentKey] = if let Some(keys) = prefetched_server_keys {
+        keys
+    } else {
+        fetched_server_keys = client
+            .list_crdt_document_keys()
+            .await
+            .context("Failed to list server CRDT document keys")?;
+        &fetched_server_keys
+    };
 
     // Determine which server documents are missing locally
     let mut missing: Vec<(String, i32)> = Vec::new();
-    for (uuid, proto_dt) in &server_keys {
-        let dt_str = proto_data_type_to_str(*proto_dt);
+    for key in server_keys {
+        let uuid = &key.document_uuid;
+        let proto_dt = key.data_type;
+        let dt_str = proto_data_type_to_str(proto_dt);
         if dt_str.is_empty() || local_keys.contains(&(uuid.clone(), dt_str.to_string())) {
             continue;
         }
@@ -404,7 +484,7 @@ async fn pull_missing_documents(
             }
         }
 
-        missing.push((uuid.clone(), *proto_dt));
+        missing.push((uuid.clone(), proto_dt));
     }
 
     if missing.is_empty() {
@@ -718,5 +798,20 @@ mod tests_v3 {
 
         let md = DocumentKey::thing_markdown("thing-1");
         assert_eq!(md.data_type_str(), "thing_markdown");
+    }
+
+    #[test]
+    fn document_head_match_detects_identical_single_head_doc() {
+        let doc = remi_things_crdt::Schema::init_root_doc("device-a").unwrap();
+        let head = local_canonical_head(&doc).unwrap();
+
+        assert!(document_is_at_server_head(&doc, &head));
+    }
+
+    #[test]
+    fn document_head_match_requires_non_empty_server_head() {
+        let doc = remi_things_crdt::Schema::init_root_doc("device-a").unwrap();
+
+        assert!(!document_is_at_server_head(&doc, &[]));
     }
 }
