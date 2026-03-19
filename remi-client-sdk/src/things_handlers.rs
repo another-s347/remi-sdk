@@ -5,6 +5,7 @@ use crate::interrupt_handler::{InterruptHandler, extract_interrupt_data};
 use crate::things_crdt::ThingsSnapshot;
 use crate::types::{TriggerRegistration, TriggerRule};
 use serde::{Deserialize, Serialize};
+use serde::Deserializer;
 use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
 
@@ -24,12 +25,17 @@ pub struct ThingCollectionInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThingInfo {
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub uuid: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub title: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub datatype: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub data_json: String,
     #[serde(default)]
     pub parent_uuid: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub collection_uuid: String,
     #[serde(default)]
     pub created_at: Option<String>,
@@ -45,6 +51,13 @@ struct ThingsThingEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ThingsCollectionEnvelope {
     pub collection: ThingCollectionInfo,
+}
+
+fn deserialize_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn normalize_optional_string(s: Option<String>) -> Option<String> {
@@ -324,6 +337,7 @@ impl InterruptHandler for ThingAddedHandler {
 
         let thing_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
         let collection_uuid = normalize_required_uuid(&info.collection_uuid, "collection_uuid")?;
+        let datatype = normalize_string(&info.datatype).unwrap_or_else(|| "markdown".to_string());
 
         let snapshot = load_things_snapshot(&self.sdk, &self.device_id, false)?;
         if snapshot
@@ -343,7 +357,7 @@ impl InterruptHandler for ThingAddedHandler {
         let mut thing_obj = serde_json::Map::new();
         thing_obj.insert("uuid".to_string(), json!(thing_uuid));
         thing_obj.insert("title".to_string(), json!(info.title));
-        thing_obj.insert("datatype".to_string(), json!(info.datatype));
+        thing_obj.insert("datatype".to_string(), json!(datatype));
         thing_obj.insert("collection_uuid".to_string(), json!(collection_uuid));
         if let Some(parent_uuid) = normalize_optional_string(info.parent_uuid) {
             thing_obj.insert("parent_uuid".to_string(), json!(parent_uuid));
@@ -398,6 +412,7 @@ impl InterruptHandler for ThingEditedHandler {
 
         let thing_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
         let collection_uuid = normalize_required_uuid(&info.collection_uuid, "collection_uuid")?;
+        let datatype = normalize_string(&info.datatype).unwrap_or_else(|| "markdown".to_string());
 
         // Convert incoming payload to SDK v2 ThingUpsert JSON.
         let data_value: Option<JsonValue> =
@@ -406,7 +421,7 @@ impl InterruptHandler for ThingEditedHandler {
         let mut thing_obj = serde_json::Map::new();
         thing_obj.insert("uuid".to_string(), json!(thing_uuid));
         thing_obj.insert("title".to_string(), json!(info.title));
-        thing_obj.insert("datatype".to_string(), json!(info.datatype));
+        thing_obj.insert("datatype".to_string(), json!(datatype));
         thing_obj.insert("collection_uuid".to_string(), json!(collection_uuid));
         if let Some(parent_uuid) = normalize_optional_string(info.parent_uuid) {
             thing_obj.insert("parent_uuid".to_string(), json!(parent_uuid));
@@ -430,6 +445,35 @@ impl InterruptHandler for ThingEditedHandler {
 
         Ok(json!({
             "confirmed": true,        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn thing_envelope_allows_nullable_required_strings() {
+        let envelope: ThingsThingEnvelope = serde_json::from_value(json!({
+            "thing": {
+                "uuid": null,
+                "title": "hello",
+                "datatype": null,
+                "data_json": null,
+                "parent_uuid": null,
+                "collection_uuid": "collection-1",
+                "created_at": null,
+                "updated_at": null
+            }
+        }))
+        .expect("envelope should deserialize");
+
+        assert_eq!(envelope.thing.uuid, "");
+        assert_eq!(envelope.thing.datatype, "");
+        assert_eq!(envelope.thing.data_json, "");
+        assert_eq!(envelope.thing.collection_uuid, "collection-1");
+        assert_eq!(envelope.thing.parent_uuid, None);
     }
 }
 

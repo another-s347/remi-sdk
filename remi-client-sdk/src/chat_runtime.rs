@@ -661,6 +661,13 @@ fn parse_tool_arguments_json(arguments_json: &str) -> JsonValue {
         .unwrap_or_else(|_| JsonValue::String(arguments_json.to_string()))
 }
 
+fn json_arg_string(arguments: &JsonValue, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
 fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValue {
     match tool_name {
         "list_things_tool" => json!({
@@ -675,16 +682,20 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
         "add_things_tool" => json!({
             "type": "things_thing_added",
             "thing": {
-                "uuid": arguments.get("uuid").cloned().unwrap_or_else(|| JsonValue::String(uuid::Uuid::new_v4().to_string())),
-                "title": arguments.get("title").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
+                "uuid": json_arg_string(arguments, "uuid")
+                    .map(JsonValue::String)
+                    .unwrap_or_else(|| JsonValue::String(uuid::Uuid::new_v4().to_string())),
+                "title": JsonValue::String(json_arg_string(arguments, "title").unwrap_or_default()),
                 "datatype": "markdown",
-                "data_json": if let Some(content) = arguments.get("content").and_then(|v| v.as_str()) {
+                "data_json": if let Some(content) = json_arg_string(arguments, "content") {
                     if content.trim().is_empty() { JsonValue::String("{}".to_string()) } else { JsonValue::String(json!({"markdown": content}).to_string()) }
                 } else {
                     JsonValue::String("{}".to_string())
                 },
-                "parent_uuid": arguments.get("parent_uuid").cloned().unwrap_or(JsonValue::Null),
-                "collection_uuid": arguments.get("collection_uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
+                "parent_uuid": json_arg_string(arguments, "parent_uuid")
+                    .map(JsonValue::String)
+                    .unwrap_or(JsonValue::Null),
+                "collection_uuid": JsonValue::String(json_arg_string(arguments, "collection_uuid").unwrap_or_default()),
                 "created_at": "",
                 "updated_at": "",
             }
