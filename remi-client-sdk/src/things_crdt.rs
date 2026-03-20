@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use automerge::{AutoCommit, ReadDoc, Value as AmValue};
+use automerge::transaction::Transactable;
+use automerge::{ActorId, AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value as AmValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -8,9 +9,9 @@ use remi_things_crdt::{
     CURRENT_SCHEMA_VERSION, CrdtDataType, Content, Op, Schema, ThingDatatype, TriggerUpdate,
     ROOT_DOC_UUID,
     // V3 types
-    RootOp, CollectionOp, ThingMarkdownOp,
+    CollectionOp, ThingMarkdownOp,
     RootView, CollectionDocView, ThingMarkdownView,
-    apply_root_op, apply_collection_op, apply_thing_markdown_op,
+    apply_collection_op, apply_thing_markdown_op,
     extract_root_view, extract_collection_doc_view, extract_thing_markdown_view,
     // V3 compaction
     needs_compaction, compact_root_doc, compact_collection_doc, compact_thing_markdown_doc,
@@ -482,6 +483,7 @@ pub struct DocumentState {
     pub automerge_doc: Vec<u8>,
     pub sync_state: Vec<u8>,
     pub dirty: bool,
+    pub last_sync_at: Option<String>,
 }
 
 impl DocumentState {
@@ -490,6 +492,7 @@ impl DocumentState {
             automerge_doc: Vec::new(),
             sync_state: Vec::new(),
             dirty: false,
+            last_sync_at: None,
         }
     }
 }
@@ -524,6 +527,7 @@ impl ThingsDocumentSet {
                 automerge_doc: doc_bytes,
                 sync_state: Vec::new(),
                 dirty: true,
+                last_sync_at: None,
             },
         );
         Ok(())
@@ -786,19 +790,113 @@ impl ThingsDocumentSet {
 
     // ===== Root Operations =====
 
+    fn root_collection_list_ids(doc: &AutoCommit) -> Result<Vec<ObjId>> {
+        Ok(doc
+            .get_all(automerge::ROOT, Schema::KEY_COLLECTION_UUIDS)?
+            .into_iter()
+            .filter_map(|(value, obj_id)| match value {
+                AmValue::Object(ObjType::List) => Some(obj_id),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn root_list_contains_collection(
+        doc: &AutoCommit,
+        list_obj: &ObjId,
+        collection_uuid: &str,
+    ) -> Result<bool> {
+        for index in 0..doc.length(list_obj) {
+            if let Some((AmValue::Scalar(value), _)) = doc.get(list_obj, index)? {
+                if let ScalarValue::Str(existing_uuid) = value.as_ref() {
+                    if existing_uuid == collection_uuid {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn remove_collection_from_root_lists(
+        doc: &mut AutoCommit,
+        collection_uuid: &str,
+    ) -> Result<()> {
+        for list_obj in Self::root_collection_list_ids(doc)? {
+            let mut indexes_to_delete = Vec::new();
+
+            for index in 0..doc.length(&list_obj) {
+                if let Some((AmValue::Scalar(value), _)) = doc.get(&list_obj, index)? {
+                    if let ScalarValue::Str(existing_uuid) = value.as_ref() {
+                        if existing_uuid == collection_uuid {
+                            indexes_to_delete.push(index);
+                        }
+                    }
+                }
+            }
+
+            for index in indexes_to_delete.into_iter().rev() {
+                doc.delete(&list_obj, index)
+                    .context("Failed to remove collection uuid from root list")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn update_root_collection_membership(
+        &self,
+        doc_bytes: &[u8],
+        collection_uuid: &str,
+        should_exist: bool,
+    ) -> Result<Vec<u8>> {
+        let mut doc = if doc_bytes.is_empty() {
+            let init_bytes = Schema::init_root_doc(&self.device_id)?;
+            AutoCommit::load(&init_bytes).context("Failed to load init root doc")?
+        } else {
+            AutoCommit::load(doc_bytes).context("Failed to load root doc")?
+        };
+        doc.set_actor(ActorId::from(self.device_id.as_bytes().to_vec()));
+
+        let list_objs = Self::root_collection_list_ids(&doc)?;
+
+        if should_exist {
+            let mut already_present = false;
+            for list_obj in &list_objs {
+                if Self::root_list_contains_collection(&doc, list_obj, collection_uuid)? {
+                    already_present = true;
+                    break;
+                }
+            }
+
+            if !already_present {
+                let target_list = if let Some(existing) = list_objs.first() {
+                    existing.clone()
+                } else {
+                    doc.put_object(automerge::ROOT, Schema::KEY_COLLECTION_UUIDS, ObjType::List)
+                        .context("Failed to create collection_uuids list")?
+                };
+                doc.insert(&target_list, doc.length(&target_list), collection_uuid.to_string())
+                    .context("Failed to add collection uuid to root list")?;
+            }
+        } else {
+            Self::remove_collection_from_root_lists(&mut doc, collection_uuid)?;
+        }
+
+        Ok(doc.save())
+    }
+
     /// Add a collection to the root document
     pub fn add_collection(&mut self, collection_uuid: &str) -> Result<()> {
         self.init_root()?;
         let key = DocumentKey::root();
+        let current_doc = self.documents.get(&key).unwrap().automerge_doc.clone();
+        let updated_doc =
+            self.update_root_collection_membership(&current_doc, collection_uuid, true)?;
         let state = self.documents.get_mut(&key).unwrap();
 
-        state.automerge_doc = apply_root_op(
-            &state.automerge_doc,
-            &self.device_id,
-            RootOp::AddCollection {
-                uuid: collection_uuid.to_string(),
-            },
-        )?;
+        state.automerge_doc = updated_doc;
         state.dirty = true;
         Ok(())
     }
@@ -807,15 +905,12 @@ impl ThingsDocumentSet {
     pub fn remove_collection(&mut self, collection_uuid: &str) -> Result<()> {
         self.init_root()?;
         let key = DocumentKey::root();
+        let current_doc = self.documents.get(&key).unwrap().automerge_doc.clone();
+        let updated_doc =
+            self.update_root_collection_membership(&current_doc, collection_uuid, false)?;
         let state = self.documents.get_mut(&key).unwrap();
 
-        state.automerge_doc = apply_root_op(
-            &state.automerge_doc,
-            &self.device_id,
-            RootOp::RemoveCollection {
-                uuid: collection_uuid.to_string(),
-            },
-        )?;
+        state.automerge_doc = updated_doc;
         state.dirty = true;
         Ok(())
     }
@@ -846,6 +941,7 @@ impl ThingsDocumentSet {
                     automerge_doc: doc_bytes,
                     sync_state: Vec::new(),
                     dirty: true,
+                    last_sync_at: None,
                 },
             );
             // Also add to root
@@ -1150,6 +1246,7 @@ impl ThingsDocumentSet {
                     automerge_doc: doc_bytes,
                     sync_state: Vec::new(),
                     dirty: true,
+                    last_sync_at: None,
                 },
             );
         }
@@ -1506,6 +1603,7 @@ impl ThingsDocumentSet {
                         automerge_doc: row.automerge_doc,
                         sync_state: row.sync_state,
                         dirty: row.dirty,
+                        last_sync_at: row.last_sync_at,
                     },
                 );
             }
@@ -1524,7 +1622,7 @@ impl ThingsDocumentSet {
                     &state.automerge_doc,
                     &state.sync_state,
                     state.dirty,
-                    None,
+                    state.last_sync_at.as_deref(),
                 )
                 .with_context(|| format!("Failed to save CRDT document {:?}", key))?;
         }
@@ -1544,7 +1642,7 @@ impl ThingsDocumentSet {
                     &state.automerge_doc,
                     &state.sync_state,
                     state.dirty,
-                    None,
+                    state.last_sync_at.as_deref(),
                 )
                 .with_context(|| format!("Failed to save dirty CRDT document {:?}", key))?;
         }
@@ -1595,7 +1693,7 @@ impl ThingsDocumentSet {
                         &state.automerge_doc,
                         &state.sync_state,
                         state.dirty,
-                        None,
+                        state.last_sync_at.as_deref(),
                     )
                     .with_context(|| format!("Failed to save dirty CRDT document {:?}", key))?;
             }
@@ -1621,11 +1719,14 @@ impl ThingsDocumentSet {
                     &state.automerge_doc,
                     &state.sync_state,
                     dirty,
-                    last_sync_at,
+                    last_sync_at.or(state.last_sync_at.as_deref()),
                 )
                 .with_context(|| format!("Failed to save CRDT document {:?}", key))?;
             if mark_clean {
                 state.dirty = false;
+            }
+            if let Some(last_sync_at) = last_sync_at {
+                state.last_sync_at = Some(last_sync_at.to_string());
             }
         }
         Ok(())

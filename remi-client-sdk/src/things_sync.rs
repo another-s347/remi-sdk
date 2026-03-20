@@ -4,7 +4,7 @@ use crate::TriggerClient;
 use crate::TriggerSdk;
 use crate::crdt_sync;
 use crate::things_crdt::{DocumentKey, DocumentState, ThingsDocumentSet};
-use crate::trigger_client::ServerCrdtDocumentKey;
+use crate::trigger_client::{CrdtSyncTransport, ServerCrdtDocumentKey};
 
 use remi_things_crdt::CrdtDataType;
 
@@ -74,6 +74,20 @@ fn build_server_head_map(
     }
 
     out
+}
+
+enum ServerKeyDiscovery {
+    Available(Vec<ServerCrdtDocumentKey>),
+    Unavailable,
+}
+
+impl ServerKeyDiscovery {
+    fn keys(&self) -> Option<&[ServerCrdtDocumentKey]> {
+        match self {
+            Self::Available(keys) => Some(keys),
+            Self::Unavailable => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -208,6 +222,14 @@ pub async fn sync_v3_documents_with_server(
     client: &mut TriggerClient,
     device_id: &str,
 ) -> Result<ThingsV3SyncOutput> {
+    sync_v3_documents_with_transport(sdk, client, device_id).await
+}
+
+pub async fn sync_v3_documents_with_transport(
+    sdk: &TriggerSdk,
+    client: &mut dyn CrdtSyncTransport,
+    device_id: &str,
+) -> Result<ThingsV3SyncOutput> {
     let mut documents_synced = 0;
     let mut last_sync_at: Option<String> = None;
 
@@ -243,6 +265,9 @@ pub async fn sync_v3_documents_with_server(
     // auto-created docs don't fork the server's canonical root.
     let mut documents_pulled = 0;
     if !has_ever_synced {
+        let stashed_local_snapshot = sdk
+            .things_bootstrap_stash_local_snapshot_if_needed(device_id)
+            .unwrap_or(false);
         let server_keys = client.list_crdt_document_keys().await.unwrap_or_default();
 
         if !server_keys.is_empty() {
@@ -268,6 +293,13 @@ pub async fn sync_v3_documents_with_server(
                     documents_synced += count;
                     if let Some(ts) = pull_last_sync {
                         last_sync_at = Some(ts);
+                    }
+
+                    if stashed_local_snapshot {
+                        sdk.things_bootstrap_replay_stash_onto_current_documents(device_id)
+                            .context(
+                                "Failed to replay stashed local changes after first-sync bootstrap",
+                            )?;
                     }
                 }
                 Err(err) => {
@@ -343,22 +375,23 @@ pub async fn sync_v3_documents_with_server(
     // Phase 1 only syncs dirty (locally-modified) documents. Clean docs that
     // already exist locally still need a receive path for changes made by
     // OTHER devices. Use the server's canonical head metadata to skip docs
-    // that are already converged, and fall back to a full receive sync when
-    // the metadata is unavailable.
-    let server_keys_after_push = match client.list_crdt_document_keys().await {
-        Ok(keys) => Some(keys),
+    // that are already converged. If key discovery itself is unavailable,
+    // skip the receive/pull phases for this run rather than falling back to
+    // a broad receive sync over every local document.
+    let server_key_discovery = match client.list_crdt_document_keys().await {
+        Ok(keys) => ServerKeyDiscovery::Available(keys),
         Err(err) => {
             tracing::warn!(
                 device_id = device_id,
                 error = %err,
-                "Failed to list server CRDT keys for phase 1b optimization; falling back to full receive sync"
+                "Failed to list server CRDT keys for phase 1b optimization; skipping receive/pull phases to avoid cold-start sync storms"
             );
-            None
+            ServerKeyDiscovery::Unavailable
         }
     };
-    let server_head_by_key = server_keys_after_push
-        .as_ref()
-        .map(|keys| build_server_head_map(keys))
+    let server_head_by_key = server_key_discovery
+        .keys()
+        .map(build_server_head_map)
         .unwrap_or_default();
     let reachability = match build_local_reachability_filters(sdk, device_id) {
         Ok(filters) => filters,
@@ -372,7 +405,7 @@ pub async fn sync_v3_documents_with_server(
         }
     };
 
-    {
+    if server_key_discovery.keys().is_some() {
         let mut all_keys = sdk.crdt_list_document_keys().unwrap_or_default();
 
         // Sort: root first, then collection, then thing_markdown
@@ -473,26 +506,38 @@ pub async fn sync_v3_documents_with_server(
                 }
             }
         }
+    } else {
+        tracing::warn!(
+            device_id = device_id,
+            "Skipping phase 1b receive sync because server key discovery is unavailable"
+        );
     }
 
     // ── Phase 2: pull any remaining missing server-side documents ────────
 
-    let pulled = pull_missing_documents(sdk, client, device_id, server_keys_after_push.as_deref()).await;
-    match pulled {
-        Ok((count, pull_last_sync)) => {
-            documents_pulled += count;
-            documents_synced += count;
-            if let Some(ts) = pull_last_sync {
-                last_sync_at = Some(ts);
+    if let Some(server_keys) = server_key_discovery.keys() {
+        let pulled = pull_missing_documents(sdk, client, device_id, Some(server_keys)).await;
+        match pulled {
+            Ok((count, pull_last_sync)) => {
+                documents_pulled += count;
+                documents_synced += count;
+                if let Some(ts) = pull_last_sync {
+                    last_sync_at = Some(ts);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    device_id = device_id,
+                    error = %err,
+                    "Failed to pull missing server documents (non-fatal)"
+                );
             }
         }
-        Err(err) => {
-            tracing::warn!(
-                device_id = device_id,
-                error = %err,
-                "Failed to pull missing server documents (non-fatal)"
-            );
-        }
+    } else {
+        tracing::warn!(
+            device_id = device_id,
+            "Skipping phase 2 pull because server key discovery is unavailable"
+        );
     }
 
     // ── Notify Flutter if new documents were pulled ──────────────────────
@@ -519,7 +564,7 @@ pub async fn sync_v3_documents_with_server(
 /// Returns (documents_pulled, last_sync_at).
 async fn pull_missing_documents(
     sdk: &TriggerSdk,
-    client: &mut TriggerClient,
+    client: &mut dyn CrdtSyncTransport,
     device_id: &str,
     prefetched_server_keys: Option<&[ServerCrdtDocumentKey]>,
 ) -> Result<(usize, Option<String>)> {
@@ -719,7 +764,7 @@ fn proto_data_type_to_str(proto_dt: i32) -> &'static str {
 
 /// Sync a single v3 CRDT document with the server
 async fn sync_single_v3_document(
-    client: &mut TriggerClient,
+    client: &mut dyn CrdtSyncTransport,
     device_id: &str,
     uuid: &str,
     data_type: &CrdtDataType,
@@ -865,6 +910,7 @@ pub fn load_document_set_from_storage(
                     automerge_doc: row.automerge_doc,
                     sync_state: row.sync_state,
                     dirty: row.dirty,
+                    last_sync_at: row.last_sync_at,
                 },
             );
         }
@@ -883,7 +929,7 @@ pub fn save_document_set_to_storage(sdk: &TriggerSdk, doc_set: &ThingsDocumentSe
                 &state.automerge_doc,
                 &state.sync_state,
                 state.dirty,
-                None,
+                state.last_sync_at.as_deref(),
             )
             .context("Failed to save CRDT document to storage")?;
         }
@@ -906,7 +952,7 @@ pub fn save_dirty_documents_to_storage(
             &state.automerge_doc,
             &state.sync_state,
             state.dirty,
-            None,
+            state.last_sync_at.as_deref(),
         )
         .context("Failed to save dirty CRDT document to storage")?;
     }

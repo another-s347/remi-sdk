@@ -10,6 +10,9 @@ use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use tonic_conn::{NetConnector, NetConnectorOptions};
 
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransportConfig {
     /// gRPC endpoint URI — required for decenet mode, optional for TCP (derived from tcpGrpcAddr).
@@ -169,19 +172,19 @@ pub async fn build_transport_state(config_json: &str) -> Result<TransportState, 
             .ok_or_else(|| "tcpGrpcAddr is required when transportMode=tcp".to_string())?;
         let endpoint_uri = format!("http://{tcp_addr}");
         tracing::info!("[transport] build_transport_state: TCP mode, addr={tcp_addr}");
+        let request_timeout = config
+            .request_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
         let mut endpoint = Endpoint::from_shared(endpoint_uri)
             .map_err(|err| format!("Invalid TCP gRPC endpoint: {err}"))?;
         if let Some(timeout_ms) = config.connect_timeout_ms {
             endpoint = endpoint.connect_timeout(Duration::from_millis(timeout_ms));
         } else {
-            endpoint = endpoint.connect_timeout(Duration::from_secs(5));
+            endpoint = endpoint.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
         }
-        endpoint = endpoint.timeout(Duration::from_secs(20));
+        endpoint = endpoint.timeout(request_timeout);
         endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(30)));
-        let request_timeout = config
-            .request_timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_secs(20));
         return Ok(TransportState {
             endpoint,
             connector: None,
@@ -273,18 +276,17 @@ pub async fn build_transport_state(config_json: &str) -> Result<TransportState, 
 
     let mut endpoint = Endpoint::from_shared(endpoint_uri)
         .map_err(|err| format!("Invalid endpoint URI: {err}"))?;
-    if let Some(timeout_ms) = config.connect_timeout_ms {
-        endpoint = endpoint.connect_timeout(Duration::from_millis(timeout_ms));
-    } else {
-        endpoint = endpoint.connect_timeout(Duration::from_secs(5));
-    }
-    endpoint = endpoint.timeout(Duration::from_secs(20));
-    endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(30)));
-
     let request_timeout = config
         .request_timeout_ms
         .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_secs(20));
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+    if let Some(timeout_ms) = config.connect_timeout_ms {
+        endpoint = endpoint.connect_timeout(Duration::from_millis(timeout_ms));
+    } else {
+        endpoint = endpoint.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+    }
+    endpoint = endpoint.timeout(request_timeout);
+    endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(30)));
 
     Ok(TransportState {
         endpoint,

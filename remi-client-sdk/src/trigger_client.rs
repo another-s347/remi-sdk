@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use tokio::time::timeout;
 use tonic::Request;
 use tonic::transport::Channel;
@@ -217,6 +218,27 @@ pub struct ServerCrdtDocumentKey {
     pub canonical_head: Vec<u8>,
 }
 
+#[async_trait]
+pub trait CrdtSyncTransport: Send {
+    async fn sync_crdt_document(
+        &mut self,
+        device_id: String,
+        document_uuid: String,
+        data_type: i32,
+        sync_message: Vec<u8>,
+    ) -> Result<(Vec<Vec<u8>>, String)>;
+
+    async fn get_crdt_document_snapshot(
+        &mut self,
+        device_id: String,
+        document_uuid: String,
+        data_type: i32,
+        reset_sync_state: bool,
+    ) -> Result<(Vec<u8>, String)>;
+
+    async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>>;
+}
+
 impl From<TriggerInfo> for ServerTriggerInfo {
     fn from(info: TriggerInfo) -> Self {
         Self {
@@ -228,6 +250,41 @@ impl From<TriggerInfo> for ServerTriggerInfo {
             created_at: info.created_at,
             updated_at: info.updated_at,
         }
+    }
+}
+
+#[async_trait]
+impl CrdtSyncTransport for TriggerClient {
+    async fn sync_crdt_document(
+        &mut self,
+        device_id: String,
+        document_uuid: String,
+        data_type: i32,
+        sync_message: Vec<u8>,
+    ) -> Result<(Vec<Vec<u8>>, String)> {
+        TriggerClient::sync_crdt_document(self, device_id, document_uuid, data_type, sync_message)
+            .await
+    }
+
+    async fn get_crdt_document_snapshot(
+        &mut self,
+        device_id: String,
+        document_uuid: String,
+        data_type: i32,
+        reset_sync_state: bool,
+    ) -> Result<(Vec<u8>, String)> {
+        TriggerClient::get_crdt_document_snapshot(
+            self,
+            device_id,
+            document_uuid,
+            data_type,
+            reset_sync_state,
+        )
+        .await
+    }
+
+    async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>> {
+        TriggerClient::list_crdt_document_keys(self).await
     }
 }
 

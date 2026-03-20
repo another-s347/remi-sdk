@@ -3087,6 +3087,65 @@ impl TriggerSdk {
         Ok(())
     }
 
+    /// Replay stashed local changes onto the current V3 document set.
+    ///
+    /// Use this when the current storage already contains server documents pulled during
+    /// first-sync bootstrap. Unlike `things_bootstrap_from_server_snapshot_and_replay_stash`,
+    /// this preserves the pulled server state and layers the stashed local changes on top.
+    pub fn things_bootstrap_replay_stash_onto_current_documents(
+        &self,
+        device_id: &str,
+    ) -> Result<()> {
+        const STASH_KEY: &str = "things.bootstrap.stash_snapshot_json";
+        const DONE_KEY: &str = "things.bootstrap.done";
+
+        let stash_json = self
+            .storage
+            .get_internal_kv(STASH_KEY)?
+            .ok_or_else(|| anyhow::anyhow!("No bootstrap stash found"))?;
+
+        let stash: crate::things_crdt::ThingsSnapshot = serde_json::from_str(&stash_json)
+            .context("Failed to parse bootstrap stash snapshot")?;
+
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+
+        for collection in &stash.collections {
+            doc_set.get_or_init_collection(&collection.uuid)?;
+            let trigger = crate::things_crdt::trigger_update_from_tri_state(
+                collection.trigger_uuid.as_deref(),
+            );
+            doc_set.update_collection_meta(
+                &collection.uuid,
+                Some(collection.title.clone()),
+                None,
+                trigger,
+            )?;
+        }
+
+        for thing in &stash.things {
+            let trigger =
+                crate::things_crdt::trigger_update_from_tri_state(thing.trigger_uuid.as_deref());
+            doc_set.upsert_thing_meta(
+                &thing.collection_uuid,
+                &thing.uuid,
+                Some(thing.datatype.clone()),
+                None,
+                Some(thing.title.clone()),
+                thing.parent_uuid.clone(),
+                trigger,
+            )?;
+
+            let content =
+                crate::things_crdt::markdown_only_content_from_value(&thing.datatype, &thing.data);
+            doc_set.set_thing_content(&thing.uuid, content)?;
+        }
+
+        doc_set.save_to_storage(&self.storage)?;
+        self.storage.set_internal_kv(DONE_KEY, "1")?;
+        self.storage.delete_internal_kv(STASH_KEY)?;
+        Ok(())
+    }
+
     /// Reconcile trigger bindings after a sync operation.
     /// Returns a list of trigger UUIDs that need to be downloaded and installed.
     pub fn reconcile_trigger_bindings_after_sync(&self, device_id: &str) -> Result<Vec<String>> {
