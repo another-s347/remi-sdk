@@ -2,6 +2,41 @@ use anyhow::{Context, Result};
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value};
 
+fn collect_object_keys_by_type(
+    doc: &AutoCommit,
+    obj: &ObjId,
+    key: &str,
+    expected_type: ObjType,
+) -> Result<Vec<ObjId>> {
+    let mut out = Vec::new();
+
+    if let Ok(all) = doc.get_all(obj, key) {
+        for (value, id) in all {
+            if matches!(value, Value::Object(obj_type) if obj_type == expected_type) {
+                out.push(id);
+            }
+        }
+    }
+
+    if out.is_empty() {
+        if let Some((Value::Object(obj_type), id)) = doc.get(obj, key)? {
+            if obj_type == expected_type {
+                out.push(id);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+pub fn collect_map_keys(doc: &AutoCommit, obj: &ObjId, key: &str) -> Result<Vec<ObjId>> {
+    collect_object_keys_by_type(doc, obj, key, ObjType::Map)
+}
+
+pub fn collect_list_keys(doc: &AutoCommit, obj: &ObjId, key: &str) -> Result<Vec<ObjId>> {
+    collect_object_keys_by_type(doc, obj, key, ObjType::List)
+}
+
 pub fn actor_id(actor: &str) -> ActorId {
     let bytes = if actor.is_empty() {
         b"remi-actor".to_vec()
@@ -19,6 +54,9 @@ pub fn ensure_map_key(doc: &mut AutoCommit, obj: &ObjId, key: &str) -> Result<Ob
     if let Some((Value::Object(ObjType::Map), id)) = doc.get(obj, key)? {
         return Ok(id);
     }
+    if let Some(id) = collect_map_keys(doc, obj, key)?.into_iter().next() {
+        return Ok(id);
+    }
     Ok(doc
         .put_object(obj, key, ObjType::Map)
         .with_context(|| format!("Failed to create map '{key}'"))?)
@@ -28,6 +66,9 @@ pub fn ensure_list_key(doc: &mut AutoCommit, obj: &ObjId, key: &str) -> Result<O
     if let Some((Value::Object(ObjType::List), id)) = doc.get(obj, key)? {
         return Ok(id);
     }
+    if let Some(id) = collect_list_keys(doc, obj, key)?.into_iter().next() {
+        return Ok(id);
+    }
     Ok(doc
         .put_object(obj, key, ObjType::List)
         .with_context(|| format!("Failed to create list '{key}'"))?)
@@ -35,6 +76,9 @@ pub fn ensure_list_key(doc: &mut AutoCommit, obj: &ObjId, key: &str) -> Result<O
 
 pub fn ensure_child_map(doc: &mut AutoCommit, parent_map: &ObjId, key: &str) -> Result<ObjId> {
     if let Some((Value::Object(ObjType::Map), id)) = doc.get(parent_map, key)? {
+        return Ok(id);
+    }
+    if let Some(id) = collect_map_keys(doc, parent_map, key)?.into_iter().next() {
         return Ok(id);
     }
     Ok(doc

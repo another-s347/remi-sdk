@@ -5,10 +5,11 @@ use tracing::info;
 
 use crate::datatype::{ContentEntry, ContentEntryPayload, DateField, ImageField, LocationField, UrlField};
 use crate::schema::{Schema, CURRENT_SCHEMA_VERSION};
-use crate::util::{collect_root_maps, get_json_string, get_string, get_u64};
+use crate::util::{collect_list_keys, collect_map_keys, collect_root_maps, get_json_string, get_string, get_u64};
 use crate::view::{
     BlockView, CollectionDocView, CollectionMetaView, CollectionView, ContentView, EditClock,
-    RootView, ThingBuiltInFieldsView, ThingMarkdownView, ThingMetaView, ThingStatus, ThingView,
+    RootView, ThingBuiltInFieldsView, ThingContentView, ThingMarkdownView, ThingMetaView,
+    ThingStatus, ThingView,
     Tombstone, TriggerBinding, View,
 };
 use crate::ThingDatatype;
@@ -679,12 +680,11 @@ fn extract_thing_meta_from_obj(
     let attrs = get_json_string(doc, thing_obj, "attrs")?;
 
     // Read built_in fields
-    let built_in = if let Some((Value::Object(ObjType::Map), built_in_obj)) =
-        doc.get(thing_obj, Schema::KEY_BUILT_IN)?
-    {
-        extract_built_in_fields(doc, &built_in_obj)?
-    } else {
+    let built_in_objs = collect_map_keys(doc, thing_obj, Schema::KEY_BUILT_IN)?;
+    let built_in = if built_in_objs.is_empty() {
         ThingBuiltInFieldsView::default()
+    } else {
+        extract_built_in_fields(doc, &built_in_objs)?
     };
 
     Ok(ThingMetaView {
@@ -704,24 +704,29 @@ fn extract_thing_meta_from_obj(
 /// Extract ThingBuiltInFieldsView from a built_in object (V3 multi-value content entries)
 fn extract_built_in_fields(
     doc: &AutoCommit,
-    built_in_obj: &ObjId,
+    built_in_objs: &[ObjId],
 ) -> Result<ThingBuiltInFieldsView> {
-    let extra = get_json_string(doc, built_in_obj, "extra")?;
+    let extra = built_in_objs.iter().find_map(|built_in_obj| {
+        get_json_string(doc, built_in_obj, "extra")
+            .ok()
+            .flatten()
+    });
 
-    // Read content_entries list
-    let mut content_entries = Vec::new();
-    if let Some((Value::Object(ObjType::List), entries_list)) =
-        doc.get(built_in_obj, "content_entries")?
-    {
-        let len = doc.length(&entries_list);
-        for i in 0..len {
-            if let Some((Value::Object(ObjType::Map), entry_obj)) = doc.get(&entries_list, i)? {
-                if let Some(entry) = extract_content_entry(doc, &entry_obj)? {
-                    content_entries.push(entry);
+    let mut content_entries_by_id = std::collections::BTreeMap::new();
+    for built_in_obj in built_in_objs {
+        for entries_list in collect_list_keys(doc, built_in_obj, "content_entries")? {
+            let len = doc.length(&entries_list);
+            for i in 0..len {
+                if let Some((Value::Object(ObjType::Map), entry_obj)) = doc.get(&entries_list, i)? {
+                    if let Some(entry) = extract_content_entry(doc, &entry_obj)? {
+                        content_entries_by_id.insert(entry.id.clone(), entry);
+                    }
                 }
             }
         }
     }
+
+    let mut content_entries: Vec<_> = content_entries_by_id.into_values().collect();
 
     // Sort by order
     content_entries.sort_by(|a, b| {
@@ -865,39 +870,62 @@ fn extract_content_entry_payload(
             let data_str = get_string(doc, payload_obj, "data")?.unwrap_or_default();
             let data: serde_json::Value =
                 serde_json::from_str(&data_str).unwrap_or(serde_json::Value::Null);
-            Ok(Some(ContentEntryPayload::Custom(data)))
+            Ok(Some(ContentEntryPayload::Custom {
+                content_type: "custom".to_string(),
+                data,
+            }))
         }
-        _ => Ok(None),
+        other => {
+            let data_str = get_string(doc, payload_obj, "data")?.unwrap_or_default();
+            let data: serde_json::Value = if data_str.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(&data_str).unwrap_or(serde_json::Value::Null)
+            };
+            Ok(Some(ContentEntryPayload::Custom {
+                content_type: other.to_string(),
+                data,
+            }))
+        }
     }
 }
 
-/// Extract view from a ThingMarkdown document (CrdtDataType::ThingMarkdown)
-pub fn extract_thing_markdown_view(
+/// Extract view from a generic thing-owned content document.
+pub fn extract_thing_content_view(
     doc_bytes: &[u8],
+    document_uuid: &str,
     thing_uuid: &str,
-) -> Result<ThingMarkdownView> {
+) -> Result<ThingContentView> {
     if doc_bytes.is_empty() {
-        return Ok(ThingMarkdownView {
+        return Ok(ThingContentView {
             schema_version: CURRENT_SCHEMA_VERSION,
+            document_uuid: document_uuid.to_string(),
             thing_uuid: thing_uuid.to_string(),
+            content_type: "markdown".to_string(),
             content: None,
         });
     }
 
-    let doc = AutoCommit::load(doc_bytes).context("Failed to load thing markdown document")?;
-    extract_thing_markdown_view_from_doc(&doc, thing_uuid)
+    let doc = AutoCommit::load(doc_bytes).context("Failed to load thing content document")?;
+    extract_thing_content_view_from_doc(&doc, document_uuid, thing_uuid)
 }
 
-/// Extract view from a ThingMarkdown document (already loaded)
-pub fn extract_thing_markdown_view_from_doc(
+/// Extract view from a generic thing-owned content document (already loaded)
+pub fn extract_thing_content_view_from_doc(
     doc: &AutoCommit,
+    document_uuid: &str,
     thing_uuid: &str,
-) -> Result<ThingMarkdownView> {
+) -> Result<ThingContentView> {
     let schema_version = get_u64(doc, &automerge::ROOT, Schema::KEY_SCHEMA_VERSION)?
         .unwrap_or(CURRENT_SCHEMA_VERSION as u64) as u32;
 
+    let stored_document_uuid = get_string(doc, &automerge::ROOT, "document_uuid")?
+        .unwrap_or_else(|| document_uuid.to_string());
+
     let stored_uuid =
         get_string(doc, &automerge::ROOT, "thing_uuid")?.unwrap_or_else(|| thing_uuid.to_string());
+    let content_type =
+        get_string(doc, &automerge::ROOT, "content_type")?.unwrap_or_else(|| "markdown".to_string());
 
     // Read content
     let content = if let Some((Value::Object(ObjType::Map), content_obj)) =
@@ -908,10 +936,38 @@ pub fn extract_thing_markdown_view_from_doc(
         None
     };
 
-    Ok(ThingMarkdownView {
+    Ok(ThingContentView {
         schema_version,
+        document_uuid: stored_document_uuid,
         thing_uuid: stored_uuid,
+        content_type,
         content,
+    })
+}
+
+/// Extract view from a ThingMarkdown document (CrdtDataType::ThingMarkdown)
+pub fn extract_thing_markdown_view(
+    doc_bytes: &[u8],
+    thing_uuid: &str,
+) -> Result<ThingMarkdownView> {
+    let view = extract_thing_content_view(doc_bytes, thing_uuid, thing_uuid)?;
+    Ok(ThingMarkdownView {
+        schema_version: view.schema_version,
+        thing_uuid: view.thing_uuid,
+        content: view.content,
+    })
+}
+
+/// Extract view from a ThingMarkdown document (already loaded)
+pub fn extract_thing_markdown_view_from_doc(
+    doc: &AutoCommit,
+    thing_uuid: &str,
+) -> Result<ThingMarkdownView> {
+    let view = extract_thing_content_view_from_doc(doc, thing_uuid, thing_uuid)?;
+    Ok(ThingMarkdownView {
+        schema_version: view.schema_version,
+        thing_uuid: view.thing_uuid,
+        content: view.content,
     })
 }
 
@@ -995,6 +1051,23 @@ mod tests_v3 {
         let view = extract_thing_markdown_view(&doc_bytes, "thing-456").unwrap();
         assert_eq!(view.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(view.thing_uuid, "thing-456");
+        assert!(view.content.is_some());
+    }
+
+    #[test]
+    fn test_extract_generic_thing_content_view() {
+        let doc_bytes = Schema::init_thing_content_doc(
+            "test-actor",
+            "content-456",
+            "thing-456",
+            "markdown",
+        )
+        .unwrap();
+        let view = extract_thing_content_view(&doc_bytes, "content-456", "thing-456").unwrap();
+        assert_eq!(view.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(view.document_uuid, "content-456");
+        assert_eq!(view.thing_uuid, "thing-456");
+        assert_eq!(view.content_type, "markdown");
         assert!(view.content.is_some());
     }
 }

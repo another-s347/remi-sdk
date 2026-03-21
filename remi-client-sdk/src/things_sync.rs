@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::TriggerClient;
 use crate::TriggerSdk;
 use crate::crdt_sync;
-use crate::things_crdt::{DocumentKey, DocumentState, ThingsDocumentSet};
+use crate::things_crdt::{DocumentPersistence, ThingsDocumentSet};
 use crate::trigger_client::{CrdtSyncTransport, ServerCrdtDocumentKey};
 
 use remi_things_crdt::CrdtDataType;
@@ -11,7 +11,14 @@ use remi_things_crdt::CrdtDataType;
 struct ThingsSyncOutput {
     pub doc_bytes: Vec<u8>,
     pub sync_state_bytes: Vec<u8>,
-    pub last_sync_at: String,
+    pub last_sync_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalBootstrapState {
+    Empty,
+    DirtyUnsynced,
+    HasSyncedHistory,
 }
 
 // ============================================================================
@@ -76,6 +83,63 @@ fn build_server_head_map(
     out
 }
 
+fn has_sync_history(doc: &crate::types::CrdtDocumentRow) -> bool {
+    let initial_sync_state = crate::crdt_sync::init_sync_state();
+    !doc.sync_state.is_empty() && doc.sync_state != initial_sync_state
+}
+
+fn optional_sync_timestamp(value: String) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn observe_sync_timestamp(observed: &mut Option<String>, candidate: Option<String>) {
+    if let Some(ts) = candidate {
+        *observed = Some(ts);
+    }
+}
+
+fn classify_local_bootstrap_state(
+    sdk: &TriggerSdk,
+    dirty_docs: &[crate::types::CrdtDocumentRow],
+) -> LocalBootstrapState {
+    if dirty_docs.iter().any(has_sync_history) {
+        return LocalBootstrapState::HasSyncedHistory;
+    }
+
+    let all_keys = sdk.crdt_list_document_keys().unwrap_or_default();
+    if all_keys.is_empty() {
+        return LocalBootstrapState::Empty;
+    }
+
+    let has_synced_history = all_keys.iter().any(|(uuid, dt)| {
+        sdk.crdt_get_document(uuid, dt)
+            .ok()
+            .flatten()
+            .map(|doc| has_sync_history(&doc))
+            .unwrap_or(false)
+    });
+
+    if has_synced_history {
+        LocalBootstrapState::HasSyncedHistory
+    } else {
+        LocalBootstrapState::DirtyUnsynced
+    }
+}
+
+fn never_synced_dirty_keys(
+    dirty_docs: &[crate::types::CrdtDocumentRow],
+) -> Vec<(String, String)> {
+    dirty_docs
+        .iter()
+        .filter(|doc| !has_sync_history(doc))
+        .map(|doc| (doc.uuid.clone(), doc.data_type.clone()))
+        .collect()
+}
+
 enum ServerKeyDiscovery {
     Available(Vec<ServerCrdtDocumentKey>),
     Unavailable,
@@ -100,16 +164,28 @@ fn build_local_reachability_filters(
     sdk: &TriggerSdk,
     device_id: &str,
 ) -> Result<LocalReachabilityFilters> {
-    match sdk.crdt_get_document(remi_things_crdt::ROOT_DOC_UUID, "root") {
-        Ok(Some(row)) if row.last_sync_at.is_some() => {
-            let doc_set = load_document_set_from_storage(sdk, device_id)?;
-            Ok(LocalReachabilityFilters {
-                active_collections: Some(doc_set.live_collection_uuids_from_root()?),
-                active_things: Some(doc_set.live_thing_uuids_from_root()?),
-            })
-        }
-        _ => Ok(LocalReachabilityFilters::default()),
+    let has_synced_non_root_documents = sdk
+        .crdt_list_document_keys()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, data_type)| data_type != "root")
+        .any(|(uuid, data_type)| {
+            sdk.crdt_get_document(&uuid, &data_type)
+                .ok()
+                .flatten()
+                .map(|row| has_sync_history(&row))
+                .unwrap_or(false)
+        });
+
+    if !has_synced_non_root_documents {
+        return Ok(LocalReachabilityFilters::default());
     }
+
+    let doc_set = load_document_set_from_storage(sdk, device_id)?;
+    Ok(LocalReachabilityFilters {
+        active_collections: Some(doc_set.active_collection_uuids()?),
+        active_things: Some(doc_set.active_thing_uuids()?),
+    })
 }
 
 fn clean_document_should_receive(
@@ -171,34 +247,46 @@ fn update_reachability_from_downloaded_doc(
     filters: &mut LocalReachabilityFilters,
 ) {
     match data_type_str {
-        "root" => {
+        "collection" => {
+            let Ok(view) = remi_things_crdt::extract_collection_doc_view(doc_bytes, uuid) else {
+                return;
+            };
+
+            let collection_is_live = !view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false);
+
             if let Some(active_collections) = filters.active_collections.as_mut() {
-                if let Ok(view) = remi_things_crdt::extract_root_view(doc_bytes) {
-                    *active_collections = view.collection_uuids.into_iter().collect();
+                if collection_is_live {
+                    active_collections.insert(uuid.to_string());
+                } else {
+                    active_collections.remove(uuid);
                 }
             }
-        }
-        "collection" => {
-            let collection_is_active = filters
-                .active_collections
-                .as_ref()
-                .map(|active| active.contains(uuid))
-                .unwrap_or(true);
-            if !collection_is_active {
+
+            if !collection_is_live {
+                if let Some(active_things) = filters.active_things.as_mut() {
+                    for thing in &view.things {
+                        active_things.remove(&thing.id);
+                    }
+                }
                 return;
             }
 
             if let Some(active_things) = filters.active_things.as_mut() {
-                if let Ok(view) = remi_things_crdt::extract_collection_doc_view(doc_bytes, uuid) {
-                    for thing in &view.things {
-                        if !thing
-                            .tombstone
-                            .as_ref()
-                            .map(|t| t.deleted)
-                            .unwrap_or(false)
-                        {
-                            active_things.insert(thing.id.clone());
-                        }
+                for thing in &view.things {
+                    if !thing
+                        .tombstone
+                        .as_ref()
+                        .map(|t| t.deleted)
+                        .unwrap_or(false)
+                    {
+                        active_things.insert(thing.id.clone());
+                    } else {
+                        active_things.remove(&thing.id);
                     }
                 }
             }
@@ -247,24 +335,13 @@ pub async fn sync_v3_documents_with_transport(
         .crdt_get_dirty_documents()
         .context("Failed to load dirty CRDT documents")?;
 
-    let has_ever_synced = dirty_docs.iter().any(|d| d.last_sync_at.is_some()) || {
-        // Also check non-dirty docs
-        sdk.crdt_list_document_keys()
-            .unwrap_or_default()
-            .iter()
-            .any(|(uuid, dt)| {
-                sdk.crdt_get_document(uuid, dt)
-                    .ok()
-                    .flatten()
-                    .map(|d| d.last_sync_at.is_some())
-                    .unwrap_or(false)
-            })
-    };
+    let bootstrap_state = classify_local_bootstrap_state(sdk, &dirty_docs);
+    let never_synced_dirty_keys = never_synced_dirty_keys(&dirty_docs);
 
     // On true first sync, pull from server before pushing so that locally
     // auto-created docs don't fork the server's canonical root.
     let mut documents_pulled = 0;
-    if !has_ever_synced {
+    if bootstrap_state != LocalBootstrapState::HasSyncedHistory {
         let stashed_local_snapshot = sdk
             .things_bootstrap_stash_local_snapshot_if_needed(device_id)
             .unwrap_or(false);
@@ -280,10 +357,8 @@ pub async fn sync_v3_documents_with_transport(
             // Delete never-synced auto-created local docs so that
             // `pull_missing_documents` treats them as missing and downloads
             // the server's versions instead.
-            for doc_row in &dirty_docs {
-                if doc_row.last_sync_at.is_none() {
-                    let _ = sdk.crdt_delete_document(&doc_row.uuid, &doc_row.data_type);
-                }
+            for (uuid, data_type) in &never_synced_dirty_keys {
+                let _ = sdk.crdt_delete_document(uuid, data_type);
             }
 
             let pulled = pull_missing_documents(sdk, client, device_id, Some(&server_keys)).await;
@@ -291,9 +366,7 @@ pub async fn sync_v3_documents_with_transport(
                 Ok((count, pull_last_sync)) => {
                     documents_pulled = count;
                     documents_synced += count;
-                    if let Some(ts) = pull_last_sync {
-                        last_sync_at = Some(ts);
-                    }
+                    observe_sync_timestamp(&mut last_sync_at, pull_last_sync);
 
                     if stashed_local_snapshot {
                         sdk.things_bootstrap_replay_stash_onto_current_documents(device_id)
@@ -350,14 +423,12 @@ pub async fn sync_v3_documents_with_transport(
                     &output.doc_bytes,
                     &output.sync_state_bytes,
                     false, // no longer dirty
-                    Some(&output.last_sync_at),
+                    output.last_sync_at.as_deref(),
                 )
                 .context("Failed to save synced CRDT document")?;
 
                 documents_synced += 1;
-                if !output.last_sync_at.is_empty() {
-                    last_sync_at = Some(output.last_sync_at);
-                }
+                observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
             }
             Err(err) => {
                 tracing::warn!(
@@ -484,16 +555,14 @@ pub async fn sync_v3_documents_with_transport(
                         &output.doc_bytes,
                         &output.sync_state_bytes,
                         false,
-                        Some(&output.last_sync_at),
+                        output.last_sync_at.as_deref(),
                     )
                     .context("Failed to save synced CRDT document")?;
 
                     documents_synced += 1;
                     // Count as "pulled" so SnapshotReplace is emitted for UI refresh
                     documents_pulled += 1;
-                    if !output.last_sync_at.is_empty() {
-                        last_sync_at = Some(output.last_sync_at);
-                    }
+                    observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -521,9 +590,7 @@ pub async fn sync_v3_documents_with_transport(
             Ok((count, pull_last_sync)) => {
                 documents_pulled += count;
                 documents_synced += count;
-                if let Some(ts) = pull_last_sync {
-                    last_sync_at = Some(ts);
-                }
+                observe_sync_timestamp(&mut last_sync_at, pull_last_sync);
             }
             Err(err) => {
                 tracing::warn!(
@@ -692,7 +759,7 @@ async fn pull_missing_documents(
                             &output.doc_bytes,
                             &output.sync_state_bytes,
                             false,
-                            Some(&output.last_sync_at),
+                            output.last_sync_at.as_deref(),
                         )
                         .context("Failed to save pulled CRDT document")?;
 
@@ -704,12 +771,11 @@ async fn pull_missing_documents(
                         );
 
                         documents_pulled += 1;
-                        if !output.last_sync_at.is_empty() {
-                            last_sync_at = Some(output.last_sync_at);
-                        }
+                        observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
                     }
                     Err(err) => {
                         // Sync round failed; still save the raw snapshot so we have *something*
+                        let snapshot_sync_at = optional_sync_timestamp(sync_at);
                         tracing::warn!(uuid = uuid, data_type = dt_str, error = %err,
                             "Sync round after snapshot download failed, saving raw snapshot");
                         sdk.crdt_save_document(
@@ -718,11 +784,7 @@ async fn pull_missing_documents(
                             &doc_bytes_fallback,
                             &[],
                             false,
-                            if sync_at.is_empty() {
-                                None
-                            } else {
-                                Some(&sync_at)
-                            },
+                            snapshot_sync_at.as_deref(),
                         )
                         .context("Failed to save raw snapshot")?;
                         update_reachability_from_downloaded_doc(
@@ -732,9 +794,7 @@ async fn pull_missing_documents(
                             &mut reachability,
                         );
                         documents_pulled += 1;
-                        if !sync_at.is_empty() {
-                            last_sync_at = Some(sync_at);
-                        }
+                        observe_sync_timestamp(&mut last_sync_at, snapshot_sync_at);
                     }
                 }
             }
@@ -781,7 +841,7 @@ async fn sync_single_v3_document(
     const MAX_ROUNDS: usize = 20;
     const MAX_STALL_ROUNDS: usize = 3;
 
-    let mut last_sync_at = String::new();
+    let mut last_sync_at = None;
     let mut server_msgs: Vec<Vec<u8>> = Vec::new();
     let mut prev_outgoing: Vec<u8> = Vec::new();
     let mut prev_server_msgs: Vec<Vec<u8>> = Vec::new();
@@ -822,7 +882,7 @@ async fn sync_single_v3_document(
             .await
             .context("Failed to sync CRDT document with server")?;
 
-        last_sync_at = last;
+        last_sync_at = optional_sync_timestamp(last);
 
         if outgoing_for_compare == prev_outgoing && next_server_msgs == prev_server_msgs {
             stall_rounds += 1;
@@ -881,60 +941,12 @@ pub fn load_document_set_from_storage(
     sdk: &TriggerSdk,
     device_id: &str,
 ) -> Result<ThingsDocumentSet> {
-    let mut doc_set = ThingsDocumentSet::new(device_id);
-
-    // Load all documents from storage
-    let keys = sdk
-        .crdt_list_document_keys()
-        .context("Failed to list CRDT document keys")?;
-
-    for (uuid, data_type_str) in keys {
-        let data_type: CrdtDataType = match data_type_str.as_str() {
-            "root" => CrdtDataType::Root,
-            "collection" => CrdtDataType::Collection,
-            "thing_markdown" => CrdtDataType::ThingMarkdown,
-            _ => continue,
-        };
-
-        if let Some(row) = sdk
-            .crdt_get_document(&uuid, &data_type_str)
-            .context("Failed to get CRDT document")?
-        {
-            let key = DocumentKey {
-                uuid: uuid.clone(),
-                data_type,
-            };
-            doc_set.set(
-                key,
-                DocumentState {
-                    automerge_doc: row.automerge_doc,
-                    sync_state: row.sync_state,
-                    dirty: row.dirty,
-                    last_sync_at: row.last_sync_at,
-                },
-            );
-        }
-    }
-
-    Ok(doc_set)
+    DocumentPersistence::new(sdk).load_document_set(device_id)
 }
 
 /// Save a ThingsDocumentSet back to storage
 pub fn save_document_set_to_storage(sdk: &TriggerSdk, doc_set: &ThingsDocumentSet) -> Result<()> {
-    for key in doc_set.keys() {
-        if let Some(state) = doc_set.get(key) {
-            sdk.crdt_save_document(
-                &key.uuid,
-                key.data_type_str(),
-                &state.automerge_doc,
-                &state.sync_state,
-                state.dirty,
-                state.last_sync_at.as_deref(),
-            )
-            .context("Failed to save CRDT document to storage")?;
-        }
-    }
-    Ok(())
+    DocumentPersistence::new(sdk).save_document_set(doc_set)
 }
 
 /// Save only dirty documents from a ThingsDocumentSet to storage
@@ -942,27 +954,26 @@ pub fn save_dirty_documents_to_storage(
     sdk: &TriggerSdk,
     doc_set: &ThingsDocumentSet,
 ) -> Result<usize> {
-    let dirty = doc_set.dirty_documents();
-    let count = dirty.len();
-
-    for (key, state) in dirty {
-        sdk.crdt_save_document(
-            &key.uuid,
-            key.data_type_str(),
-            &state.automerge_doc,
-            &state.sync_state,
-            state.dirty,
-            state.last_sync_at.as_deref(),
-        )
-        .context("Failed to save dirty CRDT document to storage")?;
-    }
-
-    Ok(count)
+    DocumentPersistence::new(sdk).save_dirty_documents(doc_set)
 }
 
 #[cfg(test)]
 mod tests_v3 {
     use super::*;
+    use crate::things_crdt::DocumentKey;
+
+    fn test_doc_row(sync_state: Vec<u8>, last_sync_at: Option<&str>) -> crate::types::CrdtDocumentRow {
+        crate::types::CrdtDocumentRow {
+            uuid: "doc-1".to_string(),
+            data_type: "root".to_string(),
+            automerge_doc: Vec::new(),
+            sync_state,
+            dirty: true,
+            last_sync_at: last_sync_at.map(str::to_string),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
 
     #[test]
     fn test_document_key_data_type_str() {
@@ -989,5 +1000,43 @@ mod tests_v3 {
         let doc = remi_things_crdt::Schema::init_root_doc("device-a").unwrap();
 
         assert!(!document_is_at_server_head(&doc, &[]));
+    }
+
+    #[test]
+    fn sync_history_ignores_last_sync_at_when_sync_state_is_initial() {
+        let initial = crate::crdt_sync::init_sync_state();
+
+        assert!(!has_sync_history(&test_doc_row(Vec::new(), Some("2026-03-21T00:00:00Z"))));
+        assert!(!has_sync_history(&test_doc_row(initial, Some("2026-03-21T00:00:00Z"))));
+    }
+
+    #[test]
+    fn sync_history_detects_advanced_sync_state_without_last_sync_at() {
+        let doc = remi_things_crdt::Schema::init_root_doc("device-a").unwrap();
+        let initial = crate::crdt_sync::init_sync_state();
+        let (_message, advanced_state) =
+            crate::crdt_sync::generate_sync_message(&doc, &initial).unwrap();
+
+        assert!(has_sync_history(&test_doc_row(advanced_state, None)));
+    }
+
+    #[test]
+    fn never_synced_dirty_keys_follows_sync_state_history() {
+        let doc = remi_things_crdt::Schema::init_root_doc("device-a").unwrap();
+        let initial = crate::crdt_sync::init_sync_state();
+        let (_message, advanced_state) =
+            crate::crdt_sync::generate_sync_message(&doc, &initial).unwrap();
+
+        let unsynced = crate::types::CrdtDocumentRow {
+            uuid: "unsynced".to_string(),
+            ..test_doc_row(crate::crdt_sync::init_sync_state(), Some("2026-03-21T00:00:00Z"))
+        };
+        let synced = crate::types::CrdtDocumentRow {
+            uuid: "synced".to_string(),
+            ..test_doc_row(advanced_state, None)
+        };
+
+        let keys = never_synced_dirty_keys(&[unsynced, synced]);
+        assert_eq!(keys, vec![("unsynced".to_string(), "root".to_string())]);
     }
 }

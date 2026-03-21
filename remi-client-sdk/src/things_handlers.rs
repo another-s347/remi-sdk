@@ -2,7 +2,7 @@
 
 use crate::TriggerSdk;
 use crate::interrupt_handler::{InterruptHandler, extract_interrupt_data};
-use crate::things_crdt::ThingsSnapshot;
+use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert, ThingsSnapshot};
 use crate::types::{TriggerRegistration, TriggerRule};
 use serde::{Deserialize, Serialize};
 use serde::Deserializer;
@@ -204,25 +204,22 @@ impl InterruptHandler for CollectionAddedHandler {
 
         let collection_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
 
-        let mut collection_obj = serde_json::Map::new();
-        collection_obj.insert("uuid".to_string(), json!(collection_uuid));
-        collection_obj.insert("title".to_string(), json!(info.title));
-        if let Some(created_at) = normalize_optional_string(info.created_at) {
-            collection_obj.insert("created_at".to_string(), json!(created_at));
-        }
-        if let Some(updated_at) = normalize_optional_string(info.updated_at) {
-            collection_obj.insert("updated_at".to_string(), json!(updated_at));
-        }
-        let collection_json = JsonValue::Object(collection_obj);
-
         self.sdk
-            .things_upsert_collection_json(&self.device_id, &collection_json.to_string())
+            .things_upsert_collection(
+                &self.device_id,
+                ThingCollectionUpsert {
+                    uuid: collection_uuid.clone(),
+                    title: info.title.clone(),
+                    trigger_uuid: None,
+                    created_at: normalize_optional_string(info.created_at),
+                    updated_at: normalize_optional_string(info.updated_at),
+                },
+            )
             .map_err(|e| format!("Failed to upsert collection: {}", e))?;
 
         tracing::info!(
             uuid = %collection_uuid,
             title = %info.title,
-            payload_json = %collection_json,
             "[CollectionAddedHandler] Collection added via interrupt"
         );
 
@@ -259,19 +256,17 @@ impl InterruptHandler for CollectionEditedHandler {
 
         let collection_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
 
-        let mut collection_obj = serde_json::Map::new();
-        collection_obj.insert("uuid".to_string(), json!(collection_uuid));
-        collection_obj.insert("title".to_string(), json!(info.title));
-        if let Some(created_at) = normalize_optional_string(info.created_at) {
-            collection_obj.insert("created_at".to_string(), json!(created_at));
-        }
-        if let Some(updated_at) = normalize_optional_string(info.updated_at) {
-            collection_obj.insert("updated_at".to_string(), json!(updated_at));
-        }
-        let collection_json = JsonValue::Object(collection_obj);
-
         self.sdk
-            .things_upsert_collection_json(&self.device_id, &collection_json.to_string())
+            .things_upsert_collection(
+                &self.device_id,
+                ThingCollectionUpsert {
+                    uuid: collection_uuid.clone(),
+                    title: info.title.clone(),
+                    trigger_uuid: None,
+                    created_at: normalize_optional_string(info.created_at),
+                    updated_at: normalize_optional_string(info.updated_at),
+                },
+            )
             .map_err(|e| format!("Failed to upsert collection: {}", e))?;
 
         tracing::info!(uuid = %collection_uuid, title = %info.title, "Collection edited via interrupt");
@@ -349,32 +344,24 @@ impl InterruptHandler for ThingAddedHandler {
             return Err(format!("Collection not found: {collection_uuid}"));
         }
 
-        // Convert incoming (mobile/agent) payload to SDK v2 ThingUpsert JSON.
-        // ThingUpsert requires: uuid, title, datatype, (optional)data, collection_uuid, (optional)parent_uuid.
         let data_value: Option<JsonValue> =
             normalize_string(&info.data_json).and_then(|s| serde_json::from_str(&s).ok());
 
-        let mut thing_obj = serde_json::Map::new();
-        thing_obj.insert("uuid".to_string(), json!(thing_uuid));
-        thing_obj.insert("title".to_string(), json!(info.title));
-        thing_obj.insert("datatype".to_string(), json!(datatype));
-        thing_obj.insert("collection_uuid".to_string(), json!(collection_uuid));
-        if let Some(parent_uuid) = normalize_optional_string(info.parent_uuid) {
-            thing_obj.insert("parent_uuid".to_string(), json!(parent_uuid));
-        }
-        if let Some(created_at) = normalize_optional_string(info.created_at) {
-            thing_obj.insert("created_at".to_string(), json!(created_at));
-        }
-        if let Some(updated_at) = normalize_optional_string(info.updated_at) {
-            thing_obj.insert("updated_at".to_string(), json!(updated_at));
-        }
-        if let Some(v) = data_value {
-            thing_obj.insert("data".to_string(), v);
-        }
-        let thing_json = JsonValue::Object(thing_obj);
-
         self.sdk
-            .things_upsert_thing_json(&self.device_id, &thing_json.to_string())
+            .things_upsert_thing(
+                &self.device_id,
+                ThingUpsert {
+                    uuid: thing_uuid.clone(),
+                    title: info.title.clone(),
+                    datatype: ThingDatatype::from_str(&datatype),
+                    data: data_value,
+                    collection_uuid: collection_uuid.clone(),
+                    trigger_uuid: None,
+                    parent_uuid: normalize_optional_string(info.parent_uuid),
+                    created_at: normalize_optional_string(info.created_at),
+                    updated_at: normalize_optional_string(info.updated_at),
+                },
+            )
             .map_err(|e| format!("Failed to upsert thing: {}", e))?;
 
         tracing::info!(uuid = %thing_uuid, title = %info.title, "Thing added via interrupt");
@@ -414,31 +401,24 @@ impl InterruptHandler for ThingEditedHandler {
         let collection_uuid = normalize_required_uuid(&info.collection_uuid, "collection_uuid")?;
         let datatype = normalize_string(&info.datatype).unwrap_or_else(|| "markdown".to_string());
 
-        // Convert incoming payload to SDK v2 ThingUpsert JSON.
         let data_value: Option<JsonValue> =
             normalize_string(&info.data_json).and_then(|s| serde_json::from_str(&s).ok());
 
-        let mut thing_obj = serde_json::Map::new();
-        thing_obj.insert("uuid".to_string(), json!(thing_uuid));
-        thing_obj.insert("title".to_string(), json!(info.title));
-        thing_obj.insert("datatype".to_string(), json!(datatype));
-        thing_obj.insert("collection_uuid".to_string(), json!(collection_uuid));
-        if let Some(parent_uuid) = normalize_optional_string(info.parent_uuid) {
-            thing_obj.insert("parent_uuid".to_string(), json!(parent_uuid));
-        }
-        if let Some(created_at) = normalize_optional_string(info.created_at) {
-            thing_obj.insert("created_at".to_string(), json!(created_at));
-        }
-        if let Some(updated_at) = normalize_optional_string(info.updated_at) {
-            thing_obj.insert("updated_at".to_string(), json!(updated_at));
-        }
-        if let Some(v) = data_value {
-            thing_obj.insert("data".to_string(), v);
-        }
-        let thing_json = JsonValue::Object(thing_obj);
-
         self.sdk
-            .things_upsert_thing_json(&self.device_id, &thing_json.to_string())
+            .things_upsert_thing(
+                &self.device_id,
+                ThingUpsert {
+                    uuid: thing_uuid.clone(),
+                    title: info.title.clone(),
+                    datatype: ThingDatatype::from_str(&datatype),
+                    data: data_value,
+                    collection_uuid: collection_uuid.clone(),
+                    trigger_uuid: None,
+                    parent_uuid: normalize_optional_string(info.parent_uuid),
+                    created_at: normalize_optional_string(info.created_at),
+                    updated_at: normalize_optional_string(info.updated_at),
+                },
+            )
             .map_err(|e| format!("Failed to upsert thing: {}", e))?;
 
         tracing::info!(uuid = %thing_uuid, title = %info.title, "Thing edited via interrupt");
@@ -638,27 +618,24 @@ impl InterruptHandler for ThingMovedHandler {
 
         // Perform move as an upsert that preserves title/datatype, and only changes collection/parent.
         // We intentionally omit `data` so content is not rewritten.
-        let mut thing_obj = serde_json::Map::new();
-        thing_obj.insert("uuid".to_string(), json!(existing.uuid));
-        thing_obj.insert("title".to_string(), json!(existing.title));
-        thing_obj.insert("datatype".to_string(), json!(existing.datatype.to_string()));
-        thing_obj.insert(
-            "collection_uuid".to_string(),
-            json!(to_collection_uuid.to_string()),
-        );
-        if let Some(ref p) = parent_uuid {
-            thing_obj.insert("parent_uuid".to_string(), json!(p));
-        } else {
-            // Explicitly clear parent when caller passed empty/None.
-            thing_obj.insert("parent_uuid".to_string(), json!(""));
-        }
-
-        let thing_json = JsonValue::Object(thing_obj);
-        tracing::info!(thing_json = %thing_json, "[ThingMovedHandler] Calling things_upsert_thing_json");
+        tracing::info!(thing_uuid = %existing.uuid, "[ThingMovedHandler] Calling things_upsert_thing");
 
         if let Err(e) = self
             .sdk
-            .things_upsert_thing_json(&self.device_id, &thing_json.to_string())
+            .things_upsert_thing(
+                &self.device_id,
+                ThingUpsert {
+                    uuid: existing.uuid.clone(),
+                    title: existing.title.clone(),
+                    datatype: existing.datatype.clone(),
+                    data: None,
+                    collection_uuid: to_collection_uuid.to_string(),
+                    trigger_uuid: existing.trigger_uuid.clone(),
+                    parent_uuid: Some(parent_uuid.clone().unwrap_or_default()),
+                    created_at: None,
+                    updated_at: None,
+                },
+            )
         {
             tracing::error!(error = %e, "[ThingMovedHandler] Failed to upsert");
             return Ok(json!({
@@ -852,12 +829,11 @@ impl InterruptHandler for ThingsGetThingMarkdownHandler {
             .map_err(|e| format!("Failed to get thing markdown: {e}"))?
             .unwrap_or_default();
 
-        let content_entries_json = self
+        let content_entries = self
             .sdk
             .things_get_content_entries(&self.device_id, &req.uuid)
-            .unwrap_or_else(|_| "[]".to_string());
-        let content_entries: JsonValue =
-            serde_json::from_str(&content_entries_json).unwrap_or(JsonValue::Array(vec![]));
+            .map(|items| serde_json::to_value(items).unwrap_or(JsonValue::Array(vec![])))
+            .unwrap_or_else(|_| JsonValue::Array(vec![]));
 
         Ok(json!({
             "thing_markdown": {

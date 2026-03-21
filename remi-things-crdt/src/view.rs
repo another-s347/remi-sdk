@@ -322,6 +322,23 @@ pub struct ThingMarkdownView {
     pub content: Option<ContentView>,
 }
 
+/// Generic view for a thing-owned content document.
+///
+/// Today the only concrete content document family is `thing_markdown`, but the
+/// long-term model treats that as the first registered content-doc specialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThingContentView {
+    pub schema_version: u32,
+    /// Document UUID for this content document.
+    pub document_uuid: String,
+    /// The thing UUID this content belongs to.
+    pub thing_uuid: String,
+    /// Registered content type carried by this document, for example `markdown`.
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<ContentView>,
+}
+
 // ============================================================================
 // Conversion helpers
 // ============================================================================

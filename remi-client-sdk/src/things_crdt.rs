@@ -5,8 +5,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
+pub use remi_things_crdt::{
+    ContentEntry, ContentEntryKind, ContentEntryPayload, ContentEntryUpdate, DateField,
+    ImageField, LocationField, ThingDatatype, UrlField,
+};
+
 use remi_things_crdt::{
-    CURRENT_SCHEMA_VERSION, CrdtDataType, Content, Op, Schema, ThingDatatype, TriggerUpdate,
+    CURRENT_SCHEMA_VERSION, CrdtDataType, Content, Op, Schema, TriggerUpdate,
     ROOT_DOC_UUID,
     // V3 types
     CollectionOp, ThingMarkdownOp,
@@ -17,7 +22,7 @@ use remi_things_crdt::{
     needs_compaction, compact_root_doc, compact_collection_doc, compact_thing_markdown_doc,
     DEFAULT_COMPACTION_THRESHOLD,
     // V3 built-in fields (multi-value)
-    ContentEntry, ContentEntryPayload, ThingBuiltInFieldsUpdate,
+    ThingBuiltInFieldsUpdate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +133,533 @@ pub struct ThingsSnapshot {
     pub things: Vec<ThingEntry>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ContentTypeRegistry;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisteredContentType {
+    Markdown,
+    Url,
+    Location,
+    Date,
+    Image,
+    Custom(String),
+}
+
+impl ContentTypeRegistry {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn detect_payload_type(&self, value: &Value) -> Result<RegisteredContentType> {
+        let payload_type = value
+            .get("type")
+            .and_then(|entry_type| entry_type.as_str())
+            .filter(|entry_type| !entry_type.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing payload type"))?;
+
+        match payload_type {
+            "markdown" => Ok(RegisteredContentType::Markdown),
+            "url" => Ok(RegisteredContentType::Url),
+            "location" => Ok(RegisteredContentType::Location),
+            "date" => Ok(RegisteredContentType::Date),
+            "image" => Ok(RegisteredContentType::Image),
+            other => Ok(RegisteredContentType::Custom(other.to_string())),
+        }
+    }
+
+    pub fn parse_content_entry(&self, value: &Value) -> Result<ContentEntry> {
+        let id = value
+            .get("id")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let title = value
+            .get("title")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        let order = value.get("order").and_then(|item| item.as_f64()).unwrap_or(0.0);
+        let payload_value = value
+            .get("payload")
+            .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
+
+        Ok(ContentEntry {
+            id,
+            title,
+            order,
+            payload: self.parse_content_entry_payload(payload_value)?,
+        })
+    }
+
+    pub fn parse_content_entry_update(
+        &self,
+        value: &Value,
+    ) -> Result<(Option<Option<String>>, Option<f64>, Option<ContentEntryPayload>)> {
+        let title = if value.get("title").is_some() {
+            Some(
+                value.get("title")
+                    .and_then(|item| item.as_str())
+                    .map(|item| item.to_string()),
+            )
+        } else {
+            None
+        };
+        let order = value.get("order").and_then(|item| item.as_f64());
+        let payload = value
+            .get("payload")
+            .map(|payload| self.parse_content_entry_payload(payload))
+            .transpose()?;
+
+        Ok((title, order, payload))
+    }
+
+    pub fn parse_content_entry_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
+        match self.detect_payload_type(value)? {
+            RegisteredContentType::Markdown => self.parse_markdown_payload(value),
+            RegisteredContentType::Url => self.parse_url_payload(value),
+            RegisteredContentType::Location => self.parse_location_payload(value),
+            RegisteredContentType::Date => self.parse_date_payload(value),
+            RegisteredContentType::Image => self.parse_image_payload(value),
+            RegisteredContentType::Custom(content_type) => {
+                self.parse_custom_payload(&content_type, value)
+            }
+        }
+    }
+
+    pub fn serialize_content_entry(&self, entry: &ContentEntry) -> Value {
+        json!({
+            "id": entry.id,
+            "title": entry.title,
+            "order": entry.order,
+            "payload": self.serialize_content_entry_payload(&entry.payload),
+        })
+    }
+
+    pub fn serialize_content_entries(&self, entries: &[ContentEntry]) -> Value {
+        Value::Array(
+            entries
+                .iter()
+                .map(|entry| self.serialize_content_entry(entry))
+                .collect(),
+        )
+    }
+
+    pub fn serialize_thing_built_in(
+        &self,
+        built_in: &remi_things_crdt::ThingBuiltInFieldsView,
+    ) -> Value {
+        let mut obj = serde_json::Map::new();
+        if !built_in.content_entries.is_empty() {
+            obj.insert(
+                "content_entries".to_string(),
+                self.serialize_content_entries(&built_in.content_entries),
+            );
+        }
+        if let Some(extra) = &built_in.extra {
+            obj.insert("extra".to_string(), extra.clone());
+        }
+        Value::Object(obj)
+    }
+
+    pub fn serialize_thing_snapshot_data(
+        &self,
+        meta: &remi_things_crdt::ThingMetaView,
+        content: Option<&remi_things_crdt::view::ContentView>,
+        options: SnapshotOptions,
+    ) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("status".to_string(), json!(meta.status));
+        obj.insert("datatype".to_string(), json!(meta.datatype));
+        obj.insert("attrs".to_string(), json!(meta.attrs));
+        if options.include_content {
+            obj.insert("content".to_string(), json!(content));
+        }
+        obj.insert(
+            "built_in".to_string(),
+            self.serialize_thing_built_in(&meta.built_in),
+        );
+        Value::Object(obj)
+    }
+
+    pub fn find_first_payload_by_kind(
+        &self,
+        entries: &[ContentEntry],
+        kind: &remi_things_crdt::ContentEntryKind,
+    ) -> Option<Value> {
+        entries
+            .iter()
+            .find(|entry| &entry.kind() == kind)
+            .map(|entry| self.serialize_content_entry_payload(&entry.payload))
+    }
+
+    fn parse_markdown_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
+        let doc_uuid = value
+            .get("doc_uuid")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        Ok(ContentEntryPayload::Markdown { doc_uuid })
+    }
+
+    fn parse_url_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
+        let url = value
+            .get("url")
+            .and_then(|item| item.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = value
+            .get("title")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        let description = value
+            .get("description")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        let image_url = value
+            .get("image_url")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        let favicon_url = value
+            .get("favicon_url")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        let site_name = value
+            .get("site_name")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        let resolved = value.get("resolved").and_then(|item| item.as_bool()).unwrap_or(false);
+        Ok(ContentEntryPayload::Url(remi_things_crdt::UrlField {
+            url,
+            title,
+            description,
+            image_url,
+            favicon_url,
+            site_name,
+            resolved,
+        }))
+    }
+
+    fn parse_location_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
+        use remi_things_crdt::LocationField;
+
+        let loc_type = value
+            .get("loc_type")
+            .and_then(|entry_type| entry_type.as_str())
+            .unwrap_or("");
+        let location = match loc_type {
+            "coordinate" => {
+                let lat = value
+                    .get("lat")
+                    .and_then(|item| item.as_f64())
+                    .ok_or_else(|| anyhow::anyhow!("Missing lat"))?;
+                let lng = value
+                    .get("lng")
+                    .and_then(|item| item.as_f64())
+                    .ok_or_else(|| anyhow::anyhow!("Missing lng"))?;
+                let coord_system = value
+                    .get("coord_system")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("wgs84")
+                    .to_string();
+                let source_name = value
+                    .get("source_name")
+                    .and_then(|item| item.as_str())
+                    .map(|item| item.to_string());
+                LocationField::Coordinate {
+                    lat,
+                    lng,
+                    coord_system,
+                    source_name,
+                }
+            }
+            "fuzzy" => {
+                let name = value
+                    .get("name")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let place_type = value
+                    .get("place_type")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                LocationField::Fuzzy { name, place_type }
+            }
+            _ => anyhow::bail!("Invalid location type: {}", loc_type),
+        };
+
+        Ok(ContentEntryPayload::Location(location))
+    }
+
+    fn parse_date_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
+        use remi_things_crdt::DateField;
+
+        let timestamp_ms = value
+            .get("timestamp_ms")
+            .and_then(|item| item.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("Missing timestamp_ms"))?;
+        let has_time = value
+            .get("has_time")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false);
+        let timezone = value
+            .get("timezone")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        Ok(ContentEntryPayload::Date(DateField {
+            timestamp_ms,
+            has_time,
+            timezone,
+        }))
+    }
+
+    fn parse_image_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
+        let uri = value
+            .get("uri")
+            .and_then(|item| item.as_str())
+            .unwrap_or("")
+            .to_string();
+        let caption = value
+            .get("caption")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        let width = value.get("width").and_then(|item| item.as_u64()).map(|item| item as u32);
+        let height = value.get("height").and_then(|item| item.as_u64()).map(|item| item as u32);
+        let size_bytes = value.get("size_bytes").and_then(|item| item.as_u64());
+        let device_id = value
+            .get("device_id")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string());
+        Ok(ContentEntryPayload::Image(remi_things_crdt::ImageField {
+            uri,
+            caption,
+            width,
+            height,
+            size_bytes,
+            device_id,
+        }))
+    }
+
+    // External custom payload contract:
+    // - Legacy explicit custom wrapper uses {"type":"custom","data":<json>}.
+    // - Future extension types use {"type":"<external-type>", ...}.
+    //   For object payloads, every field except `type` is preserved verbatim.
+    //   For scalar/array payloads, callers should wrap the value as
+    //   {"type":"<external-type>","data":<json>} so round-tripping stays lossless.
+    fn parse_custom_payload(&self, content_type: &str, value: &Value) -> Result<ContentEntryPayload> {
+        let data = if content_type == "custom" {
+            value.get("data").cloned().unwrap_or(Value::Null)
+        } else {
+            match value {
+                Value::Object(map) => {
+                    let mut data = serde_json::Map::new();
+                    for (key, field_value) in map {
+                        if key != "type" {
+                            data.insert(key.clone(), field_value.clone());
+                        }
+                    }
+                    Value::Object(data)
+                }
+                _ => Value::Null,
+            }
+        };
+
+        Ok(ContentEntryPayload::Custom {
+            content_type: content_type.to_string(),
+            data,
+        })
+    }
+
+    pub fn serialize_content_entry_payload(&self, payload: &ContentEntryPayload) -> Value {
+        match payload {
+            ContentEntryPayload::Markdown { doc_uuid } => json!({
+                "type": "markdown",
+                "doc_uuid": doc_uuid,
+            }),
+            ContentEntryPayload::Url(url) => json!({
+                "type": "url",
+                "url": url.url,
+                "title": url.title,
+                "description": url.description,
+                "image_url": url.image_url,
+                "favicon_url": url.favicon_url,
+                "site_name": url.site_name,
+                "resolved": url.resolved,
+            }),
+            ContentEntryPayload::Location(location) => self.serialize_location_payload(location),
+            ContentEntryPayload::Date(date) => json!({
+                "type": "date",
+                "timestamp_ms": date.timestamp_ms,
+                "has_time": date.has_time,
+                "timezone": date.timezone,
+            }),
+            ContentEntryPayload::Image(image) => json!({
+                "type": "image",
+                "uri": image.uri,
+                "caption": image.caption,
+                "width": image.width,
+                "height": image.height,
+                "size_bytes": image.size_bytes,
+                "device_id": image.device_id,
+            }),
+            ContentEntryPayload::Custom { content_type, data } => {
+                self.serialize_custom_payload(content_type, data)
+            }
+        }
+    }
+
+    // Serialize back to the external SDK/API shape described above.
+    fn serialize_custom_payload(&self, content_type: &str, data: &Value) -> Value {
+        if content_type == "custom" {
+            return json!({
+                "type": "custom",
+                "data": data,
+            });
+        }
+
+        match data {
+            Value::Object(map) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("type".to_string(), Value::String(content_type.to_string()));
+                for (key, value) in map {
+                    obj.insert(key.clone(), value.clone());
+                }
+                Value::Object(obj)
+            }
+            other => json!({
+                "type": content_type,
+                "data": other,
+            }),
+        }
+    }
+
+    fn serialize_location_payload(&self, location: &remi_things_crdt::LocationField) -> Value {
+        match location {
+            remi_things_crdt::LocationField::Coordinate {
+                lat,
+                lng,
+                coord_system,
+                source_name,
+            } => json!({
+                "type": "location",
+                "loc_type": "coordinate",
+                "lat": lat,
+                "lng": lng,
+                "coord_system": coord_system,
+                "source_name": source_name,
+            }),
+            remi_things_crdt::LocationField::Fuzzy { name, place_type } => json!({
+                "type": "location",
+                "loc_type": "fuzzy",
+                "name": name,
+                "place_type": place_type,
+            }),
+        }
+    }
+
+    pub fn extract_markdown_text_from_snapshot_data(&self, data: &Value) -> Option<String> {
+        if let Some(markdown) = data.get("markdown").and_then(|value| value.as_str()) {
+            return Some(markdown.to_string());
+        }
+
+        data.get("content")
+            .and_then(|content| content.get("blocks"))
+            .and_then(|blocks| blocks.as_array())
+            .and_then(|blocks| {
+                blocks.iter().find(|block| {
+                    block.get("id") == Some(&Value::String("main".to_string()))
+                })
+            })
+            .and_then(|block| block.get("text"))
+            .and_then(|text| text.as_str())
+            .map(|text| text.to_string())
+    }
+
+    pub fn extract_thing_snapshot_parts(
+        &self,
+        data: &Value,
+    ) -> Result<(Option<String>, Vec<ContentEntry>)> {
+        Ok((
+            self.extract_markdown_text_from_snapshot_data(data),
+            self.extract_content_entries_from_snapshot_data(data)?,
+        ))
+    }
+
+    pub fn markdown_content_from_value(
+        &self,
+        original_datatype: &ThingDatatype,
+        payload: &Value,
+    ) -> Content {
+        if original_datatype.is_markdownish() {
+            let text = match payload {
+                Value::String(s) => s.clone(),
+                Value::Object(map) => map
+                    .get("markdown")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| payload.to_string()),
+                _ => payload.to_string(),
+            };
+            return Content::Markdown {
+                blocks: vec![remi_things_crdt::Block {
+                    id: "main".to_string(),
+                    r#type: "markdown".to_string(),
+                    attrs_json: None,
+                    text: Some(text),
+                }],
+            };
+        }
+
+        let attrs = json!({
+            "embed_kind": original_datatype.as_str(),
+            "payload": payload,
+        })
+        .to_string();
+
+        Content::Markdown {
+            blocks: vec![remi_things_crdt::Block {
+                id: "main".to_string(),
+                r#type: original_datatype.to_string(),
+                attrs_json: Some(attrs),
+                text: None,
+            }],
+        }
+    }
+
+    pub fn extract_content_entries_from_snapshot_data(&self, data: &Value) -> Result<Vec<ContentEntry>> {
+        let Some(entries) = data
+            .get("built_in")
+            .and_then(|built_in| built_in.get("content_entries"))
+            .and_then(|entries| entries.as_array())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let payload = entry
+                .get("payload")
+                .ok_or_else(|| anyhow::anyhow!("Missing payload in stashed content entry"))?;
+
+            out.push(ContentEntry {
+                id: entry
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing id in stashed content entry"))?
+                    .to_string(),
+                title: entry
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
+                order: entry.get("order").and_then(|value| value.as_f64()).unwrap_or(0.0),
+                payload: self.parse_content_entry_payload(payload)?,
+            });
+        }
+
+        Ok(out)
+    }
+}
+
 pub fn init_empty_doc(device_id: &str) -> Result<Vec<u8>> {
     let mut doc = AutoCommit::new();
     Schema::ensure_root(&mut doc, device_id, 0)?;
@@ -170,10 +702,10 @@ pub fn delete_collection(
 
 pub fn upsert_thing(doc_bytes: &[u8], device_id: &str, upsert: ThingUpsert) -> Result<Vec<u8>> {
     let trigger = trigger_update_from_tri_state(upsert.trigger_uuid.as_deref());
+    let content_registry = ContentTypeRegistry::new();
 
     let content = upsert.data.as_ref().map(|payload| {
-        let original_datatype = upsert.datatype.clone();
-        markdown_only_content_from_value(&original_datatype, payload)
+        content_registry.markdown_content_from_value(&upsert.datatype, payload)
     });
     remi_things_crdt::apply_op(
         doc_bytes,
@@ -224,40 +756,7 @@ pub fn markdown_only_content_from_value(
     original_datatype: &ThingDatatype,
     payload: &Value,
 ) -> Content {
-    if original_datatype.is_markdownish() {
-        let text = match payload {
-            Value::String(s) => s.clone(),
-            Value::Object(map) => map
-                .get("markdown")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| payload.to_string()),
-            _ => payload.to_string(),
-        };
-        return Content::Markdown {
-            blocks: vec![remi_things_crdt::Block {
-                id: "main".to_string(),
-                r#type: "markdown".to_string(),
-                attrs_json: None,
-                text: Some(text),
-            }],
-        };
-    }
-
-    let attrs = json!({
-        "embed_kind": original_datatype.as_str(),
-        "payload": payload,
-    })
-    .to_string();
-
-    Content::Markdown {
-        blocks: vec![remi_things_crdt::Block {
-            id: "main".to_string(),
-            r#type: original_datatype.to_string(),
-            attrs_json: Some(attrs),
-            text: None,
-        }],
-    }
+    ContentTypeRegistry::new().markdown_content_from_value(original_datatype, payload)
 }
 
 pub fn delete_thing(
@@ -497,197 +996,291 @@ impl DocumentState {
     }
 }
 
-/// Manages the set of CRDT documents (Root, Collections, ThingMarkdown)
-#[derive(Debug, Clone)]
-pub struct ThingsDocumentSet {
-    device_id: String,
-    documents: HashMap<DocumentKey, DocumentState>,
+#[derive(Debug, Clone, Copy)]
+struct DocumentStoreView<'a> {
+    documents: &'a HashMap<DocumentKey, DocumentState>,
 }
 
-impl ThingsDocumentSet {
-    /// Create a new empty document set
-    pub fn new(device_id: &str) -> Self {
-        Self {
-            device_id: device_id.to_string(),
-            documents: HashMap::new(),
-        }
+impl<'a> DocumentStoreView<'a> {
+    fn new(documents: &'a HashMap<DocumentKey, DocumentState>) -> Self {
+        Self { documents }
     }
 
-    /// Initialize with a root document
-    pub fn init_root(&mut self) -> Result<()> {
-        let key = DocumentKey::root();
-        if self.documents.contains_key(&key) {
-            return Ok(());
-        }
-
-        let doc_bytes = Schema::init_root_doc(&self.device_id)?;
-        self.documents.insert(
-            key,
-            DocumentState {
-                automerge_doc: doc_bytes,
-                sync_state: Vec::new(),
-                dirty: true,
-                last_sync_at: None,
-            },
-        );
-        Ok(())
-    }
-
-    /// Get or create the root document
-    pub fn get_or_init_root(&mut self) -> Result<&DocumentState> {
-        self.init_root()?;
-        Ok(self.documents.get(&DocumentKey::root()).unwrap())
-    }
-
-    /// Get a document by key
-    pub fn get(&self, key: &DocumentKey) -> Option<&DocumentState> {
+    fn get(&self, key: &DocumentKey) -> Option<&'a DocumentState> {
         self.documents.get(key)
     }
 
-    /// Get a document mutably
-    pub fn get_mut(&mut self, key: &DocumentKey) -> Option<&mut DocumentState> {
-        self.documents.get_mut(key)
+    fn iter(&self) -> impl Iterator<Item = (&'a DocumentKey, &'a DocumentState)> {
+        self.documents.iter()
+    }
+}
+
+struct DocumentStoreMut<'a> {
+    device_id: &'a str,
+    documents: &'a mut HashMap<DocumentKey, DocumentState>,
+}
+
+impl<'a> DocumentStoreMut<'a> {
+    fn new(device_id: &'a str, documents: &'a mut HashMap<DocumentKey, DocumentState>) -> Self {
+        Self { device_id, documents }
     }
 
-    /// Insert or update a document
-    pub fn set(&mut self, key: DocumentKey, state: DocumentState) {
+    fn set(&mut self, key: DocumentKey, state: DocumentState) {
         self.documents.insert(key, state);
     }
 
-    /// Check if a document exists
-    pub fn contains(&self, key: &DocumentKey) -> bool {
-        self.documents.contains_key(key)
+    fn set_persisted_state(
+        &mut self,
+        key: &DocumentKey,
+        mark_clean: bool,
+        last_sync_at: Option<&str>,
+    ) {
+        if let Some(state) = self.documents.get_mut(key) {
+            if mark_clean {
+                state.dirty = false;
+            }
+            if let Some(last_sync_at) = last_sync_at {
+                state.last_sync_at = Some(last_sync_at.to_string());
+            }
+        }
     }
 
-    /// Get all document keys
-    pub fn keys(&self) -> impl Iterator<Item = &DocumentKey> {
-        self.documents.keys()
-    }
-
-    /// Get all dirty documents, ordered by sync priority
-    pub fn dirty_documents(&self) -> Vec<(&DocumentKey, &DocumentState)> {
-        let mut dirty: Vec<_> = self
-            .documents
+    fn dirty_document_keys(&self) -> Vec<DocumentKey> {
+        self.documents
             .iter()
             .filter(|(_, state)| state.dirty)
-            .collect();
-        dirty.sort_by_key(|(key, _)| key.data_type.sync_priority());
-        dirty
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
-    /// Mark a document as clean (synced)
-    pub fn mark_clean(&mut self, key: &DocumentKey) {
-        if let Some(state) = self.documents.get_mut(key) {
-            state.dirty = false;
+    fn remove_document(&mut self, key: &DocumentKey) -> Option<DocumentState> {
+        self.documents.remove(key)
+    }
+
+    fn maybe_compact_with_threshold(&mut self, key: &DocumentKey, threshold: usize) -> Result<bool> {
+        let Some(state) = self.documents.get(key) else {
+            return Ok(false);
+        };
+
+        if !needs_compaction(&state.automerge_doc, threshold) {
+            return Ok(false);
         }
-    }
 
-    /// Mark a document as dirty
-    pub fn mark_dirty(&mut self, key: &DocumentKey) {
+        let compacted = match key.data_type {
+            CrdtDataType::Root => {
+                compact_root_doc(&state.automerge_doc, self.device_id)
+                    .context("Failed to compact root document")?
+            }
+            CrdtDataType::Collection => {
+                compact_collection_doc(&state.automerge_doc, &key.uuid, self.device_id)
+                    .context("Failed to compact collection document")?
+            }
+            CrdtDataType::ThingMarkdown => {
+                compact_thing_markdown_doc(&state.automerge_doc, &key.uuid, self.device_id)
+                    .context("Failed to compact thing markdown document")?
+            }
+        };
+
         if let Some(state) = self.documents.get_mut(key) {
+            state.automerge_doc = compacted;
             state.dirty = true;
         }
+
+        Ok(true)
     }
 
-    /// Ensure every locally-loaded collection document is listed in the root
-    /// document's `collection_uuids`.  This repairs the root → collection
-    /// linkage that can break when sync is interrupted or documents arrive
-    /// out of order.
-    ///
-    /// Returns the number of collections that were re-linked to root.
-    pub fn repair_root_collection_linkage(&mut self) -> Result<usize> {
-        let root_view = self.root_view()?;
-        let root_uuids: std::collections::HashSet<&str> =
-            root_view.collection_uuids.iter().map(|s| s.as_str()).collect();
-
-        let orphaned_colls: Vec<String> = self
+    fn compact_all_with_threshold(&mut self, threshold: usize) -> Result<usize> {
+        let keys_to_compact: Vec<DocumentKey> = self
             .documents
-            .keys()
-            .filter(|k| k.data_type == CrdtDataType::Collection && !root_uuids.contains(k.uuid.as_str()))
-            .filter_map(|k| {
-                match self.collection_view(&k.uuid) {
-                    Ok(view)
-                        if !view
-                            .meta
-                            .tombstone
-                            .as_ref()
-                            .map(|t| t.deleted)
-                            .unwrap_or(false) =>
-                    {
-                        Some(k.uuid.clone())
-                    }
-                    Ok(_) => {
-                        tracing::debug!(
-                            collection_uuid = k.uuid.as_str(),
-                            "repair_root_collection_linkage: skipping tombstoned collection"
-                        );
-                        None
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            collection_uuid = k.uuid.as_str(),
-                            error = %err,
-                            "repair_root_collection_linkage: failed to inspect collection, skipping relink"
-                        );
-                        None
-                    }
-                }
-            })
+            .iter()
+            .filter(|(_, state)| needs_compaction(&state.automerge_doc, threshold))
+            .map(|(key, _)| key.clone())
             .collect();
 
-        if orphaned_colls.is_empty() {
-            return Ok(0);
+        let mut count = 0;
+        for key in keys_to_compact {
+            if self.maybe_compact_with_threshold(&key, threshold)? {
+                count += 1;
+            }
         }
 
-        for coll_uuid in &orphaned_colls {
-            tracing::warn!(
-                collection_uuid = coll_uuid.as_str(),
-                "repair_root_collection_linkage: re-linking orphaned collection to root"
-            );
-            self.add_collection(coll_uuid)?;
-        }
+        Ok(count)
+    }
+}
 
-        Ok(orphaned_colls.len())
+#[derive(Debug, Clone, Copy)]
+struct ThingsDomainReader<'a> {
+    store: DocumentStoreView<'a>,
+}
+
+impl<'a> ThingsDomainReader<'a> {
+    fn new(store: DocumentStoreView<'a>) -> Self {
+        Self { store }
     }
 
-    /// Return collection UUIDs that are still live and reachable from the root document.
-    pub fn live_collection_uuids_from_root(&self) -> Result<HashSet<String>> {
-        let root_view = self.root_view()?;
-        let mut live = HashSet::new();
+    fn root_view(&self) -> Result<RootView> {
+        let key = DocumentKey::root();
+        match self.store.get(&key) {
+            Some(state) => extract_root_view(&state.automerge_doc),
+            None => Ok(RootView {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                epoch: 0,
+                collection_uuids: Vec::new(),
+            }),
+        }
+    }
 
-        for coll_uuid in root_view.collection_uuids {
-            let key = DocumentKey::collection(&coll_uuid);
-            match self.documents.get(&key) {
-                Some(_) => {
-                    let deleted = self
-                        .collection_view(&coll_uuid)?
-                        .meta
-                        .tombstone
-                        .as_ref()
-                        .map(|t| t.deleted)
-                        .unwrap_or(false);
-                    if !deleted {
-                        live.insert(coll_uuid);
-                    }
-                }
-                None => {
-                    // Root still references it; keep it reachable so Phase 2 can pull it.
-                    live.insert(coll_uuid);
+    fn collection_view(&self, collection_uuid: &str) -> Result<CollectionDocView> {
+        let key = DocumentKey::collection(collection_uuid);
+        match self.store.get(&key) {
+            Some(state) => extract_collection_doc_view(&state.automerge_doc, collection_uuid),
+            None => Ok(CollectionDocView {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                meta: remi_things_crdt::CollectionMetaView {
+                    id: collection_uuid.to_string(),
+                    title: String::new(),
+                    status: "active".to_string(),
+                    edit_clock: remi_things_crdt::view::EditClock::zero(),
+                    tombstone: None,
+                    trigger: None,
+                    attrs: None,
+                },
+                things: Vec::new(),
+            }),
+        }
+    }
+
+    fn thing_markdown_view(&self, thing_uuid: &str) -> Result<ThingMarkdownView> {
+        let key = DocumentKey::thing_markdown(thing_uuid);
+        match self.store.get(&key) {
+            Some(state) => extract_thing_markdown_view(&state.automerge_doc, thing_uuid),
+            None => Ok(ThingMarkdownView {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                thing_uuid: thing_uuid.to_string(),
+                content: None,
+            }),
+        }
+    }
+
+    fn get_content_entries(
+        &self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+    ) -> Result<Vec<ContentEntry>> {
+        let key = DocumentKey::collection(collection_uuid);
+        let state = self
+            .store
+            .get(&key)
+            .context("Collection not found")?;
+
+        let view = extract_collection_doc_view(&state.automerge_doc, collection_uuid)?;
+        let collection_deleted = view
+            .meta
+            .tombstone
+            .as_ref()
+            .map(|t| t.deleted)
+            .unwrap_or(false);
+        if collection_deleted {
+            anyhow::bail!("Thing not found");
+        }
+
+        let thing = view
+            .things
+            .iter()
+            .find(|thing| thing.id == thing_uuid)
+            .context("Thing not found")?;
+
+        let thing_deleted = thing
+            .tombstone
+            .as_ref()
+            .map(|t| t.deleted)
+            .unwrap_or(false);
+        if thing_deleted {
+            anyhow::bail!("Thing not found");
+        }
+
+        Ok(thing.built_in.content_entries.clone())
+    }
+
+    fn find_thing_collection_uuid(&self, thing_uuid: &str) -> Option<String> {
+        for (key, state) in self.store.iter() {
+            if key.data_type != CrdtDataType::Collection {
+                continue;
+            }
+
+            let view = match extract_collection_doc_view(&state.automerge_doc, &key.uuid) {
+                Ok(view) => view,
+                Err(_) => continue,
+            };
+
+            if view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            for thing in &view.things {
+                let thing_deleted = thing
+                    .tombstone
+                    .as_ref()
+                    .map(|t| t.deleted)
+                    .unwrap_or(false);
+                if !thing_deleted && thing.id == thing_uuid {
+                    return Some(key.uuid.clone());
                 }
             }
+        }
+
+        None
+    }
+
+    fn collection_uuids_from_documents(&self) -> Result<Vec<String>> {
+        let mut collection_uuids = Vec::new();
+
+        for (key, state) in self.store.iter() {
+            if key.data_type != CrdtDataType::Collection {
+                continue;
+            }
+
+            let view = extract_collection_doc_view(&state.automerge_doc, &key.uuid)?;
+            if view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            collection_uuids.push(key.uuid.clone());
+        }
+
+        collection_uuids.sort();
+        Ok(collection_uuids)
+    }
+
+    fn active_collection_uuids(&self) -> Result<HashSet<String>> {
+        let mut live = HashSet::new();
+
+        for coll_uuid in self.collection_uuids_from_documents()? {
+            live.insert(coll_uuid);
         }
 
         Ok(live)
     }
 
-    /// Return thing UUIDs that are still reachable through live collections.
-    pub fn live_thing_uuids_from_root(&self) -> Result<HashSet<String>> {
-        let live_collections = self.live_collection_uuids_from_root()?;
+    fn active_thing_uuids(&self) -> Result<HashSet<String>> {
+        let live_collections = self.active_collection_uuids()?;
         let mut live_things = HashSet::new();
 
         for coll_uuid in &live_collections {
             let key = DocumentKey::collection(coll_uuid);
-            let Some(state) = self.documents.get(&key) else {
+            let Some(state) = self.store.get(&key) else {
                 continue;
             };
 
@@ -717,78 +1310,162 @@ impl ThingsDocumentSet {
         Ok(live_things)
     }
 
-    // ===== V3 Compaction =====
-
-    /// Try to compact a document if it exceeds the size threshold.
-    /// Returns true if compaction was performed.
-    pub fn maybe_compact(&mut self, key: &DocumentKey) -> Result<bool> {
-        self.maybe_compact_with_threshold(key, DEFAULT_COMPACTION_THRESHOLD)
+    fn extract_snapshot(&self) -> Result<ThingsSnapshot> {
+        self.extract_snapshot_with_options(SnapshotOptions::default())
     }
 
-    /// Try to compact a document if it exceeds the specified threshold.
-    /// Returns true if compaction was performed.
-    pub fn maybe_compact_with_threshold(&mut self, key: &DocumentKey, threshold: usize) -> Result<bool> {
-        let Some(state) = self.documents.get(key) else {
-            return Ok(false);
-        };
+    fn extract_snapshot_with_options(&self, options: SnapshotOptions) -> Result<ThingsSnapshot> {
+        let mut collections = Vec::new();
+        let mut things = Vec::new();
+        let content_registry = ContentTypeRegistry::new();
 
-        if !needs_compaction(&state.automerge_doc, threshold) {
-            return Ok(false);
+        for coll_uuid in &self.collection_uuids_from_documents()? {
+            let coll_view = self.collection_view(coll_uuid)?;
+
+            let deleted = coll_view.meta.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
+            if deleted {
+                continue;
+            }
+
+            let trigger_uuid = desired_trigger_uuid(deleted, &coll_view.meta.trigger);
+            collections.push(ThingCollectionEntry {
+                uuid: coll_view.meta.id.clone(),
+                title: coll_view.meta.title.clone(),
+                trigger_uuid,
+                created_at: String::new(),
+                updated_at: String::new(),
+                actor_type: None,
+                actor_app_id: None,
+                actor_display_name: None,
+            });
+
+            for thing_meta in &coll_view.things {
+                let thing_deleted = thing_meta.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
+                if thing_deleted {
+                    continue;
+                }
+
+                let thing_trigger = desired_trigger_uuid(thing_deleted, &thing_meta.trigger);
+                let content = if options.include_content {
+                    let md_view = self.thing_markdown_view(&thing_meta.id)?;
+                    md_view.content
+                } else {
+                    None
+                };
+                let data = content_registry.serialize_thing_snapshot_data(
+                    thing_meta,
+                    content.as_ref(),
+                    options,
+                );
+
+                things.push(ThingEntry {
+                    uuid: thing_meta.id.clone(),
+                    title: thing_meta.title.clone().unwrap_or_default(),
+                    datatype: thing_meta.datatype.clone(),
+                    data,
+                    collection_uuid: coll_uuid.clone(),
+                    trigger_uuid: thing_trigger,
+                    parent_uuid: thing_meta.parent_id.clone(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    status: thing_meta.status.as_storage_str().to_string(),
+                    status_timestamp_ms: thing_meta.status.timestamp_ms(),
+                    actor_type: None,
+                    actor_app_id: None,
+                    actor_display_name: None,
+                });
+            }
         }
 
-        // Perform compaction based on document type
-        let compacted = match key.data_type {
-            CrdtDataType::Root => {
-                compact_root_doc(&state.automerge_doc, &self.device_id)
-                    .context("Failed to compact root document")?
-            }
-            CrdtDataType::Collection => {
-                compact_collection_doc(&state.automerge_doc, &key.uuid, &self.device_id)
-                    .context("Failed to compact collection document")?
-            }
-            CrdtDataType::ThingMarkdown => {
-                compact_thing_markdown_doc(&state.automerge_doc, &key.uuid, &self.device_id)
-                    .context("Failed to compact thing markdown document")?
-            }
-        };
+        Ok(ThingsSnapshot { collections, things })
+    }
+}
 
-        // Update the document in-place
-        if let Some(state) = self.documents.get_mut(key) {
-            state.automerge_doc = compacted;
-            state.dirty = true;
+struct ThingsDomainWriter<'a> {
+    device_id: &'a str,
+    documents: &'a mut HashMap<DocumentKey, DocumentState>,
+}
+
+impl<'a> ThingsDomainWriter<'a> {
+    fn new(device_id: &'a str, documents: &'a mut HashMap<DocumentKey, DocumentState>) -> Self {
+        Self { device_id, documents }
+    }
+
+    fn new_document_state(&self, automerge_doc: Vec<u8>) -> DocumentState {
+        DocumentState {
+            automerge_doc,
+            sync_state: Vec::new(),
+            dirty: true,
+            last_sync_at: None,
+        }
+    }
+
+    fn init_root(&mut self) -> Result<()> {
+        let key = DocumentKey::root();
+        if self.documents.contains_key(&key) {
+            return Ok(());
         }
 
-        Ok(true)
+        let doc_bytes = Schema::init_root_doc(self.device_id)?;
+        self.documents.insert(key, self.new_document_state(doc_bytes));
+        Ok(())
     }
 
-    /// Compact all documents that exceed the threshold.
-    /// Returns the number of documents compacted.
-    pub fn compact_all(&mut self) -> Result<usize> {
-        self.compact_all_with_threshold(DEFAULT_COMPACTION_THRESHOLD)
+    fn get_or_init_collection(&mut self, collection_uuid: &str) -> Result<()> {
+        let key = DocumentKey::collection(collection_uuid);
+        if !self.documents.contains_key(&key) {
+            let doc_bytes = Schema::init_collection_doc(self.device_id, collection_uuid)?;
+            self.documents
+                .insert(key, self.new_document_state(doc_bytes));
+            self.add_collection(collection_uuid)?;
+        }
+        Ok(())
     }
 
-    /// Compact all documents that exceed the specified threshold.
-    /// Returns the number of documents compacted.
-    pub fn compact_all_with_threshold(&mut self, threshold: usize) -> Result<usize> {
-        // Collect keys that need compaction
-        let keys_to_compact: Vec<DocumentKey> = self
+    fn get_or_init_thing_markdown(&mut self, thing_uuid: &str) -> Result<()> {
+        let key = DocumentKey::thing_markdown(thing_uuid);
+        if !self.documents.contains_key(&key) {
+            let doc_bytes = Schema::init_thing_markdown_doc(self.device_id, thing_uuid)?;
+            self.documents
+                .insert(key, self.new_document_state(doc_bytes));
+        }
+        Ok(())
+    }
+
+    fn apply_document_update<F>(&mut self, key: &DocumentKey, update: F) -> Result<()>
+    where
+        F: FnOnce(&[u8]) -> Result<Vec<u8>>,
+    {
+        let current_doc = self
             .documents
-            .iter()
-            .filter(|(_, state)| needs_compaction(&state.automerge_doc, threshold))
-            .map(|(key, _)| key.clone())
-            .collect();
-
-        let mut count = 0;
-        for key in keys_to_compact {
-            if self.maybe_compact_with_threshold(&key, threshold)? {
-                count += 1;
-            }
-        }
-
-        Ok(count)
+            .get(key)
+            .map(|state| state.automerge_doc.clone())
+            .ok_or_else(|| anyhow::anyhow!("Missing document for key {:?}", key))?;
+        let updated_doc = update(&current_doc)?;
+        let state = self
+            .documents
+            .get_mut(key)
+            .ok_or_else(|| anyhow::anyhow!("Missing document for key {:?}", key))?;
+        state.automerge_doc = updated_doc;
+        state.dirty = true;
+        Ok(())
     }
 
-    // ===== Root Operations =====
+    fn apply_collection_update(&mut self, collection_uuid: &str, op: CollectionOp) -> Result<()> {
+        self.get_or_init_collection(collection_uuid)?;
+        let key = DocumentKey::collection(collection_uuid);
+        self.apply_document_update(&key, |doc| {
+            apply_collection_op(doc, self.device_id, collection_uuid, op)
+        })
+    }
+
+    fn apply_thing_markdown_update(&mut self, thing_uuid: &str, op: ThingMarkdownOp) -> Result<()> {
+        self.get_or_init_thing_markdown(thing_uuid)?;
+        let key = DocumentKey::thing_markdown(thing_uuid);
+        self.apply_document_update(&key, |doc| {
+            apply_thing_markdown_op(doc, self.device_id, thing_uuid, op)
+        })
+    }
 
     fn root_collection_list_ids(doc: &AutoCommit) -> Result<Vec<ObjId>> {
         Ok(doc
@@ -846,18 +1523,18 @@ impl ThingsDocumentSet {
     }
 
     fn update_root_collection_membership(
-        &self,
+        device_id: &str,
         doc_bytes: &[u8],
         collection_uuid: &str,
         should_exist: bool,
     ) -> Result<Vec<u8>> {
         let mut doc = if doc_bytes.is_empty() {
-            let init_bytes = Schema::init_root_doc(&self.device_id)?;
+            let init_bytes = Schema::init_root_doc(device_id)?;
             AutoCommit::load(&init_bytes).context("Failed to load init root doc")?
         } else {
             AutoCommit::load(doc_bytes).context("Failed to load root doc")?
         };
-        doc.set_actor(ActorId::from(self.device_id.as_bytes().to_vec()));
+        doc.set_actor(ActorId::from(device_id.as_bytes().to_vec()));
 
         let list_objs = Self::root_collection_list_ids(&doc)?;
 
@@ -887,66 +1564,418 @@ impl ThingsDocumentSet {
         Ok(doc.save())
     }
 
-    /// Add a collection to the root document
-    pub fn add_collection(&mut self, collection_uuid: &str) -> Result<()> {
+    fn add_collection(&mut self, collection_uuid: &str) -> Result<()> {
         self.init_root()?;
         let key = DocumentKey::root();
-        let current_doc = self.documents.get(&key).unwrap().automerge_doc.clone();
-        let updated_doc =
-            self.update_root_collection_membership(&current_doc, collection_uuid, true)?;
-        let state = self.documents.get_mut(&key).unwrap();
+        let device_id = self.device_id;
+        self.apply_document_update(&key, |doc| {
+            Self::update_root_collection_membership(device_id, doc, collection_uuid, true)
+        })
+    }
 
-        state.automerge_doc = updated_doc;
-        state.dirty = true;
+    fn remove_collection(&mut self, collection_uuid: &str) -> Result<()> {
+        self.init_root()?;
+        let key = DocumentKey::root();
+        let device_id = self.device_id;
+        self.apply_document_update(&key, |doc| {
+            Self::update_root_collection_membership(device_id, doc, collection_uuid, false)
+        })
+    }
+
+    fn update_collection_meta(
+        &mut self,
+        collection_uuid: &str,
+        title: Option<String>,
+        status: Option<String>,
+        trigger: TriggerUpdate,
+    ) -> Result<()> {
+        self.apply_collection_update(
+            collection_uuid,
+            CollectionOp::UpdateMeta {
+                title,
+                status,
+                trigger,
+                attrs_json: None,
+            },
+        )
+    }
+
+    fn ensure_live_collection_exists(&self, collection_uuid: &str) -> Result<()> {
+        let key = DocumentKey::collection(collection_uuid);
+        let Some(state) = self.documents.get(&key) else {
+            anyhow::bail!(
+                "collection '{}' must exist before adding or reparenting things",
+                collection_uuid
+            );
+        };
+
+        let view = extract_collection_doc_view(&state.automerge_doc, collection_uuid)?;
+        if view
+            .meta
+            .tombstone
+            .as_ref()
+            .map(|t| t.deleted)
+            .unwrap_or(false)
+        {
+            anyhow::bail!("collection '{}' is deleted", collection_uuid);
+        }
+
         Ok(())
+    }
+
+    fn upsert_thing_meta(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        datatype: Option<ThingDatatype>,
+        status: Option<String>,
+        title: Option<String>,
+        parent_uuid: Option<String>,
+        trigger: TriggerUpdate,
+    ) -> Result<()> {
+        self.ensure_live_collection_exists(collection_uuid)?;
+        self.apply_collection_update(
+            collection_uuid,
+            CollectionOp::UpsertThingMeta {
+                thing_id: thing_uuid.to_string(),
+                datatype,
+                status,
+                status_timestamp_ms: None,
+                title,
+                parent_id: parent_uuid,
+                trigger,
+                built_in: None,
+                attrs_json: None,
+            },
+        )
+    }
+
+    fn delete_collection(&mut self, collection_uuid: &str) -> Result<()> {
+        self.apply_collection_update(collection_uuid, CollectionOp::Delete)?;
+        self.remove_collection(collection_uuid)
+    }
+
+    fn delete_thing(&mut self, collection_uuid: &str, thing_uuid: &str) -> Result<()> {
+        if !self.documents.contains_key(&DocumentKey::collection(collection_uuid)) {
+            return Ok(());
+        }
+
+        self.apply_collection_update(
+            collection_uuid,
+            CollectionOp::DeleteThing {
+                thing_id: thing_uuid.to_string(),
+            },
+        )
+    }
+
+    fn add_content_entry(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        entry: ContentEntry,
+    ) -> Result<()> {
+        let built_in = ThingBuiltInFieldsUpdate {
+            add_entries: vec![entry],
+            ..Default::default()
+        };
+
+        self.apply_collection_update(
+            collection_uuid,
+            CollectionOp::UpsertThingMeta {
+                thing_id: thing_uuid.to_string(),
+                datatype: None,
+                status: None,
+                status_timestamp_ms: None,
+                title: None,
+                parent_id: None,
+                trigger: TriggerUpdate::Noop,
+                built_in: Some(built_in),
+                attrs_json: None,
+            },
+        )
+    }
+
+    fn update_content_entry(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+        title: Option<Option<String>>,
+        order: Option<f64>,
+        payload: Option<ContentEntryPayload>,
+    ) -> Result<()> {
+        let entry_update = remi_things_crdt::ContentEntryUpdate {
+            id: entry_id.to_string(),
+            title,
+            order,
+            payload,
+        };
+
+        let built_in = ThingBuiltInFieldsUpdate {
+            update_entries: vec![entry_update],
+            ..Default::default()
+        };
+
+        self.apply_collection_update(
+            collection_uuid,
+            CollectionOp::UpsertThingMeta {
+                thing_id: thing_uuid.to_string(),
+                datatype: None,
+                status: None,
+                status_timestamp_ms: None,
+                title: None,
+                parent_id: None,
+                trigger: TriggerUpdate::Noop,
+                built_in: Some(built_in),
+                attrs_json: None,
+            },
+        )
+    }
+
+    fn delete_content_entry(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+    ) -> Result<()> {
+        let built_in = ThingBuiltInFieldsUpdate {
+            delete_entry_ids: vec![entry_id.to_string()],
+            ..Default::default()
+        };
+
+        self.apply_collection_update(
+            collection_uuid,
+            CollectionOp::UpsertThingMeta {
+                thing_id: thing_uuid.to_string(),
+                datatype: None,
+                status: None,
+                status_timestamp_ms: None,
+                title: None,
+                parent_id: None,
+                trigger: TriggerUpdate::Noop,
+                built_in: Some(built_in),
+                attrs_json: None,
+            },
+        )
+    }
+
+    fn set_thing_content(&mut self, thing_uuid: &str, content: Content) -> Result<()> {
+        self.apply_thing_markdown_update(thing_uuid, ThingMarkdownOp::SetContent { content })
+    }
+
+    fn splice_thing_text(
+        &mut self,
+        thing_uuid: &str,
+        block_id: &str,
+        index: usize,
+        delete: usize,
+        insert: &str,
+    ) -> Result<()> {
+        self.apply_thing_markdown_update(
+            thing_uuid,
+            ThingMarkdownOp::SpliceText {
+                block_id: block_id.to_string(),
+                index,
+                delete,
+                insert: insert.to_string(),
+            },
+        )
+    }
+}
+
+/// Manages the set of CRDT documents (Root, Collections, ThingMarkdown)
+#[derive(Debug, Clone)]
+pub struct ThingsDocumentSet {
+    device_id: String,
+    documents: HashMap<DocumentKey, DocumentState>,
+}
+
+impl ThingsDocumentSet {
+    fn store_view(&self) -> DocumentStoreView<'_> {
+        DocumentStoreView::new(&self.documents)
+    }
+
+    fn store_mut(&mut self) -> DocumentStoreMut<'_> {
+        DocumentStoreMut::new(&self.device_id, &mut self.documents)
+    }
+
+    fn domain_reader(&self) -> ThingsDomainReader<'_> {
+        ThingsDomainReader::new(self.store_view())
+    }
+
+    fn domain_writer(&mut self) -> ThingsDomainWriter<'_> {
+        ThingsDomainWriter::new(&self.device_id, &mut self.documents)
+    }
+
+    /// Create a new empty document set
+    pub fn new(device_id: &str) -> Self {
+        Self {
+            device_id: device_id.to_string(),
+            documents: HashMap::new(),
+        }
+    }
+
+    /// Initialize with a root document
+    pub fn init_root(&mut self) -> Result<()> {
+        self.domain_writer().init_root()
+    }
+
+    pub fn has_root_document(&self) -> bool {
+        self.documents.contains_key(&DocumentKey::root())
+    }
+
+    /// Get a document by key
+    pub fn get(&self, key: &DocumentKey) -> Option<&DocumentState> {
+        self.documents.get(key)
+    }
+
+    /// Get a document mutably
+    pub fn get_mut(&mut self, key: &DocumentKey) -> Option<&mut DocumentState> {
+        self.documents.get_mut(key)
+    }
+
+    /// Insert or update a document
+    pub fn set(&mut self, key: DocumentKey, state: DocumentState) {
+        self.store_mut().set(key, state);
+    }
+
+    /// Check if a document exists
+    pub fn contains(&self, key: &DocumentKey) -> bool {
+        self.documents.contains_key(key)
+    }
+
+    /// Get all dirty documents, ordered by sync priority
+    fn dirty_documents(&self) -> Vec<(&DocumentKey, &DocumentState)> {
+        let mut dirty: Vec<_> = self
+            .documents
+            .iter()
+            .filter(|(_, state)| state.dirty)
+            .collect();
+        dirty.sort_by_key(|(key, _)| key.data_type.sync_priority());
+        dirty
+    }
+
+    /// Best-effort local index maintenance.
+    ///
+    /// Rebuild the root discovery index from live collection documents without
+    /// changing business visibility. This is intended for manual maintenance or
+    /// diagnostics only; normal reads and sync must not depend on it.
+    ///
+    /// Returns the number of collections that were added back to the root index.
+    pub fn maintain_root_index_from_live_collections(&mut self) -> Result<usize> {
+        let root_view = self.root_view()?;
+        let root_uuids: std::collections::HashSet<&str> =
+            root_view.collection_uuids.iter().map(|s| s.as_str()).collect();
+
+        let orphaned_colls: Vec<String> = self
+            .documents
+            .keys()
+            .filter(|k| k.data_type == CrdtDataType::Collection && !root_uuids.contains(k.uuid.as_str()))
+            .filter_map(|k| {
+                match self.collection_view(&k.uuid) {
+                    Ok(view)
+                        if !view
+                            .meta
+                            .tombstone
+                            .as_ref()
+                            .map(|t| t.deleted)
+                            .unwrap_or(false) =>
+                    {
+                        Some(k.uuid.clone())
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            collection_uuid = k.uuid.as_str(),
+                            "maintain_root_index_from_live_collections: skipping tombstoned collection"
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            collection_uuid = k.uuid.as_str(),
+                            error = %err,
+                            "maintain_root_index_from_live_collections: failed to inspect collection, skipping relink"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        if orphaned_colls.is_empty() {
+            return Ok(0);
+        }
+
+        for coll_uuid in &orphaned_colls {
+            tracing::warn!(
+                collection_uuid = coll_uuid.as_str(),
+                "maintain_root_index_from_live_collections: re-linking orphaned collection to root index"
+            );
+            self.add_collection(coll_uuid)?;
+        }
+
+        Ok(orphaned_colls.len())
+    }
+
+    /// Return collection UUIDs that are still live according to collection documents.
+    pub fn active_collection_uuids(&self) -> Result<HashSet<String>> {
+        self.domain_reader().active_collection_uuids()
+    }
+
+    /// Return thing UUIDs that are still reachable through live collection documents.
+    pub fn active_thing_uuids(&self) -> Result<HashSet<String>> {
+        self.domain_reader().active_thing_uuids()
+    }
+
+    // ===== V3 Compaction =====
+
+    /// Try to compact a document if it exceeds the size threshold.
+    /// Returns true if compaction was performed.
+    pub fn maybe_compact(&mut self, key: &DocumentKey) -> Result<bool> {
+        self.maybe_compact_with_threshold(key, DEFAULT_COMPACTION_THRESHOLD)
+    }
+
+    /// Try to compact a document if it exceeds the specified threshold.
+    /// Returns true if compaction was performed.
+    pub fn maybe_compact_with_threshold(&mut self, key: &DocumentKey, threshold: usize) -> Result<bool> {
+        self.store_mut().maybe_compact_with_threshold(key, threshold)
+    }
+
+    /// Compact all documents that exceed the threshold.
+    /// Returns the number of documents compacted.
+    pub fn compact_all(&mut self) -> Result<usize> {
+        self.compact_all_with_threshold(DEFAULT_COMPACTION_THRESHOLD)
+    }
+
+    /// Compact all documents that exceed the specified threshold.
+    /// Returns the number of documents compacted.
+    pub fn compact_all_with_threshold(&mut self, threshold: usize) -> Result<usize> {
+        self.store_mut().compact_all_with_threshold(threshold)
+    }
+
+    // ===== Root Operations =====
+
+    /// Add a collection to the root document
+    pub fn add_collection(&mut self, collection_uuid: &str) -> Result<()> {
+        self.domain_writer().add_collection(collection_uuid)
     }
 
     /// Remove a collection from the root document
     pub fn remove_collection(&mut self, collection_uuid: &str) -> Result<()> {
-        self.init_root()?;
-        let key = DocumentKey::root();
-        let current_doc = self.documents.get(&key).unwrap().automerge_doc.clone();
-        let updated_doc =
-            self.update_root_collection_membership(&current_doc, collection_uuid, false)?;
-        let state = self.documents.get_mut(&key).unwrap();
-
-        state.automerge_doc = updated_doc;
-        state.dirty = true;
-        Ok(())
+        self.domain_writer().remove_collection(collection_uuid)
     }
 
     /// Get root view
     pub fn root_view(&self) -> Result<RootView> {
-        let key = DocumentKey::root();
-        match self.documents.get(&key) {
-            Some(state) => extract_root_view(&state.automerge_doc),
-            None => Ok(RootView {
-                schema_version: CURRENT_SCHEMA_VERSION,
-                epoch: 0,
-                collection_uuids: Vec::new(),
-            }),
-        }
+        self.domain_reader().root_view()
     }
 
     // ===== Collection Operations =====
 
     /// Get or create a collection document
     pub fn get_or_init_collection(&mut self, collection_uuid: &str) -> Result<&DocumentState> {
+        self.domain_writer().get_or_init_collection(collection_uuid)?;
         let key = DocumentKey::collection(collection_uuid);
-        if !self.documents.contains_key(&key) {
-            let doc_bytes = Schema::init_collection_doc(&self.device_id, collection_uuid)?;
-            self.documents.insert(
-                key.clone(),
-                DocumentState {
-                    automerge_doc: doc_bytes,
-                    sync_state: Vec::new(),
-                    dirty: true,
-                    last_sync_at: None,
-                },
-            );
-            // Also add to root
-            self.add_collection(collection_uuid)?;
-        }
         Ok(self.documents.get(&key).unwrap())
     }
 
@@ -958,23 +1987,8 @@ impl ThingsDocumentSet {
         status: Option<String>,
         trigger: TriggerUpdate,
     ) -> Result<()> {
-        self.get_or_init_collection(collection_uuid)?;
-        let key = DocumentKey::collection(collection_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
-
-        state.automerge_doc = apply_collection_op(
-            &state.automerge_doc,
-            &self.device_id,
-            collection_uuid,
-            CollectionOp::UpdateMeta {
-                title,
-                status,
-                trigger,
-                attrs_json: None,
-            },
-        )?;
-        state.dirty = true;
-        Ok(())
+        self.domain_writer()
+            .update_collection_meta(collection_uuid, title, status, trigger)
     }
 
     /// Upsert a thing in a collection
@@ -988,66 +2002,27 @@ impl ThingsDocumentSet {
         parent_uuid: Option<String>,
         trigger: TriggerUpdate,
     ) -> Result<()> {
-        self.get_or_init_collection(collection_uuid)?;
-        let key = DocumentKey::collection(collection_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
-
-        state.automerge_doc = apply_collection_op(
-            &state.automerge_doc,
-            &self.device_id,
+        self.domain_writer().upsert_thing_meta(
             collection_uuid,
-            CollectionOp::UpsertThingMeta {
-                thing_id: thing_uuid.to_string(),
-                datatype,
-                status,
-                status_timestamp_ms: None,
-                title,
-                parent_id: parent_uuid,
-                trigger,
-                built_in: None,
-                attrs_json: None,
-            },
-        )?;
-        state.dirty = true;
-        Ok(())
+            thing_uuid,
+            datatype,
+            status,
+            title,
+            parent_uuid,
+            trigger,
+        )
     }
 
     /// Delete a collection by tombstoning its collection document and removing
     /// the root reference. Child things become unreachable through the deleted
     /// collection and are pruned from snapshots without deleting their docs.
     pub fn delete_collection(&mut self, collection_uuid: &str) -> Result<()> {
-        self.get_or_init_collection(collection_uuid)?;
-
-        let key = DocumentKey::collection(collection_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
-
-        state.automerge_doc = apply_collection_op(
-            &state.automerge_doc,
-            &self.device_id,
-            collection_uuid,
-            CollectionOp::Delete,
-        )?;
-        state.dirty = true;
-
-        self.remove_collection(collection_uuid)?;
-        Ok(())
+        self.domain_writer().delete_collection(collection_uuid)
     }
 
     /// Delete a thing from a collection
     pub fn delete_thing(&mut self, collection_uuid: &str, thing_uuid: &str) -> Result<()> {
-        let key = DocumentKey::collection(collection_uuid);
-        if let Some(state) = self.documents.get_mut(&key) {
-            state.automerge_doc = apply_collection_op(
-                &state.automerge_doc,
-                &self.device_id,
-                collection_uuid,
-                CollectionOp::DeleteThing {
-                    thing_id: thing_uuid.to_string(),
-                },
-            )?;
-            state.dirty = true;
-        }
-        Ok(())
+        self.domain_writer().delete_thing(collection_uuid, thing_uuid)
     }
 
     /// Add a content entry to a thing (V3 multi-value)
@@ -1057,33 +2032,8 @@ impl ThingsDocumentSet {
         thing_uuid: &str,
         entry: ContentEntry,
     ) -> Result<()> {
-        self.get_or_init_collection(collection_uuid)?;
-        let key = DocumentKey::collection(collection_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
-
-        let built_in = ThingBuiltInFieldsUpdate {
-            add_entries: vec![entry],
-            ..Default::default()
-        };
-
-        state.automerge_doc = apply_collection_op(
-            &state.automerge_doc,
-            &self.device_id,
-            collection_uuid,
-            CollectionOp::UpsertThingMeta {
-                thing_id: thing_uuid.to_string(),
-                datatype: None,
-                status: None,
-                status_timestamp_ms: None,
-                title: None,
-                parent_id: None,
-                trigger: TriggerUpdate::Noop,
-                built_in: Some(built_in),
-                attrs_json: None,
-            },
-        )?;
-        state.dirty = true;
-        Ok(())
+        self.domain_writer()
+            .add_content_entry(collection_uuid, thing_uuid, entry)
     }
 
     /// Update a content entry on a thing (V3 multi-value)
@@ -1096,40 +2046,14 @@ impl ThingsDocumentSet {
         order: Option<f64>,
         payload: Option<ContentEntryPayload>,
     ) -> Result<()> {
-        self.get_or_init_collection(collection_uuid)?;
-        let key = DocumentKey::collection(collection_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
-
-        let entry_update = remi_things_crdt::ContentEntryUpdate {
-            id: entry_id.to_string(),
+        self.domain_writer().update_content_entry(
+            collection_uuid,
+            thing_uuid,
+            entry_id,
             title,
             order,
             payload,
-        };
-
-        let built_in = ThingBuiltInFieldsUpdate {
-            update_entries: vec![entry_update],
-            ..Default::default()
-        };
-
-        state.automerge_doc = apply_collection_op(
-            &state.automerge_doc,
-            &self.device_id,
-            collection_uuid,
-            CollectionOp::UpsertThingMeta {
-                thing_id: thing_uuid.to_string(),
-                datatype: None,
-                status: None,
-                status_timestamp_ms: None,
-                title: None,
-                parent_id: None,
-                trigger: TriggerUpdate::Noop,
-                built_in: Some(built_in),
-                attrs_json: None,
-            },
-        )?;
-        state.dirty = true;
-        Ok(())
+        )
     }
 
     /// Delete a content entry from a thing (V3 multi-value)
@@ -1139,33 +2063,8 @@ impl ThingsDocumentSet {
         thing_uuid: &str,
         entry_id: &str,
     ) -> Result<()> {
-        self.get_or_init_collection(collection_uuid)?;
-        let key = DocumentKey::collection(collection_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
-
-        let built_in = ThingBuiltInFieldsUpdate {
-            delete_entry_ids: vec![entry_id.to_string()],
-            ..Default::default()
-        };
-
-        state.automerge_doc = apply_collection_op(
-            &state.automerge_doc,
-            &self.device_id,
-            collection_uuid,
-            CollectionOp::UpsertThingMeta {
-                thing_id: thing_uuid.to_string(),
-                datatype: None,
-                status: None,
-                status_timestamp_ms: None,
-                title: None,
-                parent_id: None,
-                trigger: TriggerUpdate::Noop,
-                built_in: Some(built_in),
-                attrs_json: None,
-            },
-        )?;
-        state.dirty = true;
-        Ok(())
+        self.domain_writer()
+            .delete_content_entry(collection_uuid, thing_uuid, entry_id)
     }
 
     /// Get content entries for a thing
@@ -1174,16 +2073,8 @@ impl ThingsDocumentSet {
         collection_uuid: &str,
         thing_uuid: &str,
     ) -> Result<Vec<ContentEntry>> {
-        let key = DocumentKey::collection(collection_uuid);
-        let state = self.documents.get(&key)
-            .context("Collection not found")?;
-
-        let view = extract_collection_doc_view(&state.automerge_doc, collection_uuid)?;
-        let thing = view.things.iter()
-            .find(|t| t.id == thing_uuid)
-            .context("Thing not found")?;
-
-        Ok(thing.built_in.content_entries.clone())
+        self.domain_reader()
+            .get_content_entries(collection_uuid, thing_uuid)
     }
 
     /// Find which collection a thing belongs to by scanning all collection documents.
@@ -1192,220 +2083,85 @@ impl ThingsDocumentSet {
     /// the root document listing the collection. It's useful when the root <-> collection
     /// linkage might be stale (e.g. after sync or migration).
     pub fn find_thing_collection_uuid(&self, thing_uuid: &str) -> Option<String> {
-        for (key, state) in &self.documents {
-            if key.data_type != CrdtDataType::Collection {
-                continue;
-            }
-            // Try to extract the collection view; skip broken documents.
-            let view = match extract_collection_doc_view(&state.automerge_doc, &key.uuid) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for thing in &view.things {
-                if thing.id == thing_uuid {
-                    // Also accept tombstoned things — the caller may want to
-                    // revive or operate on a soft-deleted thing.
-                    return Some(key.uuid.clone());
-                }
-            }
-        }
-        None
+        self.domain_reader().find_thing_collection_uuid(thing_uuid)
     }
 
     /// Get collection view
     pub fn collection_view(&self, collection_uuid: &str) -> Result<CollectionDocView> {
-        let key = DocumentKey::collection(collection_uuid);
-        match self.documents.get(&key) {
-            Some(state) => extract_collection_doc_view(&state.automerge_doc, collection_uuid),
-            None => Ok(CollectionDocView {
-                schema_version: CURRENT_SCHEMA_VERSION,
-                meta: remi_things_crdt::CollectionMetaView {
-                    id: collection_uuid.to_string(),
-                    title: String::new(),
-                    status: "active".to_string(),
-                    edit_clock: remi_things_crdt::view::EditClock::zero(),
-                    tombstone: None,
-                    trigger: None,
-                    attrs: None,
-                },
-                things: Vec::new(),
-            }),
-        }
+        self.domain_reader().collection_view(collection_uuid)
     }
 
     // ===== ThingMarkdown Operations =====
 
-    /// Get or create a thing markdown document
-    pub fn get_or_init_thing_markdown(&mut self, thing_uuid: &str) -> Result<&DocumentState> {
-        let key = DocumentKey::thing_markdown(thing_uuid);
-        if !self.documents.contains_key(&key) {
-            let doc_bytes = Schema::init_thing_markdown_doc(&self.device_id, thing_uuid)?;
-            self.documents.insert(
-                key.clone(),
-                DocumentState {
-                    automerge_doc: doc_bytes,
-                    sync_state: Vec::new(),
-                    dirty: true,
-                    last_sync_at: None,
-                },
-            );
-        }
-        Ok(self.documents.get(&key).unwrap())
+    /// Set content on a thing markdown document from a typed payload.
+    pub fn set_thing_content_from_payload(
+        &mut self,
+        thing_uuid: &str,
+        datatype: &ThingDatatype,
+        payload: &Value,
+    ) -> Result<()> {
+        let content = ContentTypeRegistry::new().markdown_content_from_value(datatype, payload);
+        self.domain_writer().set_thing_content(thing_uuid, content)
     }
 
-    /// Set content on a thing markdown document
-    pub fn set_thing_content(&mut self, thing_uuid: &str, content: Content) -> Result<()> {
-        self.get_or_init_thing_markdown(thing_uuid)?;
-        let key = DocumentKey::thing_markdown(thing_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
-
-        state.automerge_doc = apply_thing_markdown_op(
-            &state.automerge_doc,
-            &self.device_id,
+    /// Set plain markdown text on a thing using the default markdown payload shape.
+    pub fn set_thing_markdown_text(&mut self, thing_uuid: &str, text: &str) -> Result<()> {
+        self.set_thing_content_from_payload(
             thing_uuid,
-            ThingMarkdownOp::SetContent { content },
-        )?;
-        state.dirty = true;
-        Ok(())
+            &ThingDatatype::Markdown,
+            &json!({ "markdown": text }),
+        )
     }
 
-    /// Splice text in a thing markdown block
-    pub fn splice_thing_text(
+    /// Splice text and report whether the markdown content actually changed.
+    pub fn try_splice_thing_text(
         &mut self,
         thing_uuid: &str,
         block_id: &str,
         index: usize,
         delete: usize,
         insert: &str,
-    ) -> Result<()> {
-        self.get_or_init_thing_markdown(thing_uuid)?;
-        let key = DocumentKey::thing_markdown(thing_uuid);
-        let state = self.documents.get_mut(&key).unwrap();
+    ) -> Result<bool> {
+        let before = self.domain_reader().thing_markdown_view(thing_uuid)?;
+        let had_content = before.content.is_some();
 
-        state.automerge_doc = apply_thing_markdown_op(
-            &state.automerge_doc,
-            &self.device_id,
-            thing_uuid,
-            ThingMarkdownOp::SpliceText {
-                block_id: block_id.to_string(),
-                index,
-                delete,
-                insert: insert.to_string(),
-            },
-        )?;
-        state.dirty = true;
-        Ok(())
+        self.domain_writer()
+            .splice_thing_text(thing_uuid, block_id, index, delete, insert)?;
+
+        let after = self.domain_reader().thing_markdown_view(thing_uuid)?;
+        Ok(before.content != after.content || !had_content)
     }
 
-    /// Get thing markdown view
-    pub fn thing_markdown_view(&self, thing_uuid: &str) -> Result<ThingMarkdownView> {
-        let key = DocumentKey::thing_markdown(thing_uuid);
-        match self.documents.get(&key) {
-            Some(state) => extract_thing_markdown_view(&state.automerge_doc, thing_uuid),
-            None => Ok(ThingMarkdownView {
-                schema_version: CURRENT_SCHEMA_VERSION,
-                thing_uuid: thing_uuid.to_string(),
-                content: None,
-            }),
-        }
+    /// Replace the entire primary markdown block for a thing.
+    pub fn replace_thing_markdown_text(&mut self, thing_uuid: &str, text: &str) -> Result<()> {
+        self.domain_writer()
+            .splice_thing_text(thing_uuid, "main", 0, usize::MAX, text)
+    }
+
+    /// Get plain markdown text from the primary markdown block, if present.
+    pub fn get_thing_markdown_text(&self, thing_uuid: &str) -> Result<Option<String>> {
+        let md_view = self.domain_reader().thing_markdown_view(thing_uuid)?;
+        Ok(md_view.content.and_then(|content| {
+            content.blocks.and_then(|blocks| {
+                blocks
+                    .into_iter()
+                    .find(|block| block.id == "main")
+                    .and_then(|block| block.text)
+            })
+        }))
     }
 
     // ===== Snapshot Generation =====
 
     /// Extract a full snapshot from all documents
     pub fn extract_snapshot(&self) -> Result<ThingsSnapshot> {
-        self.extract_snapshot_with_options(SnapshotOptions::default())
+        self.domain_reader().extract_snapshot()
     }
 
     /// Extract a snapshot with options
     pub fn extract_snapshot_with_options(&self, options: SnapshotOptions) -> Result<ThingsSnapshot> {
-        let root = self.root_view()?;
-        let mut collections = Vec::new();
-        let mut things = Vec::new();
-
-        for coll_uuid in &root.collection_uuids {
-            let coll_view = self.collection_view(coll_uuid)?;
-
-            // Skip deleted collections
-            let deleted = coll_view.meta.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
-            if deleted {
-                continue;
-            }
-
-            let trigger_uuid = desired_trigger_uuid(deleted, &coll_view.meta.trigger);
-            collections.push(ThingCollectionEntry {
-                uuid: coll_view.meta.id.clone(),
-                title: coll_view.meta.title.clone(),
-                trigger_uuid,
-                created_at: String::new(),
-                updated_at: String::new(),
-                actor_type: None,
-                actor_app_id: None,
-                actor_display_name: None,
-            });
-
-            // Process things in this collection
-            for thing_meta in &coll_view.things {
-                let thing_deleted = thing_meta.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
-                if thing_deleted {
-                    continue;
-                }
-
-                let thing_trigger = desired_trigger_uuid(thing_deleted, &thing_meta.trigger);
-
-                // Get content if requested
-                let data = if options.include_content {
-                    let md_view = self.thing_markdown_view(&thing_meta.id)?;
-                    thing_data_from_thing_meta_and_content(thing_meta, md_view.content.as_ref())
-                } else {
-                    thing_data_from_thing_meta_no_content(thing_meta)
-                };
-
-                things.push(ThingEntry {
-                    uuid: thing_meta.id.clone(),
-                    title: thing_meta.title.clone().unwrap_or_default(),
-                    datatype: thing_meta.datatype.clone(),
-                    data,
-                    collection_uuid: coll_uuid.clone(),
-                    trigger_uuid: thing_trigger,
-                    parent_uuid: thing_meta.parent_id.clone(),
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    status: thing_meta.status.as_storage_str().to_string(),
-                    status_timestamp_ms: thing_meta.status.timestamp_ms(),
-                    actor_type: None,
-                    actor_app_id: None,
-                    actor_display_name: None,
-                });
-            }
-        }
-
-        Ok(ThingsSnapshot { collections, things })
+        self.domain_reader().extract_snapshot_with_options(options)
     }
-}
-
-fn thing_data_from_thing_meta_and_content(
-    meta: &remi_things_crdt::ThingMetaView,
-    content: Option<&remi_things_crdt::view::ContentView>,
-) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("status".to_string(), json!(meta.status));
-    obj.insert("datatype".to_string(), json!(meta.datatype));
-    obj.insert("attrs".to_string(), json!(meta.attrs));
-    obj.insert("content".to_string(), json!(content));
-    // Include built-in fields (location, date, etc.)
-    obj.insert("built_in".to_string(), json!(meta.built_in));
-    Value::Object(obj)
-}
-
-fn thing_data_from_thing_meta_no_content(meta: &remi_things_crdt::ThingMetaView) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("status".to_string(), json!(meta.status));
-    obj.insert("datatype".to_string(), json!(meta.datatype));
-    obj.insert("attrs".to_string(), json!(meta.attrs));
-    // Include built-in fields (location, date, etc.)
-    obj.insert("built_in".to_string(), json!(meta.built_in));
-    Value::Object(obj)
 }
 
 #[cfg(test)]
@@ -1463,6 +2219,27 @@ mod tests_v3 {
     }
 
     #[test]
+    fn test_upsert_thing_requires_existing_collection() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+        let err = docs
+            .upsert_thing_meta(
+                "missing-coll",
+                "thing-1",
+                Some(ThingDatatype::Markdown),
+                Some("none".to_string()),
+                Some("Task 1".to_string()),
+                None,
+                TriggerUpdate::Noop,
+            )
+            .expect_err("thing upsert without collection should fail");
+
+        assert!(
+            err.to_string().contains("must exist before adding or reparenting things"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn test_deleted_collection_is_not_relinked_to_root() {
         let mut docs = ThingsDocumentSet::new("test-device");
         docs.get_or_init_collection("coll-1").unwrap();
@@ -1483,18 +2260,7 @@ mod tests_v3 {
             TriggerUpdate::Noop,
         )
         .unwrap();
-        docs.set_thing_content(
-            "thing-1",
-            Content::Markdown {
-                blocks: vec![remi_things_crdt::Block {
-                    id: "main".to_string(),
-                    r#type: "markdown".to_string(),
-                    attrs_json: None,
-                    text: Some("hello".to_string()),
-                }],
-            },
-        )
-        .unwrap();
+        docs.set_thing_markdown_text("thing-1", "hello").unwrap();
 
         docs.delete_collection("coll-1").unwrap();
 
@@ -1512,7 +2278,7 @@ mod tests_v3 {
         assert!(docs.get(&DocumentKey::collection("coll-1")).is_some());
         assert!(docs.get(&DocumentKey::thing_markdown("thing-1")).is_some());
 
-        let repaired = docs.repair_root_collection_linkage().unwrap();
+        let repaired = docs.maintain_root_index_from_live_collections().unwrap();
         assert_eq!(repaired, 0);
 
         let snapshot = docs
@@ -1538,33 +2304,56 @@ mod tests_v3 {
             TriggerUpdate::Noop,
         )
         .unwrap();
-        docs.set_thing_content(
-            "thing-1",
-            Content::Markdown {
-                blocks: vec![remi_things_crdt::Block {
-                    id: "main".to_string(),
-                    r#type: "markdown".to_string(),
-                    attrs_json: None,
-                    text: Some("hello".to_string()),
-                }],
-            },
-        )
-        .unwrap();
+        docs.set_thing_markdown_text("thing-1", "hello").unwrap();
 
-        let live_collections = docs.live_collection_uuids_from_root().unwrap();
-        let live_things = docs.live_thing_uuids_from_root().unwrap();
+        let live_collections = docs.active_collection_uuids().unwrap();
+        let live_things = docs.active_thing_uuids().unwrap();
         assert!(live_collections.contains("coll-1"));
         assert!(live_things.contains("thing-1"));
 
         docs.delete_thing("coll-1", "thing-1").unwrap();
-        let live_things = docs.live_thing_uuids_from_root().unwrap();
+        let live_things = docs.active_thing_uuids().unwrap();
         assert!(!live_things.contains("thing-1"));
 
         docs.delete_collection("coll-1").unwrap();
-        let live_collections = docs.live_collection_uuids_from_root().unwrap();
-        let live_things = docs.live_thing_uuids_from_root().unwrap();
+        let live_collections = docs.active_collection_uuids().unwrap();
+        let live_things = docs.active_thing_uuids().unwrap();
         assert!(!live_collections.contains("coll-1"));
         assert!(!live_things.contains("thing-1"));
+    }
+
+
+    #[test]
+    fn test_snapshot_uses_collection_docs_when_root_index_is_stale() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+        docs.get_or_init_collection("coll-1").unwrap();
+        docs.update_collection_meta(
+            "coll-1",
+            Some("Inbox".to_string()),
+            None,
+            TriggerUpdate::Noop,
+        )
+        .unwrap();
+        docs.upsert_thing_meta(
+            "coll-1",
+            "thing-1",
+            Some(ThingDatatype::Markdown),
+            Some("none".to_string()),
+            Some("Task 1".to_string()),
+            None,
+            TriggerUpdate::Noop,
+        )
+        .unwrap();
+        docs.set_thing_markdown_text("thing-1", "hello").unwrap();
+
+        docs.remove_collection("coll-1").unwrap();
+
+        let snapshot = docs.extract_snapshot().unwrap();
+
+        assert_eq!(snapshot.collections.len(), 1);
+        assert_eq!(snapshot.collections[0].uuid, "coll-1");
+        assert_eq!(snapshot.things.len(), 1);
+        assert_eq!(snapshot.things[0].uuid, "thing-1");
     }
 }
 
@@ -1572,12 +2361,108 @@ mod tests_v3 {
 // Storage Integration Helpers
 // ============================================================================
 
-impl ThingsDocumentSet {
-    /// Load all documents from storage into a ThingsDocumentSet
-    pub fn load_from_storage(storage: &crate::storage::Storage, device_id: &str) -> Result<Self> {
-        let mut doc_set = Self::new(device_id);
+pub trait CrdtDocumentRepository {
+    fn list_crdt_document_keys(&self) -> Result<Vec<(String, String)>>;
+    fn get_crdt_document(
+        &self,
+        uuid: &str,
+        data_type: &str,
+    ) -> Result<Option<crate::types::CrdtDocumentRow>>;
+    fn save_crdt_document(
+        &self,
+        uuid: &str,
+        data_type: &str,
+        automerge_doc: &[u8],
+        sync_state: &[u8],
+        dirty: bool,
+        last_sync_at: Option<&str>,
+    ) -> Result<()>;
+    fn delete_crdt_document(&self, uuid: &str, data_type: &str) -> Result<()>;
+}
 
-        let keys = storage
+impl CrdtDocumentRepository for crate::storage::Storage {
+    fn list_crdt_document_keys(&self) -> Result<Vec<(String, String)>> {
+        self.list_crdt_document_keys()
+    }
+
+    fn get_crdt_document(
+        &self,
+        uuid: &str,
+        data_type: &str,
+    ) -> Result<Option<crate::types::CrdtDocumentRow>> {
+        self.get_crdt_document(uuid, data_type)
+    }
+
+    fn save_crdt_document(
+        &self,
+        uuid: &str,
+        data_type: &str,
+        automerge_doc: &[u8],
+        sync_state: &[u8],
+        dirty: bool,
+        last_sync_at: Option<&str>,
+    ) -> Result<()> {
+        self.save_crdt_document(uuid, data_type, automerge_doc, sync_state, dirty, last_sync_at)
+    }
+
+    fn delete_crdt_document(&self, uuid: &str, data_type: &str) -> Result<()> {
+        self.delete_crdt_document(uuid, data_type)
+    }
+}
+
+impl CrdtDocumentRepository for crate::TriggerSdk {
+    fn list_crdt_document_keys(&self) -> Result<Vec<(String, String)>> {
+        self.crdt_list_document_keys()
+    }
+
+    fn get_crdt_document(
+        &self,
+        uuid: &str,
+        data_type: &str,
+    ) -> Result<Option<crate::types::CrdtDocumentRow>> {
+        self.crdt_get_document(uuid, data_type)
+    }
+
+    fn save_crdt_document(
+        &self,
+        uuid: &str,
+        data_type: &str,
+        automerge_doc: &[u8],
+        sync_state: &[u8],
+        dirty: bool,
+        last_sync_at: Option<&str>,
+    ) -> Result<()> {
+        self.crdt_save_document(uuid, data_type, automerge_doc, sync_state, dirty, last_sync_at)
+    }
+
+    fn delete_crdt_document(&self, uuid: &str, data_type: &str) -> Result<()> {
+        self.crdt_delete_document(uuid, data_type)
+    }
+}
+
+pub struct DocumentPersistence<'a, R: CrdtDocumentRepository + ?Sized> {
+    repository: &'a R,
+}
+
+impl<'a, R: CrdtDocumentRepository + ?Sized> DocumentPersistence<'a, R> {
+    pub fn new(repository: &'a R) -> Self {
+        Self { repository }
+    }
+
+    pub fn load_or_init_document_set(&self, device_id: &str) -> Result<ThingsDocumentSet> {
+        let mut doc_set = self.load_document_set(device_id)?;
+        if !doc_set.has_root_document() {
+            doc_set.init_root()?;
+            self.save_document_set(&doc_set)?;
+        }
+        Ok(doc_set)
+    }
+
+    pub fn load_document_set(&self, device_id: &str) -> Result<ThingsDocumentSet> {
+        let mut doc_set = ThingsDocumentSet::new(device_id);
+
+        let keys = self
+            .repository
             .list_crdt_document_keys()
             .context("Failed to list CRDT document keys")?;
 
@@ -1589,7 +2474,8 @@ impl ThingsDocumentSet {
                 _ => continue,
             };
 
-            if let Some(row) = storage
+            if let Some(row) = self
+                .repository
                 .get_crdt_document(&uuid, &data_type_str)
                 .context("Failed to get CRDT document")?
             {
@@ -1612,10 +2498,9 @@ impl ThingsDocumentSet {
         Ok(doc_set)
     }
 
-    /// Save all documents to storage
-    pub fn save_to_storage(&self, storage: &crate::storage::Storage) -> Result<()> {
-        for (key, state) in &self.documents {
-            storage
+    pub fn save_document_set(&self, doc_set: &ThingsDocumentSet) -> Result<()> {
+        for (key, state) in &doc_set.documents {
+            self.repository
                 .save_crdt_document(
                     &key.uuid,
                     key.data_type_str(),
@@ -1629,13 +2514,12 @@ impl ThingsDocumentSet {
         Ok(())
     }
 
-    /// Save only modified documents to storage
-    pub fn save_dirty_to_storage(&self, storage: &crate::storage::Storage) -> Result<usize> {
-        let dirty = self.dirty_documents();
+    pub fn save_dirty_documents(&self, doc_set: &ThingsDocumentSet) -> Result<usize> {
+        let dirty = doc_set.dirty_documents();
         let count = dirty.len();
 
         for (key, state) in dirty {
-            storage
+            self.repository
                 .save_crdt_document(
                     &key.uuid,
                     key.data_type_str(),
@@ -1648,6 +2532,105 @@ impl ThingsDocumentSet {
         }
 
         Ok(count)
+    }
+
+    pub fn save_dirty_documents_with_compaction(
+        &self,
+        doc_set: &mut ThingsDocumentSet,
+        threshold: usize,
+    ) -> Result<(usize, usize)> {
+        let dirty_keys = doc_set.store_mut().dirty_document_keys();
+
+        let count = dirty_keys.len();
+        let mut compacted = 0;
+
+        for key in &dirty_keys {
+            if doc_set.maybe_compact_with_threshold(key, threshold)? {
+                compacted += 1;
+            }
+
+            if let Some(state) = doc_set.documents.get(key) {
+                self.repository
+                    .save_crdt_document(
+                        &key.uuid,
+                        key.data_type_str(),
+                        &state.automerge_doc,
+                        &state.sync_state,
+                        state.dirty,
+                        state.last_sync_at.as_deref(),
+                    )
+                    .with_context(|| format!("Failed to save dirty CRDT document {:?}", key))?;
+            }
+        }
+
+        Ok((count, compacted))
+    }
+
+    pub fn save_document_state(
+        &self,
+        doc_set: &mut ThingsDocumentSet,
+        key: &DocumentKey,
+        mark_clean: bool,
+        last_sync_at: Option<&str>,
+    ) -> Result<()> {
+        if let Some(state) = doc_set.documents.get_mut(key) {
+            let dirty = if mark_clean { false } else { state.dirty };
+            self.repository
+                .save_crdt_document(
+                    &key.uuid,
+                    key.data_type_str(),
+                    &state.automerge_doc,
+                    &state.sync_state,
+                    dirty,
+                    last_sync_at.or(state.last_sync_at.as_deref()),
+                )
+                .with_context(|| format!("Failed to save CRDT document {:?}", key))?;
+        }
+        doc_set
+            .store_mut()
+            .set_persisted_state(key, mark_clean, last_sync_at);
+        Ok(())
+    }
+
+    pub fn delete_collection_documents(
+        &self,
+        doc_set: &mut ThingsDocumentSet,
+        collection_uuid: &str,
+    ) -> Result<()> {
+        let coll_view = doc_set.collection_view(collection_uuid)?;
+        let thing_uuids: Vec<String> = coll_view.things.iter().map(|t| t.id.clone()).collect();
+
+        for thing_uuid in &thing_uuids {
+            let key = DocumentKey::thing_markdown(thing_uuid);
+            doc_set.remove_document(&key);
+            self.repository.delete_crdt_document(thing_uuid, "thing_markdown").ok();
+        }
+
+        let key = DocumentKey::collection(collection_uuid);
+        doc_set.remove_document(&key);
+        self.repository
+            .delete_crdt_document(collection_uuid, "collection")?;
+
+        doc_set.remove_collection(collection_uuid)?;
+
+        Ok(())
+    }
+}
+
+impl ThingsDocumentSet {
+    /// Load all documents from storage into a ThingsDocumentSet
+    pub fn load_from_storage(storage: &crate::storage::Storage, device_id: &str) -> Result<Self> {
+        DocumentPersistence::new(storage).load_document_set(device_id)
+    }
+
+    /// Save all documents to storage
+    pub fn save_to_storage(&self, storage: &crate::storage::Storage) -> Result<()> {
+        DocumentPersistence::new(storage).save_document_set(self)
+    }
+
+    /// Save only modified documents to storage
+    pub fn save_dirty_to_storage(&self, storage: &crate::storage::Storage) -> Result<usize> {
+        DocumentPersistence::new(storage).save_dirty_documents(self)
     }
 
     /// Save only modified documents to storage, compacting large documents first.
@@ -1666,75 +2649,12 @@ impl ThingsDocumentSet {
         storage: &crate::storage::Storage,
         threshold: usize,
     ) -> Result<(usize, usize)> {
-        // First, collect dirty document keys
-        let dirty_keys: Vec<DocumentKey> = self
-            .documents
-            .iter()
-            .filter(|(_, state)| state.dirty)
-            .map(|(key, _)| key.clone())
-            .collect();
-
-        let count = dirty_keys.len();
-        let mut compacted = 0;
-
-        // Compact and save each dirty document
-        for key in &dirty_keys {
-            // Try to compact if needed
-            if self.maybe_compact_with_threshold(key, threshold)? {
-                compacted += 1;
-            }
-
-            // Save the document
-            if let Some(state) = self.documents.get(&key) {
-                storage
-                    .save_crdt_document(
-                        &key.uuid,
-                        key.data_type_str(),
-                        &state.automerge_doc,
-                        &state.sync_state,
-                        state.dirty,
-                        state.last_sync_at.as_deref(),
-                    )
-                    .with_context(|| format!("Failed to save dirty CRDT document {:?}", key))?;
-            }
-        }
-
-        Ok((count, compacted))
-    }
-
-    /// Save a single document to storage
-    pub fn save_document_to_storage(
-        &mut self,
-        storage: &crate::storage::Storage,
-        key: &DocumentKey,
-        mark_clean: bool,
-        last_sync_at: Option<&str>,
-    ) -> Result<()> {
-        if let Some(state) = self.documents.get_mut(key) {
-            let dirty = if mark_clean { false } else { state.dirty };
-            storage
-                .save_crdt_document(
-                    &key.uuid,
-                    key.data_type_str(),
-                    &state.automerge_doc,
-                    &state.sync_state,
-                    dirty,
-                    last_sync_at.or(state.last_sync_at.as_deref()),
-                )
-                .with_context(|| format!("Failed to save CRDT document {:?}", key))?;
-            if mark_clean {
-                state.dirty = false;
-            }
-            if let Some(last_sync_at) = last_sync_at {
-                state.last_sync_at = Some(last_sync_at.to_string());
-            }
-        }
-        Ok(())
+        DocumentPersistence::new(storage).save_dirty_documents_with_compaction(self, threshold)
     }
 
     /// Check if any document has pending changes
     pub fn has_pending_changes(&self) -> bool {
-        self.documents.values().any(|s| s.dirty)
+        self.store_view().documents.values().any(|s| s.dirty)
     }
 
     /// Delete a collection and its associated things from storage
@@ -1743,35 +2663,10 @@ impl ThingsDocumentSet {
         storage: &crate::storage::Storage,
         collection_uuid: &str,
     ) -> Result<()> {
-        // Get things in this collection before deleting
-        let coll_view = self.collection_view(collection_uuid)?;
-        let thing_uuids: Vec<String> = coll_view.things.iter().map(|t| t.id.clone()).collect();
-
-        // Delete thing markdown documents
-        for thing_uuid in &thing_uuids {
-            let key = DocumentKey::thing_markdown(thing_uuid);
-            self.documents.remove(&key);
-            storage.delete_crdt_document(thing_uuid, "thing_markdown").ok();
-        }
-
-        // Delete collection document
-        let key = DocumentKey::collection(collection_uuid);
-        self.documents.remove(&key);
-        storage.delete_crdt_document(collection_uuid, "collection")?;
-
-        // Remove from root
-        self.remove_collection(collection_uuid)?;
-
-        Ok(())
+        DocumentPersistence::new(storage).delete_collection_documents(self, collection_uuid)
     }
-
-    /// Get the device ID for this document set
-    pub fn device_id(&self) -> &str {
-        &self.device_id
-    }
-
     /// Make documents field accessible for deletion
     pub fn remove_document(&mut self, key: &DocumentKey) -> Option<DocumentState> {
-        self.documents.remove(key)
+        self.store_mut().remove_document(key)
     }
 }

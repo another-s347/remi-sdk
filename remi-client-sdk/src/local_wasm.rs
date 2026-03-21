@@ -945,6 +945,8 @@ mod tests {
                         chat_proto::ChatImageContent {
                             url: "https://example.com/image.png".to_string(),
                             detail: "auto".to_string(),
+                            data: Vec::new(),
+                            media_type: String::new(),
                         },
                     )),
                 },

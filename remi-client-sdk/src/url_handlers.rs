@@ -329,30 +329,30 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn extract_url_supports_direct_shape() {
-        let payload = json!({ "url": "https://example.com" });
-        let url = extract_url(&payload).expect("direct url");
+    fn extract_uri_supports_direct_shape() {
+        let payload = json!({ "uri": "https://example.com" });
+        let url = extract_uri(&payload).expect("direct uri");
         assert_eq!(url, "https://example.com");
     }
 
     #[test]
-    fn extract_url_supports_nested_arguments_shape() {
+    fn extract_uri_supports_nested_arguments_shape() {
         let payload = json!({
             "type": "external_tool_call",
-            "tool_name": "resolve_url",
-            "arguments": { "url": "https://example.com/page" }
+            "tool_name": "resolve_uri",
+            "arguments": { "uri": "https://example.com/page" }
         });
-        let url = extract_url(&payload).expect("nested url");
+        let url = extract_uri(&payload).expect("nested uri");
         assert_eq!(url, "https://example.com/page");
     }
 
     #[test]
-    fn resolve_url_handler_requires_url() {
-        let handler = ResolveUrlHandler;
+    fn resolve_uri_handler_requires_uri() {
+        let handler = ResolveUriHandler;
         let error = handler
-            .handle("call-1", &json!({ "type": "resolve_url" }))
-            .expect_err("missing url must fail");
-        assert!(error.contains("non-empty url"));
+            .handle("call-1", &json!({ "type": "resolve_uri" }))
+            .expect_err("missing uri must fail");
+        assert!(error.contains("non-empty uri"));
     }
 
     #[test]

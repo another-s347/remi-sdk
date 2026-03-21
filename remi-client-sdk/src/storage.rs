@@ -1326,7 +1326,7 @@ impl Storage {
                     doc_bytes = doc.len(),
                     sync_state_bytes = sync_state.len(),
                     dirty = (dirty_int != 0),
-                    last_sync_at = last_sync_at.as_deref().unwrap_or(""),
+                    last_sync_at = ?last_sync_at,
                     "sqlite: things_state row"
                 );
                 Ok((doc, sync_state, dirty_int != 0, last_sync_at))

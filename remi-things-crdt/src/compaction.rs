@@ -127,8 +127,8 @@ pub fn compact_from_view(view: &View, actor: &str, new_epoch: u64) -> Result<Vec
 // V3 Multi-Document Compaction
 // ============================================================================
 
-use crate::view::{RootView, CollectionDocView, ThingMarkdownView};
-use crate::extract::{extract_root_view_from_doc, extract_collection_doc_view_from_doc, extract_thing_markdown_view_from_doc};
+use crate::view::{RootView, CollectionDocView, ThingContentView, ThingMarkdownView};
+use crate::extract::{extract_collection_doc_view_from_doc, extract_root_view_from_doc, extract_thing_content_view_from_doc, extract_thing_markdown_view_from_doc};
 
 /// Default compaction threshold in bytes (64KB)
 pub const DEFAULT_COMPACTION_THRESHOLD: usize = 64 * 1024;
@@ -278,12 +278,44 @@ pub fn compact_thing_markdown_doc(doc_bytes: &[u8], thing_uuid: &str, actor: &st
     rebuild_thing_markdown_doc(&view, actor)
 }
 
+/// Compact a generic thing-owned content document by rebuilding from its view.
+pub fn compact_thing_content_doc(
+    doc_bytes: &[u8],
+    document_uuid: &str,
+    thing_uuid: &str,
+    actor: &str,
+) -> Result<Vec<u8>> {
+    let doc = automerge::AutoCommit::load(doc_bytes)
+        .context("Failed to load thing content document for compaction")?;
+
+    let view = extract_thing_content_view_from_doc(&doc, document_uuid, thing_uuid)
+        .context("Failed to extract thing content view for compaction")?;
+
+    rebuild_thing_content_doc(&view, actor)
+}
+
 /// Rebuild a ThingMarkdown document from its view
 fn rebuild_thing_markdown_doc(view: &ThingMarkdownView, actor: &str) -> Result<Vec<u8>> {
+    let content_view = ThingContentView {
+        schema_version: view.schema_version,
+        document_uuid: view.thing_uuid.clone(),
+        thing_uuid: view.thing_uuid.clone(),
+        content_type: "markdown".to_string(),
+        content: view.content.clone(),
+    };
+    rebuild_thing_content_doc(&content_view, actor)
+}
+
+fn rebuild_thing_content_doc(view: &ThingContentView, actor: &str) -> Result<Vec<u8>> {
     // Start from the init template and update values
-    let template = Schema::init_thing_markdown_doc(actor, &view.thing_uuid)?;
+    let template = Schema::init_thing_content_doc(
+        actor,
+        &view.document_uuid,
+        &view.thing_uuid,
+        &view.content_type,
+    )?;
     let mut doc = automerge::AutoCommit::load(&template)
-        .context("Failed to load thing markdown template")?;
+        .context("Failed to load thing content template")?;
     
     // If there's content, rebuild it
     if let Some(content) = &view.content {

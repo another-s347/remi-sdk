@@ -24,6 +24,7 @@ use proto::public_api::v1::{
 };
 
 use crate::auth::auth_get_bearer_token;
+use crate::things_crdt::{ContentEntryPayload, ContentEntryUpdate, ImageField, UrlField};
 use crate::transport::get_shared_transport;
 
 /// Structured URI metadata returned from the server.
@@ -118,31 +119,19 @@ pub async fn resolve_and_update_entry(
     let meta = resolve_uri(&url, "url").await?;
 
     // Build the update payload
-    let payload_json = if meta.is_image {
-        // Auto-convert to Image entry
+    let payload = if meta.is_image {
         info!(url = %url, "URL is an image, converting to Image payload");
-        serde_json::json!({
-            "type": "image",
-            "uri": url,
-        })
+        ContentEntryPayload::Image(ImageField::new(url.clone()))
     } else {
-        // Update URL entry with resolved metadata
-        serde_json::json!({
-            "type": "url",
-            "url": url,
-            "title": if meta.title.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(meta.title.clone()) },
-            "description": if meta.description.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(meta.description.clone()) },
-            "image_url": if meta.image_url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(meta.image_url.clone()) },
-            "favicon_url": if meta.favicon_url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(meta.favicon_url.clone()) },
-            "site_name": if meta.site_name.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(meta.site_name.clone()) },
-            "resolved": true,
-        })
+        ContentEntryPayload::Url(UrlField::with_metadata(
+            url.clone(),
+            (!meta.title.is_empty()).then(|| meta.title.clone()),
+            (!meta.description.is_empty()).then(|| meta.description.clone()),
+            (!meta.image_url.is_empty()).then(|| meta.image_url.clone()),
+            (!meta.favicon_url.is_empty()).then(|| meta.favicon_url.clone()),
+            (!meta.site_name.is_empty()).then(|| meta.site_name.clone()),
+        ))
     };
-
-    let update_json = serde_json::json!({
-        "payload": payload_json,
-    })
-    .to_string();
 
     // Write back to CRDT (synchronous op — run on blocking thread)
     let sdk_clone = sdk.clone();
@@ -154,8 +143,12 @@ pub async fn resolve_and_update_entry(
         sdk_clone.things_update_content_entry(
             &device_id_clone,
             &thing_uuid_clone,
-            &entry_id_clone,
-            &update_json,
+            ContentEntryUpdate {
+                id: entry_id_clone,
+                title: None,
+                order: None,
+                payload: Some(payload),
+            },
         )
     })
     .await

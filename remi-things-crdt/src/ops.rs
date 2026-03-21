@@ -5,8 +5,8 @@ use automerge::{AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value};
 use crate::datatype::{ContentEntryPayload, LocationField, ThingBuiltInFieldsUpdate};
 use crate::schema::Schema;
 use crate::util::{
-    ensure_child_map, ensure_list_key, ensure_map_key, ensure_map_key as ensure_root_map,
-    get_string, get_u64, put_string, put_u64, set_doc_actor,
+    collect_list_keys, collect_map_keys, ensure_child_map, ensure_list_key, ensure_map_key,
+    ensure_map_key as ensure_root_map, get_string, get_u64, put_string, put_u64, set_doc_actor,
 };
 use crate::ThingDatatype;
 
@@ -230,6 +230,91 @@ fn set_tombstone(doc: &mut AutoCommit, entity_obj: &ObjId, actor: &str) -> Resul
 
 fn clear_tombstone(doc: &mut AutoCommit, entity_obj: &ObjId) {
     let _ = doc.delete(entity_obj, "tombstone");
+}
+
+fn thing_is_live(doc: &AutoCommit, thing_obj: &ObjId) -> Result<bool> {
+    Ok(!doc
+        .get(thing_obj, "tombstone")?
+        .and_then(|(value, tombstone_obj)| match value {
+            Value::Object(ObjType::Map) => Some(tombstone_obj),
+            _ => None,
+        })
+        .map(|tombstone_obj| {
+            get_u64(doc, &tombstone_obj, "deleted")
+                .ok()
+                .flatten()
+                .map(|deleted| deleted != 0)
+                .unwrap_or_else(|| {
+                    doc.get(&tombstone_obj, "deleted")
+                        .ok()
+                        .flatten()
+                        .and_then(|(value, _)| match value {
+                            Value::Scalar(sv) => match sv.as_ref() {
+                                ScalarValue::Boolean(flag) => Some(*flag),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .unwrap_or(false)
+                })
+        })
+        .unwrap_or(false))
+}
+
+fn find_live_thing_obj(doc: &AutoCommit, thing_id: &str) -> Result<Option<ObjId>> {
+    let Some((Value::Object(ObjType::Map), things_map)) =
+        doc.get(automerge::ROOT, Schema::KEY_THING_MAP)?
+    else {
+        return Ok(None);
+    };
+
+    for (value, thing_obj) in doc.get_all(&things_map, thing_id)? {
+        if matches!(value, Value::Object(ObjType::Map)) && thing_is_live(doc, &thing_obj)? {
+            return Ok(Some(thing_obj));
+        }
+    }
+
+    Ok(None)
+}
+
+fn validate_parent_reference(
+    doc: &AutoCommit,
+    thing_id: &str,
+    parent_id: Option<&str>,
+) -> Result<()> {
+    let Some(parent_id) = parent_id.map(str::trim).filter(|parent_id| !parent_id.is_empty()) else {
+        return Ok(());
+    };
+
+    if parent_id == thing_id {
+        anyhow::bail!("thing '{}' cannot be its own parent", thing_id);
+    }
+
+    let Some(parent_obj) = find_live_thing_obj(doc, parent_id)? else {
+        anyhow::bail!(
+            "parent thing '{}' must already exist in the same collection document",
+            parent_id
+        );
+    };
+
+    let mut cursor = Some(parent_obj);
+    while let Some(current_obj) = cursor {
+        let next_parent = get_string(doc, &current_obj, "parent_id")?;
+        let Some(next_parent_id) = next_parent.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+            break;
+        };
+
+        if next_parent_id == thing_id {
+            anyhow::bail!(
+                "parent assignment would create a cycle involving thing '{}'",
+                thing_id
+            );
+        }
+
+        cursor = find_live_thing_obj(doc, next_parent_id)?;
+    }
+
+    Ok(())
 }
 
 fn apply_trigger_update(
@@ -960,6 +1045,8 @@ pub fn apply_collection_op(
             built_in,
             attrs_json,
         } => {
+            validate_parent_reference(&doc, &thing_id, parent_id.as_deref())?;
+
             let things_map = ensure_map_key(&mut doc, &automerge::ROOT, Schema::KEY_THING_MAP)?;
             let thing_obj = ensure_child_map(&mut doc, &things_map, &thing_id)?;
 
@@ -976,6 +1063,8 @@ pub fn apply_collection_op(
                 put_string(&mut doc, &thing_obj, "status", "none")?;
             }
             let _ = ensure_map_key(&mut doc, &thing_obj, "edit_clock");
+            let built_in_obj = ensure_map_key(&mut doc, &thing_obj, Schema::KEY_BUILT_IN)?;
+            let _ = ensure_list_key(&mut doc, &built_in_obj, "content_entries")?;
 
             bump_entity_clock(&mut doc, &thing_obj, actor)?;
             clear_tombstone(&mut doc, &thing_obj);
@@ -1051,22 +1140,38 @@ fn apply_built_in_fields(
     thing_obj: &ObjId,
     update: ThingBuiltInFieldsUpdate,
 ) -> Result<()> {
-    let built_in_obj = ensure_map_key(doc, thing_obj, Schema::KEY_BUILT_IN)?;
+    let mut built_in_objs = collect_map_keys(doc, thing_obj, Schema::KEY_BUILT_IN)?;
+    let built_in_obj = if let Some(existing) = built_in_objs.first().cloned() {
+        existing
+    } else {
+        let created = ensure_map_key(doc, thing_obj, Schema::KEY_BUILT_IN)?;
+        built_in_objs.push(created.clone());
+        created
+    };
 
-    // Ensure content_entries list exists
-    let entries_list = ensure_list_key(doc, &built_in_obj, "content_entries")?;
+    let mut entries_lists = Vec::new();
+    for built_in_obj in &built_in_objs {
+        entries_lists.extend(collect_list_keys(doc, built_in_obj, "content_entries")?);
+    }
+    let primary_entries_list = if let Some(existing) = entries_lists.first().cloned() {
+        existing
+    } else {
+        let created = ensure_list_key(doc, &built_in_obj, "content_entries")?;
+        entries_lists.push(created.clone());
+        created
+    };
 
     // Delete entries by ID
     for entry_id in &update.delete_entry_ids {
-        // Find and delete the entry with matching ID
-        let len = doc.length(&entries_list);
-        for i in (0..len).rev() {
-            if let Some((Value::Object(ObjType::Map), entry_obj)) = doc.get(&entries_list, i)? {
-                if let Some(id) = get_string(doc, &entry_obj, "id")? {
-                    if &id == entry_id {
-                        doc.delete(&entries_list, i)
-                            .context("Failed to delete entry")?;
-                        break;
+        for entries_list in &entries_lists {
+            let len = doc.length(entries_list);
+            for i in (0..len).rev() {
+                if let Some((Value::Object(ObjType::Map), entry_obj)) = doc.get(entries_list, i)? {
+                    if let Some(id) = get_string(doc, &entry_obj, "id")? {
+                        if &id == entry_id {
+                            doc.delete(entries_list, i)
+                                .context("Failed to delete entry")?;
+                        }
                     }
                 }
             }
@@ -1075,30 +1180,28 @@ fn apply_built_in_fields(
 
     // Update existing entries
     for entry_update in &update.update_entries {
-        let len = doc.length(&entries_list);
-        for i in 0..len {
-            if let Some((Value::Object(ObjType::Map), entry_obj)) = doc.get(&entries_list, i)? {
-                if let Some(id) = get_string(doc, &entry_obj, "id")? {
-                    if id == entry_update.id {
-                        // Update title
-                        if let Some(title_opt) = &entry_update.title {
-                            match title_opt {
-                                Some(title) => put_string(doc, &entry_obj, "title", title)?,
-                                None => {
-                                    let _ = doc.delete(&entry_obj, "title");
+        for entries_list in &entries_lists {
+            let len = doc.length(entries_list);
+            for i in 0..len {
+                if let Some((Value::Object(ObjType::Map), entry_obj)) = doc.get(entries_list, i)? {
+                    if let Some(id) = get_string(doc, &entry_obj, "id")? {
+                        if id == entry_update.id {
+                            if let Some(title_opt) = &entry_update.title {
+                                match title_opt {
+                                    Some(title) => put_string(doc, &entry_obj, "title", title)?,
+                                    None => {
+                                        let _ = doc.delete(&entry_obj, "title");
+                                    }
                                 }
                             }
+                            if let Some(order) = entry_update.order {
+                                doc.put(&entry_obj, "order", order)
+                                    .context("Failed to set order")?;
+                            }
+                            if let Some(payload) = &entry_update.payload {
+                                write_content_entry_payload(doc, &entry_obj, payload)?;
+                            }
                         }
-                        // Update order
-                        if let Some(order) = entry_update.order {
-                            doc.put(&entry_obj, "order", order)
-                                .context("Failed to set order")?;
-                        }
-                        // Update payload
-                        if let Some(payload) = &entry_update.payload {
-                            write_content_entry_payload(doc, &entry_obj, payload)?;
-                        }
-                        break;
                     }
                 }
             }
@@ -1107,9 +1210,9 @@ fn apply_built_in_fields(
 
     // Add new entries
     for entry in &update.add_entries {
-        let idx = doc.length(&entries_list);
+        let idx = doc.length(&primary_entries_list);
         let entry_obj = doc
-            .insert_object(&entries_list, idx, ObjType::Map)
+            .insert_object(&primary_entries_list, idx, ObjType::Map)
             .context("Failed to insert entry")?;
 
         put_string(doc, &entry_obj, "id", &entry.id)?;
@@ -1230,10 +1333,10 @@ fn write_content_entry_payload(
             doc.put(&payload_obj, "resolved", url_field.resolved)
                 .context("Failed to set resolved")?;
         }
-        ContentEntryPayload::Custom(val) => {
-            put_string(doc, &payload_obj, "type", "custom")?;
+        ContentEntryPayload::Custom { content_type, data } => {
+            put_string(doc, &payload_obj, "type", content_type)?;
             let json_str =
-                serde_json::to_string(val).context("Failed to serialize custom payload")?;
+                serde_json::to_string(data).context("Failed to serialize custom payload")?;
             put_string(doc, &payload_obj, "data", &json_str)?;
         }
     }
@@ -1486,6 +1589,92 @@ mod tests_v3 {
         assert_eq!(view.things.len(), 1);
         assert_eq!(view.things[0].id, "thing-1");
         assert_eq!(view.things[0].title.as_deref(), Some("My Task"));
+    }
+
+    #[test]
+    fn test_collection_op_rejects_missing_parent() {
+        let doc = Schema::init_collection_doc("test", "coll-1").unwrap();
+        let err = apply_collection_op(
+            &doc,
+            "test",
+            "coll-1",
+            CollectionOp::UpsertThingMeta {
+                thing_id: "thing-1".into(),
+                datatype: Some(ThingDatatype::Markdown),
+                status: Some("none".into()),
+                status_timestamp_ms: None,
+                title: Some("Child".into()),
+                parent_id: Some("missing-parent".into()),
+                trigger: TriggerUpdate::Noop,
+                built_in: None,
+                attrs_json: None,
+            },
+        )
+        .expect_err("missing parent must be rejected");
+
+        assert!(
+            err.to_string().contains("must already exist in the same collection document"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_collection_op_rejects_parent_cycle() {
+        let doc = Schema::init_collection_doc("test", "coll-1").unwrap();
+        let doc = apply_collection_op(
+            &doc,
+            "test",
+            "coll-1",
+            CollectionOp::UpsertThingMeta {
+                thing_id: "parent".into(),
+                datatype: Some(ThingDatatype::Markdown),
+                status: Some("none".into()),
+                status_timestamp_ms: None,
+                title: Some("Parent".into()),
+                parent_id: None,
+                trigger: TriggerUpdate::Noop,
+                built_in: None,
+                attrs_json: None,
+            },
+        )
+        .unwrap();
+        let doc = apply_collection_op(
+            &doc,
+            "test",
+            "coll-1",
+            CollectionOp::UpsertThingMeta {
+                thing_id: "child".into(),
+                datatype: Some(ThingDatatype::Markdown),
+                status: Some("none".into()),
+                status_timestamp_ms: None,
+                title: Some("Child".into()),
+                parent_id: Some("parent".into()),
+                trigger: TriggerUpdate::Noop,
+                built_in: None,
+                attrs_json: None,
+            },
+        )
+        .unwrap();
+
+        let err = apply_collection_op(
+            &doc,
+            "test",
+            "coll-1",
+            CollectionOp::UpsertThingMeta {
+                thing_id: "parent".into(),
+                datatype: None,
+                status: None,
+                status_timestamp_ms: None,
+                title: None,
+                parent_id: Some("child".into()),
+                trigger: TriggerUpdate::Noop,
+                built_in: None,
+                attrs_json: None,
+            },
+        )
+        .expect_err("parent cycle must be rejected");
+
+        assert!(err.to_string().contains("would create a cycle"), "{err:?}");
     }
 
     #[test]

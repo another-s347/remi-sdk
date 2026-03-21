@@ -1,4 +1,5 @@
 use remi_client_sdk::things_handlers::TriggerRulePublishedHandler;
+use remi_client_sdk::things_crdt::ThingCollectionUpsert;
 use remi_client_sdk::{InterruptHandler, TriggerRegistration, TriggerRule, TriggerSdk};
 use serde_json::json;
 use std::sync::Arc;
@@ -35,12 +36,16 @@ fn trigger_rule_published_rebind_deletes_old_trigger() {
     let device_id = "device-1".to_string();
     let collection_uuid = "collection-1";
 
-    let collection_payload = json!({
-        "uuid": collection_uuid,
-        "title": "Inbox",
-    })
-    .to_string();
-    sdk.things_upsert_collection_json(&device_id, &collection_payload)
+    sdk.things_upsert_collection(
+        &device_id,
+        ThingCollectionUpsert {
+            uuid: collection_uuid.to_string(),
+            title: "Inbox".to_string(),
+            trigger_uuid: None,
+            created_at: None,
+            updated_at: None,
+        },
+    )
         .expect("insert collection");
 
     let old_trigger_uuid = "trigger-old";

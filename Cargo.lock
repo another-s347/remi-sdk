@@ -3105,7 +3105,7 @@ dependencies = [
  "protoc-bin-vendored",
  "remi-agentloop",
  "remi-agentloop-wasm",
- "remi-things-crdt 0.1.0 (git+https://github.com/another-s347/remi-sdk.git?rev=60854de1666930a5b88459756b69b9b0b96c12db)",
+ "remi-things-crdt",
  "reqwest",
  "rule-trigger-engine",
  "rusqlite",
@@ -3132,20 +3132,6 @@ dependencies = [
 [[package]]
 name = "remi-things-crdt"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "automerge",
- "chrono",
- "serde",
- "serde_json",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "remi-things-crdt"
-version = "0.1.0"
-source = "git+https://github.com/another-s347/remi-sdk.git?rev=60854de1666930a5b88459756b69b9b0b96c12db#60854de1666930a5b88459756b69b9b0b96c12db"
 dependencies = [
  "anyhow",
  "automerge",

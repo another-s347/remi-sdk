@@ -406,8 +406,11 @@ pub enum ContentEntryPayload {
     Image(ImageField),
     /// URL / web link content (URL + resolved metadata)
     Url(UrlField),
-    /// Custom content (arbitrary JSON)
-    Custom(serde_json::Value),
+    /// Custom content with an explicit external type name and arbitrary JSON payload.
+    Custom {
+        content_type: String,
+        data: serde_json::Value,
+    },
 }
 
 impl ContentEntryPayload {
@@ -418,7 +421,9 @@ impl ContentEntryPayload {
             ContentEntryPayload::Date(_) => ContentEntryKind::Date,
             ContentEntryPayload::Image(_) => ContentEntryKind::Image,
             ContentEntryPayload::Url(_) => ContentEntryKind::Url,
-            ContentEntryPayload::Custom(_) => ContentEntryKind::Custom("custom".to_string()),
+            ContentEntryPayload::Custom { content_type, .. } => {
+                ContentEntryKind::Custom(content_type.clone())
+            }
         }
     }
 }

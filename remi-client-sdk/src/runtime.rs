@@ -3,7 +3,8 @@ use crate::events_events::EventsEvent;
 use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
 use crate::storage::Storage;
 use crate::things_crdt::{
-    ThingCollectionEntry, ThingCollectionUpsert, ThingEntry, ThingUpsert, ThingsSnapshot,
+    ContentEntry, ContentEntryUpdate, ThingCollectionEntry, ThingCollectionUpsert, ThingEntry,
+    ThingUpsert, ThingsSnapshot,
 };
 use crate::things_events::ThingsEvent;
 use crate::trigger_events::TriggerEvent;
@@ -110,13 +111,10 @@ impl TriggerSdk {
     /// Things/Collections state.  Called after sync pulls new documents from
     /// the server.
     pub fn emit_snapshot_replace(&self, device_id: &str) -> Result<()> {
-        use crate::things_crdt::SnapshotOptions;
         let doc_set = self.get_or_init_document_set(device_id)?;
-        let snapshot = doc_set
-            .extract_snapshot_with_options(SnapshotOptions {
-                include_content: true,
-            })
-            .context("Failed to extract snapshot for SnapshotReplace event")?;
+        let snapshot = doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+            include_content: true,
+        }).context("Failed to extract snapshot for SnapshotReplace event")?;
         let dirty = doc_set.has_pending_changes();
         self.emit_things_event(ThingsEvent::SnapshotReplace {
             device_id: device_id.to_string(),
@@ -635,29 +633,8 @@ impl TriggerSdk {
         &self,
         device_id: &str,
     ) -> Result<crate::things_crdt::ThingsDocumentSet> {
-        let mut doc_set =
-            crate::things_crdt::ThingsDocumentSet::load_from_storage(&self.storage, device_id)?;
-
-        // Ensure root document exists
-        if !doc_set.contains(&crate::things_crdt::DocumentKey::root()) {
-            doc_set.init_root()?;
-            doc_set.save_to_storage(&self.storage)?;
-        }
-
-        // Repair root → collection linkage if any collection documents
-        // are present locally but not listed in the root document.
-        // This can happen after interrupted syncs or out-of-order document pulls.
-        let repaired = doc_set.repair_root_collection_linkage()?;
-        if repaired > 0 {
-            tracing::info!(
-                device_id,
-                repaired,
-                "get_or_init_document_set: repaired root-collection linkage"
-            );
-            doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-        }
-
-        Ok(doc_set)
+        let persistence = crate::things_crdt::DocumentPersistence::new(&self.storage);
+        persistence.load_or_init_document_set(device_id)
     }
 
     pub fn things_list_snapshot_json(&self, device_id: &str) -> Result<String> {
@@ -738,13 +715,11 @@ impl TriggerSdk {
         Ok(doc_set.has_pending_changes())
     }
 
-    pub fn things_upsert_collection_json(
+    pub fn things_upsert_collection(
         &self,
         device_id: &str,
-        payload_json: &str,
-    ) -> Result<String> {
-        let upsert: ThingCollectionUpsert =
-            serde_json::from_str(payload_json).context("Invalid ThingCollectionUpsert JSON")?;
+        upsert: ThingCollectionUpsert,
+    ) -> Result<ThingCollectionEntry> {
         let mut doc_set = self.get_or_init_document_set(device_id)?;
 
         // Check if collection exists before upsert to determine if this is create or update
@@ -829,7 +804,7 @@ impl TriggerSdk {
             true,
         );
 
-        to_string(&created).context("Failed to serialize collection")
+        Ok(created.clone())
     }
 
     pub fn things_delete_collection(&self, device_id: &str, uuid: &str) -> Result<bool> {
@@ -970,9 +945,7 @@ impl TriggerSdk {
         Ok(true)
     }
 
-    pub fn things_upsert_thing_json(&self, device_id: &str, payload_json: &str) -> Result<String> {
-        let upsert: ThingUpsert =
-            serde_json::from_str(payload_json).context("Invalid ThingUpsert JSON")?;
+    pub fn things_upsert_thing(&self, device_id: &str, upsert: ThingUpsert) -> Result<ThingEntry> {
 
         // Guard: collection_uuid must be non-empty
         if upsert.collection_uuid.trim().is_empty() {
@@ -1017,7 +990,7 @@ impl TriggerSdk {
                 thing_uuid = upsert.uuid,
                 from_collection = old_coll.as_str(),
                 to_collection = upsert.collection_uuid.as_str(),
-                "things_upsert_thing_json: moving thing — tombstoning in source collection"
+                "things_upsert_thing: moving thing — tombstoning in source collection"
             );
             doc_set.delete_thing(old_coll, &upsert.uuid)?;
         }
@@ -1037,9 +1010,7 @@ impl TriggerSdk {
 
         // V3: If data is provided, update thing markdown document
         if let Some(ref data) = upsert.data {
-            let content =
-                crate::things_crdt::markdown_only_content_from_value(&upsert.datatype, data);
-            doc_set.set_thing_content(&upsert.uuid, content)?;
+            doc_set.set_thing_content_from_payload(&upsert.uuid, &upsert.datatype, data)?;
         }
 
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
@@ -1208,7 +1179,7 @@ impl TriggerSdk {
             }
         }
 
-        to_string(&created).context("Failed to serialize thing")
+        Ok(created.clone())
     }
 
     pub fn things_splice_text(
@@ -1233,16 +1204,7 @@ impl TriggerSdk {
             return Ok(false);
         }
 
-        // V3: Get the thing markdown document before splice to check if it exists
-        let md_view_before = doc_set.thing_markdown_view(thing_uuid)?;
-        let has_content = md_view_before.content.is_some();
-
-        // V3: Splice text in thing markdown document
-        doc_set.splice_thing_text(thing_uuid, block_id, index, delete, insert)?;
-
-        // Check if the splice actually changed anything
-        let md_view_after = doc_set.thing_markdown_view(thing_uuid)?;
-        if md_view_before.content == md_view_after.content && has_content {
+        if !doc_set.try_splice_thing_text(thing_uuid, block_id, index, delete, insert)? {
             // No-op (e.g., block not found). Treat as failure so callers can fall back.
             return Ok(false);
         }
@@ -1303,18 +1265,7 @@ impl TriggerSdk {
         if !snapshot.things.iter().any(|t| t.uuid == thing_uuid) {
             return Ok(None);
         }
-        let md_view = doc_set.thing_markdown_view(thing_uuid)?;
-
-        // Extract markdown text from content
-        let markdown = md_view.content.and_then(|c| {
-            c.blocks.and_then(|blocks| {
-                blocks
-                    .into_iter()
-                    .find(|b| b.id == "main")
-                    .and_then(|b| b.text)
-            })
-        });
-        Ok(markdown)
+        doc_set.get_thing_markdown_text(thing_uuid)
     }
 
     /// Edit the content of a thing using editor-level operations.
@@ -1364,18 +1315,7 @@ impl TriggerSdk {
 
         // Get current markdown content on-demand for the target thing only.
         let current_markdown = if include_content_for_read {
-            let md_view = doc_set.thing_markdown_view(thing_uuid)?;
-            md_view
-                .content
-                .and_then(|c| {
-                    c.blocks.and_then(|blocks| {
-                        blocks
-                            .into_iter()
-                            .find(|b| b.id == "main")
-                            .and_then(|b| b.text)
-                    })
-                })
-                .unwrap_or_default()
+            doc_set.get_thing_markdown_text(thing_uuid)?.unwrap_or_default()
         } else {
             String::new()
         };
@@ -1490,8 +1430,7 @@ impl TriggerSdk {
         }
 
         if !title_only {
-            // Replace the entire main block in one op.
-            doc_set.splice_thing_text(thing_uuid, "main", 0, usize::MAX, &final_content)?;
+            doc_set.replace_thing_markdown_text(thing_uuid, &final_content)?;
 
             self.emit_things_event(ThingsEvent::ThingMarkdownSplice {
                 device_id: device_id.to_string(),
@@ -1858,10 +1797,8 @@ impl TriggerSdk {
         &self,
         device_id: &str,
         thing_uuid: &str,
-        entry_json: &str,
+        entry: ContentEntry,
     ) -> Result<String> {
-        use remi_things_crdt::ContentEntry;
-
         let mut doc_set = self.get_or_init_document_set(device_id)?;
 
         // Find the thing's collection — try snapshot first, fall back to direct scan.
@@ -1890,33 +1827,7 @@ impl TriggerSdk {
             }
         };
 
-        // Parse entry JSON
-        let v: serde_json::Value =
-            serde_json::from_str(entry_json).context("Invalid entry JSON")?;
-
-        // Generate UUID using uuid crate if not provided
-        let id = v
-            .get("id")
-            .and_then(|i| i.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let title = v
-            .get("title")
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string());
-        let order = v.get("order").and_then(|o| o.as_f64()).unwrap_or(0.0);
-
-        let payload_val = v
-            .get("payload")
-            .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
-        let payload = parse_content_entry_payload(payload_val)?;
-
-        let entry = ContentEntry {
-            id: id.clone(),
-            title,
-            order,
-            payload,
-        };
+        let id = entry.id.clone();
 
         doc_set.add_content_entry(&collection_uuid, thing_uuid, entry)?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
@@ -1929,23 +1840,13 @@ impl TriggerSdk {
     /// # Arguments
     /// * `device_id` - Device identifier
     /// * `thing_uuid` - Thing UUID
-    /// * `entry_id` - Entry ID to update
-    /// * `update_json` - JSON string of fields to update
+    /// * `update` - Typed fields to update
     ///
-    /// Update JSON format:
-    /// ```json
-    /// {
-    ///   "title": "New title",  // or null to clear
-    ///   "order": 1.5,
-    ///   "payload": { ... }     // optional new payload
-    /// }
-    /// ```
     pub fn things_update_content_entry(
         &self,
         device_id: &str,
         thing_uuid: &str,
-        entry_id: &str,
-        update_json: &str,
+        update: ContentEntryUpdate,
     ) -> Result<()> {
         let mut doc_set = self.get_or_init_document_set(device_id)?;
 
@@ -1966,33 +1867,13 @@ impl TriggerSdk {
             }
         };
 
-        // Parse update JSON
-        let v: serde_json::Value =
-            serde_json::from_str(update_json).context("Invalid update JSON")?;
-
-        let title = if v.get("title").is_some() {
-            Some(
-                v.get("title")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string()),
-            )
-        } else {
-            None
-        };
-        let order = v.get("order").and_then(|o| o.as_f64());
-        let payload = if let Some(p) = v.get("payload") {
-            Some(parse_content_entry_payload(p)?)
-        } else {
-            None
-        };
-
         doc_set.update_content_entry(
             &collection_uuid,
             thing_uuid,
-            entry_id,
-            title,
-            order,
-            payload,
+            &update.id,
+            update.title,
+            update.order,
+            update.payload,
         )?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
 
@@ -2031,36 +1912,31 @@ impl TriggerSdk {
         Ok(())
     }
 
-    /// Get all content entries of a thing as JSON array.
-    pub fn things_get_content_entries(&self, device_id: &str, thing_uuid: &str) -> Result<String> {
+    /// Get all content entries of a thing.
+    pub fn things_get_content_entries(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+    ) -> Result<Vec<ContentEntry>> {
         let doc_set = self.get_or_init_document_set(device_id)?;
 
-        // Find the thing — try snapshot first, fall back to direct scan for collection_uuid.
-        let snapshot = doc_set.extract_snapshot()?;
-        let thing = snapshot.things.iter().find(|t| t.uuid == thing_uuid);
-
-        if let Some(thing) = thing {
-            // Get built_in.content_entries from thing data
-            let data = &thing.data;
-            let built_in = data.get("built_in");
-            if let Some(bi) = built_in {
-                if let Some(entries) = bi.get("content_entries") {
-                    return Ok(serde_json::to_string(entries)?);
+        let collection_uuid = {
+            let snapshot = doc_set.extract_snapshot()?;
+            match snapshot.things.iter().find(|t| t.uuid == thing_uuid) {
+                Some(t) => t.collection_uuid.clone(),
+                None => {
+                    tracing::warn!(
+                        thing_uuid,
+                        "things_get_content_entries: thing not in snapshot, scanning collection docs"
+                    );
+                    doc_set
+                        .find_thing_collection_uuid(thing_uuid)
+                        .ok_or_else(|| anyhow::anyhow!("Thing not found: {}", thing_uuid))?
                 }
             }
-            Ok("[]".to_string())
-        } else {
-            // Fallback: scan collection documents directly
-            tracing::warn!(
-                thing_uuid,
-                "things_get_content_entries: thing not in snapshot, scanning collection docs"
-            );
-            let collection_uuid = doc_set
-                .find_thing_collection_uuid(thing_uuid)
-                .ok_or_else(|| anyhow::anyhow!("Thing not found: {}", thing_uuid))?;
-            let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
-            Ok(serde_json::to_string(&entries)?)
-        }
+        };
+
+        doc_set.get_content_entries(&collection_uuid, thing_uuid)
     }
 
     // Legacy single-value getters for backward compatibility
@@ -2069,6 +1945,7 @@ impl TriggerSdk {
     /// Get location field of a thing as JSON string (backward compat).
     /// Returns the first location content entry if any.
     pub fn things_get_location(&self, device_id: &str, thing_uuid: &str) -> Result<Option<String>> {
+        let content_registry = crate::things_crdt::ContentTypeRegistry::new();
         let doc_set = self.get_or_init_document_set(device_id)?;
         let snapshot = doc_set.extract_snapshot()?;
         let thing = snapshot.things.iter().find(|t| t.uuid == thing_uuid);
@@ -2079,33 +1956,24 @@ impl TriggerSdk {
                 anyhow::bail!("Thing not found: {}", thing_uuid);
             }
             let entries = doc_set.get_content_entries(&coll.unwrap(), thing_uuid)?;
-            for entry in &entries {
-                if let remi_things_crdt::ContentEntryPayload::Location(ref loc) = entry.payload {
-                    return Ok(Some(serde_json::to_string(loc)?));
-                }
-            }
-            return Ok(None);
+            return content_registry
+                .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Location)
+                .map(|payload| serde_json::to_string(&payload).context("serialize location payload"))
+                .transpose();
         }
 
-        // Get built_in.content_entries from thing data and find first location
-        let data = &thing.unwrap().data;
-        if let Some(bi) = data.get("built_in") {
-            if let Some(entries) = bi.get("content_entries").and_then(|b| b.as_array()) {
-                for entry in entries {
-                    if let Some(payload) = entry.get("payload") {
-                        if payload.get("type").and_then(|t| t.as_str()) == Some("location") {
-                            return Ok(Some(serde_json::to_string(payload)?));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
+        let collection_uuid = thing.unwrap().collection_uuid.clone();
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        content_registry
+            .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Location)
+            .map(|payload| serde_json::to_string(&payload).context("serialize location payload"))
+            .transpose()
     }
 
     /// Get date field of a thing as JSON string (backward compat).
     /// Returns the first date content entry if any.
     pub fn things_get_date(&self, device_id: &str, thing_uuid: &str) -> Result<Option<String>> {
+        let content_registry = crate::things_crdt::ContentTypeRegistry::new();
         let doc_set = self.get_or_init_document_set(device_id)?;
         let snapshot = doc_set.extract_snapshot()?;
         let thing = snapshot.things.iter().find(|t| t.uuid == thing_uuid);
@@ -2116,28 +1984,18 @@ impl TriggerSdk {
                 anyhow::bail!("Thing not found: {}", thing_uuid);
             }
             let entries = doc_set.get_content_entries(&coll.unwrap(), thing_uuid)?;
-            for entry in &entries {
-                if let remi_things_crdt::ContentEntryPayload::Date(ref date) = entry.payload {
-                    return Ok(Some(serde_json::to_string(date)?));
-                }
-            }
-            return Ok(None);
+            return content_registry
+                .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Date)
+                .map(|payload| serde_json::to_string(&payload).context("serialize date payload"))
+                .transpose();
         }
 
-        // Get built_in.content_entries from thing data and find first date
-        let data = &thing.unwrap().data;
-        if let Some(bi) = data.get("built_in") {
-            if let Some(entries) = bi.get("content_entries").and_then(|b| b.as_array()) {
-                for entry in entries {
-                    if let Some(payload) = entry.get("payload") {
-                        if payload.get("type").and_then(|t| t.as_str()) == Some("date") {
-                            return Ok(Some(serde_json::to_string(payload)?));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
+        let collection_uuid = thing.unwrap().collection_uuid.clone();
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        content_registry
+            .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Date)
+            .map(|payload| serde_json::to_string(&payload).context("serialize date payload"))
+            .transpose()
     }
 
     /// V3: Replace state after sync - this needs to be rewritten for multi-doc
@@ -2400,12 +2258,16 @@ impl TriggerSdk {
         let trigger_uuid = details["trigger_uuid"].as_str().map(|s| s.to_string());
 
         // Restore the collection
-        let collection_json = serde_json::json!({
-            "uuid": log_entry.entity_uuid,
-            "title": title,
-            "trigger_uuid": trigger_uuid,
-        });
-        self.things_upsert_collection_json(device_id, &collection_json.to_string())?;
+        self.things_upsert_collection(
+            device_id,
+            ThingCollectionUpsert {
+                uuid: log_entry.entity_uuid.clone(),
+                title: title.to_string(),
+                trigger_uuid,
+                created_at: None,
+                updated_at: None,
+            },
+        )?;
 
         // Restore cascade-deleted things
         for cascade_entry in &preview.cascade_entries {
@@ -2417,16 +2279,20 @@ impl TriggerSdk {
                     if let Ok(thing_data) =
                         serde_json::from_str::<ThingEntry>(&snapshot.content_json)
                     {
-                        let thing_json = serde_json::json!({
-                            "uuid": thing_data.uuid,
-                            "title": thing_data.title,
-                            "datatype": thing_data.datatype.as_str(),
-                            "data": thing_data.data,
-                            "collection_uuid": thing_data.collection_uuid,
-                            "trigger_uuid": thing_data.trigger_uuid,
-                            "parent_uuid": thing_data.parent_uuid,
-                        });
-                        self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+                        self.things_upsert_thing(
+                            device_id,
+                            ThingUpsert {
+                                uuid: thing_data.uuid,
+                                title: thing_data.title,
+                                datatype: thing_data.datatype,
+                                data: Some(thing_data.data),
+                                collection_uuid: thing_data.collection_uuid,
+                                trigger_uuid: thing_data.trigger_uuid,
+                                parent_uuid: thing_data.parent_uuid,
+                                created_at: None,
+                                updated_at: None,
+                            },
+                        )?;
 
                         // For markdown things, content is in the data.content field
                         // The upsert will handle setting it via the document set
@@ -2486,22 +2352,29 @@ impl TriggerSdk {
         } else {
             thing_data.collection_uuid.clone()
         };
+        let restored_thing_uuid = thing_data.uuid.clone();
+        let restored_thing_title = thing_data.title.clone();
 
         // Restore the thing
-        let thing_json = serde_json::json!({
-            "uuid": thing_data.uuid,
-            "title": thing_data.title,
-            "datatype": thing_data.datatype.as_str(),
-            "data": thing_data.data,
-            "collection_uuid": target_collection,
-            "trigger_uuid": thing_data.trigger_uuid,
-            "parent_uuid": thing_data.parent_uuid,
-        });
-        self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+        self.things_upsert_thing(
+            device_id,
+            ThingUpsert {
+                uuid: thing_data.uuid,
+                title: thing_data.title,
+                datatype: thing_data.datatype,
+                data: Some(thing_data.data),
+                collection_uuid: target_collection,
+                trigger_uuid: thing_data.trigger_uuid,
+                parent_uuid: thing_data.parent_uuid,
+                created_at: None,
+                updated_at: None,
+            },
+        )?;
 
         // Restore cascade-deleted child things
         for cascade_entry in &preview.cascade_entries {
-            if cascade_entry.entity_type == "thing" && cascade_entry.entity_uuid != thing_data.uuid
+            if cascade_entry.entity_type == "thing"
+                && cascade_entry.entity_uuid != restored_thing_uuid
             {
                 if let Some(child_snapshot) = self
                     .storage
@@ -2510,22 +2383,26 @@ impl TriggerSdk {
                     if let Ok(child_data) =
                         serde_json::from_str::<ThingEntry>(&child_snapshot.content_json)
                     {
-                        let child_json = serde_json::json!({
-                            "uuid": child_data.uuid,
-                            "title": child_data.title,
-                            "datatype": child_data.datatype.as_str(),
-                            "data": child_data.data,
-                            "collection_uuid": child_data.collection_uuid,
-                            "trigger_uuid": child_data.trigger_uuid,
-                            "parent_uuid": child_data.parent_uuid,
-                        });
-                        self.things_upsert_thing_json(device_id, &child_json.to_string())?;
+                        self.things_upsert_thing(
+                            device_id,
+                            ThingUpsert {
+                                uuid: child_data.uuid,
+                                title: child_data.title,
+                                datatype: child_data.datatype,
+                                data: Some(child_data.data),
+                                collection_uuid: child_data.collection_uuid,
+                                trigger_uuid: child_data.trigger_uuid,
+                                parent_uuid: child_data.parent_uuid,
+                                created_at: None,
+                                updated_at: None,
+                            },
+                        )?;
                     }
                 }
             }
         }
 
-        Ok(format!("Restored thing '{}'", thing_data.title))
+        Ok(format!("Restored thing '{}'", restored_thing_title))
     }
 
     /// V3: Restore from update snapshot
@@ -2543,36 +2420,46 @@ impl TriggerSdk {
             let collection_data: ThingCollectionEntry =
                 serde_json::from_str(&content_snapshot.content_json)
                     .context("Failed to parse collection snapshot")?;
+            let collection_title = collection_data.title.clone();
 
-            let collection_json = serde_json::json!({
-                "uuid": collection_data.uuid,
-                "title": collection_data.title,
-                "trigger_uuid": collection_data.trigger_uuid,
-            });
-            self.things_upsert_collection_json(device_id, &collection_json.to_string())?;
+            self.things_upsert_collection(
+                device_id,
+                ThingCollectionUpsert {
+                    uuid: collection_data.uuid,
+                    title: collection_data.title,
+                    trigger_uuid: collection_data.trigger_uuid,
+                    created_at: None,
+                    updated_at: None,
+                },
+            )?;
 
             Ok(format!(
                 "Restored collection '{}' to previous state",
-                collection_data.title
+                collection_title
             ))
         } else {
             let thing_data: ThingEntry = serde_json::from_str(&content_snapshot.content_json)
                 .context("Failed to parse thing snapshot")?;
+            let thing_title = thing_data.title.clone();
 
-            let thing_json = serde_json::json!({
-                "uuid": thing_data.uuid,
-                "title": thing_data.title,
-                "datatype": thing_data.datatype.as_str(),
-                "data": thing_data.data,
-                "collection_uuid": thing_data.collection_uuid,
-                "trigger_uuid": thing_data.trigger_uuid,
-                "parent_uuid": thing_data.parent_uuid,
-            });
-            self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+            self.things_upsert_thing(
+                device_id,
+                ThingUpsert {
+                    uuid: thing_data.uuid,
+                    title: thing_data.title,
+                    datatype: thing_data.datatype,
+                    data: Some(thing_data.data),
+                    collection_uuid: thing_data.collection_uuid,
+                    trigger_uuid: thing_data.trigger_uuid,
+                    parent_uuid: thing_data.parent_uuid,
+                    created_at: None,
+                    updated_at: None,
+                },
+            )?;
 
             Ok(format!(
                 "Restored thing '{}' to previous state",
-                thing_data.title
+                thing_title
             ))
         }
     }
@@ -2601,16 +2488,20 @@ impl TriggerSdk {
         };
 
         // Re-upsert with original collection
-        let thing_json = serde_json::json!({
-            "uuid": thing.uuid,
-            "title": thing.title,
-            "datatype": thing.datatype.as_str(),
-            "data": thing.data,
-            "collection_uuid": original_collection,
-            "trigger_uuid": thing.trigger_uuid,
-            "parent_uuid": thing.parent_uuid,
-        });
-        self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+        self.things_upsert_thing(
+            device_id,
+            ThingUpsert {
+                uuid: thing.uuid.clone(),
+                title: thing.title.clone(),
+                datatype: thing.datatype.clone(),
+                data: Some(thing.data.clone()),
+                collection_uuid: original_collection.to_string(),
+                trigger_uuid: thing.trigger_uuid.clone(),
+                parent_uuid: thing.parent_uuid.clone(),
+                created_at: None,
+                updated_at: None,
+            },
+        )?;
 
         Ok(format!(
             "Moved thing back to original collection '{}'",
@@ -2648,16 +2539,20 @@ impl TriggerSdk {
                 let snapshot = doc_set.extract_snapshot()?;
 
                 if let Some(thing) = snapshot.things.iter().find(|t| t.uuid == thing_uuid) {
-                    let thing_json = serde_json::json!({
-                        "uuid": thing.uuid,
-                        "title": thing.title,
-                        "datatype": thing.datatype.as_str(),
-                        "data": thing.data,
-                        "collection_uuid": original_collection,
-                        "trigger_uuid": thing.trigger_uuid,
-                        "parent_uuid": thing.parent_uuid,
-                    });
-                    self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+                    self.things_upsert_thing(
+                        device_id,
+                        ThingUpsert {
+                            uuid: thing.uuid.clone(),
+                            title: thing.title.clone(),
+                            datatype: thing.datatype.clone(),
+                            data: Some(thing.data.clone()),
+                            collection_uuid: original_collection.to_string(),
+                            trigger_uuid: thing.trigger_uuid.clone(),
+                            parent_uuid: thing.parent_uuid.clone(),
+                            created_at: None,
+                            updated_at: None,
+                        },
+                    )?;
                     restored_count += 1;
                 }
             }
@@ -2681,16 +2576,20 @@ impl TriggerSdk {
                 let snapshot = doc_set.extract_snapshot()?;
 
                 if let Some(thing) = snapshot.things.iter().find(|t| t.uuid == *thing_uuid) {
-                    let thing_json = serde_json::json!({
-                        "uuid": thing.uuid,
-                        "title": thing.title,
-                        "datatype": thing.datatype.as_str(),
-                        "data": thing.data,
-                        "collection_uuid": original_collection,
-                        "trigger_uuid": thing.trigger_uuid,
-                        "parent_uuid": thing.parent_uuid,
-                    });
-                    self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+                    self.things_upsert_thing(
+                        device_id,
+                        ThingUpsert {
+                            uuid: thing.uuid.clone(),
+                            title: thing.title.clone(),
+                            datatype: thing.datatype.clone(),
+                            data: Some(thing.data.clone()),
+                            collection_uuid: original_collection.to_string(),
+                            trigger_uuid: thing.trigger_uuid.clone(),
+                            parent_uuid: thing.parent_uuid.clone(),
+                            created_at: None,
+                            updated_at: None,
+                        },
+                    )?;
                     restored_count += 1;
                 }
             }
@@ -2723,32 +2622,40 @@ impl TriggerSdk {
             // The snapshot might contain a batch of things in JSON array format
             if let Ok(things) = serde_json::from_str::<Vec<ThingEntry>>(&snapshot.content_json) {
                 for thing_data in things {
-                    let thing_json = serde_json::json!({
-                        "uuid": thing_data.uuid,
-                        "title": thing_data.title,
-                        "datatype": thing_data.datatype.as_str(),
-                        "data": thing_data.data,
-                        "collection_uuid": thing_data.collection_uuid,
-                        "trigger_uuid": thing_data.trigger_uuid,
-                        "parent_uuid": thing_data.parent_uuid,
-                    });
-                    self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+                    self.things_upsert_thing(
+                        device_id,
+                        ThingUpsert {
+                            uuid: thing_data.uuid,
+                            title: thing_data.title,
+                            datatype: thing_data.datatype,
+                            data: Some(thing_data.data),
+                            collection_uuid: thing_data.collection_uuid,
+                            trigger_uuid: thing_data.trigger_uuid,
+                            parent_uuid: thing_data.parent_uuid,
+                            created_at: None,
+                            updated_at: None,
+                        },
+                    )?;
                     restored_count += 1;
                 }
             } else if let Ok(thing_data) =
                 serde_json::from_str::<ThingEntry>(&snapshot.content_json)
             {
                 // Single thing in snapshot
-                let thing_json = serde_json::json!({
-                    "uuid": thing_data.uuid,
-                    "title": thing_data.title,
-                    "datatype": thing_data.datatype.as_str(),
-                    "data": thing_data.data,
-                    "collection_uuid": thing_data.collection_uuid,
-                    "trigger_uuid": thing_data.trigger_uuid,
-                    "parent_uuid": thing_data.parent_uuid,
-                });
-                self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+                self.things_upsert_thing(
+                    device_id,
+                    ThingUpsert {
+                        uuid: thing_data.uuid,
+                        title: thing_data.title,
+                        datatype: thing_data.datatype,
+                        data: Some(thing_data.data),
+                        collection_uuid: thing_data.collection_uuid,
+                        trigger_uuid: thing_data.trigger_uuid,
+                        parent_uuid: thing_data.parent_uuid,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                )?;
                 restored_count += 1;
             }
         }
@@ -2772,16 +2679,20 @@ impl TriggerSdk {
                             .any(|c| c.uuid == thing_data.collection_uuid);
 
                         if parent_exists {
-                            let thing_json = serde_json::json!({
-                                "uuid": thing_data.uuid,
-                                "title": thing_data.title,
-                                "datatype": thing_data.datatype.as_str(),
-                                "data": thing_data.data,
-                                "collection_uuid": thing_data.collection_uuid,
-                                "trigger_uuid": thing_data.trigger_uuid,
-                                "parent_uuid": thing_data.parent_uuid,
-                            });
-                            self.things_upsert_thing_json(device_id, &thing_json.to_string())?;
+                            self.things_upsert_thing(
+                                device_id,
+                                ThingUpsert {
+                                    uuid: thing_data.uuid,
+                                    title: thing_data.title,
+                                    datatype: thing_data.datatype,
+                                    data: Some(thing_data.data),
+                                    collection_uuid: thing_data.collection_uuid,
+                                    trigger_uuid: thing_data.trigger_uuid,
+                                    parent_uuid: thing_data.parent_uuid,
+                                    created_at: None,
+                                    updated_at: None,
+                                },
+                            )?;
                             restored_count += 1;
                         }
                     }
@@ -3056,23 +2967,7 @@ impl TriggerSdk {
 
         // Replay stashed things
         for thing in &stash.things {
-            // Create thing meta in collection document
-            let trigger =
-                crate::things_crdt::trigger_update_from_tri_state(thing.trigger_uuid.as_deref());
-            doc_set.upsert_thing_meta(
-                &thing.collection_uuid,
-                &thing.uuid,
-                Some(thing.datatype.clone()),
-                None, // status
-                Some(thing.title.clone()),
-                thing.parent_uuid.clone(),
-                trigger,
-            )?;
-
-            // Set thing content in markdown document
-            let content =
-                crate::things_crdt::markdown_only_content_from_value(&thing.datatype, &thing.data);
-            doc_set.set_thing_content(&thing.uuid, content)?;
+            replay_stashed_thing_into_document_set(&mut doc_set, thing)?;
         }
 
         // Persist all documents as dirty (so they sync on next cycle)
@@ -3123,21 +3018,7 @@ impl TriggerSdk {
         }
 
         for thing in &stash.things {
-            let trigger =
-                crate::things_crdt::trigger_update_from_tri_state(thing.trigger_uuid.as_deref());
-            doc_set.upsert_thing_meta(
-                &thing.collection_uuid,
-                &thing.uuid,
-                Some(thing.datatype.clone()),
-                None,
-                Some(thing.title.clone()),
-                thing.parent_uuid.clone(),
-                trigger,
-            )?;
-
-            let content =
-                crate::things_crdt::markdown_only_content_from_value(&thing.datatype, &thing.data);
-            doc_set.set_thing_content(&thing.uuid, content)?;
+            replay_stashed_thing_into_document_set(&mut doc_set, thing)?;
         }
 
         doc_set.save_to_storage(&self.storage)?;
@@ -4147,8 +4028,8 @@ impl TriggerSdk {
 #[cfg(test)]
 mod db_observability_tests {
     use super::TriggerSdk;
+    use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
     use crate::storage::{test_sqlite_counters_get, test_sqlite_counters_reset};
-    use serde_json::json;
     use std::time::Instant;
     use tempfile::tempdir;
 
@@ -4163,30 +4044,32 @@ mod db_observability_tests {
         let thing_id = "thing-test";
 
         // Seed doc with a collection + thing so get_or_init doesn't need to create rows during the measurement.
-        let collection_payload = json!({
-            "uuid": collection_id,
-            "title": "Test Collection",
-            "trigger_uuid": null,
-            "created_at": null,
-            "updated_at": null
-        })
-        .to_string();
-        sdk.things_upsert_collection_json(device_id, &collection_payload)
+        sdk.things_upsert_collection(
+            device_id,
+            ThingCollectionUpsert {
+                uuid: collection_id.to_string(),
+                title: "Test Collection".to_string(),
+                trigger_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
             .expect("seed collection");
 
-        let thing_payload = json!({
-            "uuid": thing_id,
-            "title": "Test Thing",
-            "datatype": "markdown",
-            "data": {"markdown": "hello"},
-            "collection_uuid": collection_id,
-            "trigger_uuid": null,
-            "parent_uuid": null,
-            "created_at": null,
-            "updated_at": null
-        })
-        .to_string();
-        sdk.things_upsert_thing_json(device_id, &thing_payload)
+        sdk.things_upsert_thing(
+            device_id,
+            ThingUpsert {
+                uuid: thing_id.to_string(),
+                title: "Test Thing".to_string(),
+                datatype: ThingDatatype::Markdown,
+                data: Some(serde_json::json!({"markdown": "hello"})),
+                collection_uuid: collection_id.to_string(),
+                trigger_uuid: None,
+                parent_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
             .expect("seed thing");
 
         // Measure overwrite behavior.
@@ -4273,30 +4156,32 @@ mod db_observability_tests {
         let collection_id = "col-test";
         let thing_id = "thing-test";
 
-        let collection_payload = json!({
-            "uuid": collection_id,
-            "title": "Test Collection",
-            "trigger_uuid": null,
-            "created_at": null,
-            "updated_at": null
-        })
-        .to_string();
-        sdk.things_upsert_collection_json(device_id, &collection_payload)
+        sdk.things_upsert_collection(
+            device_id,
+            ThingCollectionUpsert {
+                uuid: collection_id.to_string(),
+                title: "Test Collection".to_string(),
+                trigger_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
             .expect("seed collection");
 
-        let thing_payload = json!({
-            "uuid": thing_id,
-            "title": "Test Thing",
-            "datatype": "markdown",
-            "data": {"markdown": "hello"},
-            "collection_uuid": collection_id,
-            "trigger_uuid": null,
-            "parent_uuid": null,
-            "created_at": null,
-            "updated_at": null
-        })
-        .to_string();
-        sdk.things_upsert_thing_json(device_id, &thing_payload)
+        sdk.things_upsert_thing(
+            device_id,
+            ThingUpsert {
+                uuid: thing_id.to_string(),
+                title: "Test Thing".to_string(),
+                datatype: ThingDatatype::Markdown,
+                data: Some(serde_json::json!({"markdown": "hello"})),
+                collection_uuid: collection_id.to_string(),
+                trigger_uuid: None,
+                parent_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
             .expect("seed thing");
 
         let long = "A".repeat(200_000);
@@ -4558,151 +4443,30 @@ fn repeat_min_gap(freq: &rule_trigger_engine::RepeatFrequency) -> Option<Duratio
     }
 }
 
-/// Parse ContentEntryPayload from JSON value
-fn parse_content_entry_payload(
-    v: &serde_json::Value,
-) -> Result<remi_things_crdt::ContentEntryPayload> {
-    use remi_things_crdt::{ContentEntryPayload, DateField, LocationField};
+fn replay_stashed_thing_into_document_set(
+    doc_set: &mut crate::things_crdt::ThingsDocumentSet,
+    thing: &crate::things_crdt::ThingEntry,
+) -> Result<()> {
+    let content_registry = crate::things_crdt::ContentTypeRegistry::new();
+    let (markdown, content_entries) = content_registry.extract_thing_snapshot_parts(&thing.data)?;
+    let trigger = crate::things_crdt::trigger_update_from_tri_state(thing.trigger_uuid.as_deref());
+    doc_set.upsert_thing_meta(
+        &thing.collection_uuid,
+        &thing.uuid,
+        Some(thing.datatype.clone()),
+        None,
+        Some(thing.title.clone()),
+        thing.parent_uuid.clone(),
+        trigger,
+    )?;
 
-    let payload_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-    match payload_type {
-        "location" => {
-            let loc_type = v.get("loc_type").and_then(|t| t.as_str()).unwrap_or("");
-            let location = match loc_type {
-                "coordinate" => {
-                    let lat = v
-                        .get("lat")
-                        .and_then(|l| l.as_f64())
-                        .ok_or_else(|| anyhow!("Missing lat"))?;
-                    let lng = v
-                        .get("lng")
-                        .and_then(|l| l.as_f64())
-                        .ok_or_else(|| anyhow!("Missing lng"))?;
-                    let coord_system = v
-                        .get("coord_system")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("wgs84")
-                        .to_string();
-                    let source_name = v
-                        .get("source_name")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.to_string());
-                    LocationField::Coordinate {
-                        lat,
-                        lng,
-                        coord_system,
-                        source_name,
-                    }
-                }
-                "fuzzy" => {
-                    let name = v
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let place_type = v
-                        .get("place_type")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    LocationField::Fuzzy { name, place_type }
-                }
-                _ => anyhow::bail!("Invalid location type: {}", loc_type),
-            };
-            Ok(ContentEntryPayload::Location(location))
-        }
-        "markdown" => {
-            let doc_uuid = v
-                .get("doc_uuid")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            Ok(ContentEntryPayload::Markdown { doc_uuid })
-        }
-        "date" => {
-            let timestamp_ms = v
-                .get("timestamp_ms")
-                .and_then(|t| t.as_i64())
-                .ok_or_else(|| anyhow!("Missing timestamp_ms"))?;
-            let has_time = v.get("has_time").and_then(|h| h.as_bool()).unwrap_or(false);
-            let timezone = v
-                .get("timezone")
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string());
-            Ok(ContentEntryPayload::Date(DateField {
-                timestamp_ms,
-                has_time,
-                timezone,
-            }))
-        }
-        "custom" => {
-            let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
-            Ok(ContentEntryPayload::Custom(data))
-        }
-        "image" => {
-            let uri = v
-                .get("uri")
-                .and_then(|u| u.as_str())
-                .unwrap_or("")
-                .to_string();
-            let caption = v
-                .get("caption")
-                .and_then(|c| c.as_str())
-                .map(|s| s.to_string());
-            let width = v.get("width").and_then(|w| w.as_u64()).map(|w| w as u32);
-            let height = v.get("height").and_then(|h| h.as_u64()).map(|h| h as u32);
-            let size_bytes = v.get("size_bytes").and_then(|s| s.as_u64());
-            let device_id = v
-                .get("device_id")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string());
-            Ok(ContentEntryPayload::Image(remi_things_crdt::ImageField {
-                uri,
-                caption,
-                width,
-                height,
-                size_bytes,
-                device_id,
-            }))
-        }
-        "url" => {
-            let url = v
-                .get("url")
-                .and_then(|u| u.as_str())
-                .unwrap_or("")
-                .to_string();
-            let title = v
-                .get("title")
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string());
-            let description = v
-                .get("description")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string());
-            let image_url = v
-                .get("image_url")
-                .and_then(|i| i.as_str())
-                .map(|s| s.to_string());
-            let favicon_url = v
-                .get("favicon_url")
-                .and_then(|f| f.as_str())
-                .map(|s| s.to_string());
-            let site_name = v
-                .get("site_name")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let resolved = v.get("resolved").and_then(|r| r.as_bool()).unwrap_or(false);
-            Ok(ContentEntryPayload::Url(remi_things_crdt::UrlField {
-                url,
-                title,
-                description,
-                image_url,
-                favicon_url,
-                site_name,
-                resolved,
-            }))
-        }
-        _ => anyhow::bail!("Invalid payload type: {}", payload_type),
+    if let Some(markdown) = markdown {
+        doc_set.set_thing_markdown_text(&thing.uuid, &markdown)?;
     }
+
+    for entry in content_entries {
+        doc_set.add_content_entry(&thing.collection_uuid, &thing.uuid, entry)?;
+    }
+
+    Ok(())
 }

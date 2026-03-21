@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use remi_client_sdk::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
 use remi_client_sdk::TriggerSdk;
 use remi_things_crdt::{ROOT_DOC_UUID, extract_collection_doc_view, extract_root_view};
 
@@ -21,20 +22,29 @@ fn delete_collection_preserves_tombstone_and_does_not_resurrect_on_reload() -> R
     let sdk = TriggerSdk::initialize(&db_path).context("init sdk")?;
     let device_id = "device-a";
 
-    sdk.things_upsert_collection_json(
+    sdk.things_upsert_collection(
         device_id,
-        &serde_json::json!({"uuid":"c1","title":"Inbox"}).to_string(),
+        ThingCollectionUpsert {
+            uuid: "c1".to_string(),
+            title: "Inbox".to_string(),
+            trigger_uuid: None,
+            created_at: None,
+            updated_at: None,
+        },
     )?;
-    sdk.things_upsert_thing_json(
+    sdk.things_upsert_thing(
         device_id,
-        &serde_json::json!({
-            "uuid": "t1",
-            "title": "Thing 1",
-            "datatype": "markdown",
-            "data": {"markdown": "hello world"},
-            "collection_uuid": "c1"
-        })
-        .to_string(),
+        ThingUpsert {
+            uuid: "t1".to_string(),
+            title: "Thing 1".to_string(),
+            datatype: ThingDatatype::Markdown,
+            data: Some(serde_json::json!({"markdown": "hello world"})),
+            collection_uuid: "c1".to_string(),
+            trigger_uuid: None,
+            parent_uuid: None,
+            created_at: None,
+            updated_at: None,
+        },
     )?;
 
     let before = parse_snapshot(&sdk, device_id)?;
@@ -85,20 +95,29 @@ fn delete_thing_keeps_markdown_doc_but_hides_content_after_reload() -> Result<()
     let sdk = TriggerSdk::initialize(&db_path).context("init sdk")?;
     let device_id = "device-a";
 
-    sdk.things_upsert_collection_json(
+    sdk.things_upsert_collection(
         device_id,
-        &serde_json::json!({"uuid":"c1","title":"Inbox"}).to_string(),
+        ThingCollectionUpsert {
+            uuid: "c1".to_string(),
+            title: "Inbox".to_string(),
+            trigger_uuid: None,
+            created_at: None,
+            updated_at: None,
+        },
     )?;
-    sdk.things_upsert_thing_json(
+    sdk.things_upsert_thing(
         device_id,
-        &serde_json::json!({
-            "uuid": "t1",
-            "title": "Thing 1",
-            "datatype": "markdown",
-            "data": {"markdown": "hello world"},
-            "collection_uuid": "c1"
-        })
-        .to_string(),
+        ThingUpsert {
+            uuid: "t1".to_string(),
+            title: "Thing 1".to_string(),
+            datatype: ThingDatatype::Markdown,
+            data: Some(serde_json::json!({"markdown": "hello world"})),
+            collection_uuid: "c1".to_string(),
+            trigger_uuid: None,
+            parent_uuid: None,
+            created_at: None,
+            updated_at: None,
+        },
     )?;
 
     assert!(sdk.things_delete_thing(device_id, "c1", "t1")?);

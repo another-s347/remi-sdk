@@ -7,7 +7,7 @@ resolver = "2"
 [dependencies]
 remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "e05632ba99e887f2e293fb23a19db0dff137610c", default-features = false }
 remi-agentloop-wasm = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "e05632ba99e887f2e293fb23a19db0dff137610c", default-features = false, features = ["http-host"] }
-remi-things-crdt = { git = "https://github.com/another-s347/remi-sdk.git", rev = "60854de1666930a5b88459756b69b9b0b96c12db" }
+remi-things-crdt = { path = "../remi-things-crdt" }
 rule-trigger-engine = { path = "../rule-trigger-engine" }
 anyhow = "1.0"
 base64 = "0.22"
