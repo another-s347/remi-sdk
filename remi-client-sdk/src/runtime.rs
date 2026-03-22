@@ -6,7 +6,7 @@ use crate::things_crdt::{
     ContentEntry, ContentEntryUpdate, ThingCollectionEntry, ThingCollectionUpsert, ThingEntry,
     ThingUpsert, ThingsSnapshot, ThingsSnapshotState,
 };
-use crate::things_events::ThingsEvent;
+use crate::things_events::{ThingsDocumentEvent, ThingsEvent};
 use crate::trigger_events::TriggerEvent;
 use crate::types::{
     EventPayload, NotificationSource, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
@@ -20,10 +20,8 @@ use croner::Cron;
 use rule_trigger_engine::{
     EvaluationContext, MonitoringEvent, PreconditionPolicy, Rule as EngineRule, TriggerConfig,
 };
-use serde_json::Value as JsonValue;
 use serde_json::json;
 use serde_json::to_string;
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -106,7 +104,7 @@ impl TriggerSdk {
         let _ = self.things_event_tx.send(event);
     }
 
-    /// Build and emit a `SnapshotReplace` event so Flutter replaces its full
+    /// Build and emit a `SnapshotReplaced` event so clients can replace their full
     /// Things/Collections state.  Called after sync pulls new documents from
     /// the server.
     pub fn emit_snapshot_replace(&self, device_id: &str) -> Result<()> {
@@ -115,9 +113,9 @@ impl TriggerSdk {
             .extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
                 include_content: true,
             })
-            .context("Failed to extract snapshot for SnapshotReplace event")?;
+            .context("Failed to extract snapshot for SnapshotReplaced event")?;
         let dirty = doc_set.has_pending_changes();
-        self.emit_things_event(ThingsEvent::SnapshotReplace {
+        self.emit_things_event(ThingsEvent::SnapshotReplaced {
             device_id: device_id.to_string(),
             collections: snapshot.collections,
             things: snapshot.things,
@@ -149,44 +147,18 @@ impl TriggerSdk {
         Ok(())
     }
 
+    fn emit_document_events(&self, device_id: &str, events: Vec<ThingsDocumentEvent>) {
+        for event in events {
+            self.emit_things_event(event.into_event(device_id));
+        }
+    }
+
     /// Attribute all anonymous (user_id IS NULL) local data to the given user.
     /// Called after a successful login so locally-created content is owned by the user.
     pub fn claim_anonymous_data(&self, user_id: &str) -> Result<()> {
         let claimed = self.storage.claim_anonymous_data(user_id)?;
         info!(user_id = %user_id, claimed, "Claimed anonymous data after login");
         Ok(())
-    }
-
-    fn emit_things_field_patch(
-        &self,
-        device_id: &str,
-        thing_uuid: &str,
-        fields: BTreeMap<String, JsonValue>,
-    ) {
-        if fields.is_empty() {
-            return;
-        }
-        self.emit_things_event(ThingsEvent::ThingUpsert {
-            device_id: device_id.to_string(),
-            thing_uuid: thing_uuid.to_string(),
-            fields,
-        });
-    }
-
-    fn emit_collection_field_patch(
-        &self,
-        device_id: &str,
-        collection_uuid: &str,
-        fields: BTreeMap<String, JsonValue>,
-    ) {
-        if fields.is_empty() {
-            return;
-        }
-        self.emit_things_event(ThingsEvent::CollectionUpsert {
-            device_id: device_id.to_string(),
-            collection_uuid: collection_uuid.to_string(),
-            fields,
-        });
     }
 
     pub fn register_trigger(&self, params: TriggerRegistration) -> Result<String> {
@@ -502,19 +474,9 @@ impl TriggerSdk {
 
         // V3: Update collection trigger via collection document
         let trigger = crate::things_crdt::trigger_update_from_tri_state(trigger_uuid);
-        doc_set.update_collection_meta(collection_uuid, None, None, trigger)?;
+        let events = doc_set.update_collection_meta(collection_uuid, None, None, trigger)?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        let mut fields: BTreeMap<String, JsonValue> = BTreeMap::new();
-        fields.insert(
-            "trigger_uuid".to_string(),
-            match trigger_uuid {
-                None => JsonValue::Null,
-                Some(v) if v.trim().is_empty() => JsonValue::Null,
-                Some(v) => JsonValue::String(v.to_string()),
-            },
-        );
-        self.emit_collection_field_patch(device_id, collection_uuid, fields);
+        self.emit_document_events(device_id, events);
 
         Ok(())
     }
@@ -544,7 +506,7 @@ impl TriggerSdk {
 
         // V3: Update thing trigger via collection document
         let trigger = crate::things_crdt::trigger_update_from_tri_state(trigger_uuid);
-        doc_set.upsert_thing_meta(
+        let events = doc_set.upsert_thing_meta(
             &collection_uuid,
             thing_uuid,
             None, // datatype
@@ -554,17 +516,7 @@ impl TriggerSdk {
             trigger,
         )?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        let mut fields: BTreeMap<String, JsonValue> = BTreeMap::new();
-        fields.insert(
-            "trigger_uuid".to_string(),
-            match trigger_uuid {
-                None => JsonValue::Null,
-                Some(v) if v.trim().is_empty() => JsonValue::Null,
-                Some(v) => JsonValue::String(v.to_string()),
-            },
-        );
-        self.emit_things_field_patch(device_id, thing_uuid, fields);
+        self.emit_document_events(device_id, events);
 
         Ok(())
     }
@@ -733,7 +685,12 @@ impl TriggerSdk {
         // V3: Update collection metadata
         let trigger =
             crate::things_crdt::trigger_update_from_tri_state(upsert.trigger_uuid.as_deref());
-        doc_set.update_collection_meta(&upsert.uuid, Some(upsert.title.clone()), None, trigger)?;
+        let events = doc_set.update_collection_meta(
+            &upsert.uuid,
+            Some(upsert.title.clone()),
+            None,
+            trigger,
+        )?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
 
         let snapshot = doc_set.extract_snapshot()?;
@@ -743,39 +700,7 @@ impl TriggerSdk {
             .find(|c| c.uuid == upsert.uuid)
             .ok_or_else(|| anyhow!("Collection not found after upsert"))?;
 
-        let mut fields: BTreeMap<String, JsonValue> = BTreeMap::new();
-        fields.insert(
-            "title".to_string(),
-            JsonValue::String(created.title.clone()),
-        );
-        if is_create {
-            fields.insert(
-                "trigger_uuid".to_string(),
-                created
-                    .trigger_uuid
-                    .as_ref()
-                    .map(|v| JsonValue::String(v.clone()))
-                    .unwrap_or(JsonValue::Null),
-            );
-            fields.insert(
-                "created_at".to_string(),
-                JsonValue::String(created.created_at.clone()),
-            );
-        } else if let Some(v) = upsert.trigger_uuid.as_deref() {
-            fields.insert(
-                "trigger_uuid".to_string(),
-                if v.is_empty() {
-                    JsonValue::Null
-                } else {
-                    JsonValue::String(v.to_string())
-                },
-            );
-        }
-        fields.insert(
-            "updated_at".to_string(),
-            JsonValue::String(created.updated_at.clone()),
-        );
-        self.emit_collection_field_patch(device_id, &upsert.uuid, fields);
+        self.emit_document_events(device_id, events);
 
         // Record change log
         let op_type = if is_create {
@@ -864,20 +789,9 @@ impl TriggerSdk {
         // V3: Tombstone the collection document and remove the root reference.
         // Keep the collection/thing documents locally so the tombstone can sync
         // to other devices instead of being re-discovered as a live orphan.
-        doc_set.delete_collection(uuid)?;
+        let events = doc_set.delete_collection(uuid)?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        // Emit incremental delete events (collection + cascade things).
-        for thing in &things_in_collection {
-            self.emit_things_event(ThingsEvent::ThingDelete {
-                device_id: device_id.to_string(),
-                thing_uuid: thing.uuid.clone(),
-            });
-        }
-        self.emit_things_event(ThingsEvent::CollectionDelete {
-            device_id: device_id.to_string(),
-            collection_uuid: uuid.to_string(),
-        });
+        self.emit_document_events(device_id, events);
 
         // Record change log for the collection deletion
         let summary = format!("Deleted collection '{}'", collection_title);
@@ -983,6 +897,8 @@ impl TriggerSdk {
                 .as_ref()
                 .map_or(false, |old| *old != upsert.collection_uuid);
 
+        let mut move_events = Vec::new();
+
         if is_move {
             let old_coll = old_collection_uuid.as_ref().unwrap();
             tracing::info!(
@@ -991,13 +907,14 @@ impl TriggerSdk {
                 to_collection = upsert.collection_uuid.as_str(),
                 "things_upsert_thing: moving thing — tombstoning in source collection"
             );
-            doc_set.delete_thing(old_coll, &upsert.uuid)?;
+            move_events.extend(doc_set.delete_thing(old_coll, &upsert.uuid)?);
         }
 
         // V3: Update thing metadata in collection document
         let trigger =
             crate::things_crdt::trigger_update_from_tri_state(upsert.trigger_uuid.as_deref());
-        doc_set.upsert_thing_meta(
+        let mut events = move_events;
+        events.extend(doc_set.upsert_thing_meta(
             &upsert.collection_uuid,
             &upsert.uuid,
             Some(upsert.datatype.clone()),
@@ -1005,11 +922,15 @@ impl TriggerSdk {
             Some(upsert.title.clone()),
             upsert.parent_uuid.clone(),
             trigger,
-        )?;
+        )?);
 
         // V3: If data is provided, update thing markdown document
         if let Some(ref data) = upsert.data {
-            doc_set.set_thing_content_from_payload(&upsert.uuid, &upsert.datatype, data)?;
+            events.extend(doc_set.set_thing_content_from_payload(
+                &upsert.uuid,
+                &upsert.datatype,
+                data,
+            )?);
         }
 
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
@@ -1021,70 +942,7 @@ impl TriggerSdk {
             .find(|t| t.uuid == upsert.uuid)
             .ok_or_else(|| anyhow!("Thing not found after upsert"))?;
 
-        let mut fields: BTreeMap<String, JsonValue> = BTreeMap::new();
-        fields.insert(
-            "title".to_string(),
-            JsonValue::String(created.title.clone()),
-        );
-        fields.insert(
-            "datatype".to_string(),
-            serde_json::to_value(&created.datatype).unwrap_or(JsonValue::Null),
-        );
-        fields.insert(
-            "collection_uuid".to_string(),
-            JsonValue::String(created.collection_uuid.clone()),
-        );
-        if is_create {
-            fields.insert(
-                "trigger_uuid".to_string(),
-                created
-                    .trigger_uuid
-                    .as_ref()
-                    .map(|v| JsonValue::String(v.clone()))
-                    .unwrap_or(JsonValue::Null),
-            );
-            fields.insert(
-                "parent_uuid".to_string(),
-                created
-                    .parent_uuid
-                    .as_ref()
-                    .map(|v| JsonValue::String(v.clone()))
-                    .unwrap_or(JsonValue::Null),
-            );
-            fields.insert(
-                "created_at".to_string(),
-                JsonValue::String(created.created_at.clone()),
-            );
-        } else {
-            if let Some(v) = upsert.trigger_uuid.as_deref() {
-                fields.insert(
-                    "trigger_uuid".to_string(),
-                    if v.is_empty() {
-                        JsonValue::Null
-                    } else {
-                        JsonValue::String(v.to_string())
-                    },
-                );
-            }
-            if let Some(v) = upsert.parent_uuid.as_deref() {
-                fields.insert(
-                    "parent_uuid".to_string(),
-                    if v.is_empty() {
-                        JsonValue::Null
-                    } else {
-                        JsonValue::String(v.to_string())
-                    },
-                );
-            }
-        }
-        if is_create || upsert.data.is_some() {
-            fields.insert("data".to_string(), created.data.clone());
-        }
-        fields.insert(
-            "updated_at".to_string(),
-            JsonValue::String(created.updated_at.clone()),
-        );
-        self.emit_things_field_patch(device_id, &created.uuid, fields);
+        self.emit_document_events(device_id, events);
 
         // Record change log
         let op_type = if is_create {
@@ -1204,21 +1062,13 @@ impl TriggerSdk {
             return Ok(false);
         }
 
-        if !doc_set.try_splice_thing_text(thing_uuid, block_id, index, delete, insert)? {
+        let Some(events) = doc_set.try_splice_thing_text(thing_uuid, block_id, index, delete, insert)? else {
             // No-op (e.g., block not found). Treat as failure so callers can fall back.
             return Ok(false);
-        }
+        };
 
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        self.emit_things_event(ThingsEvent::ThingMarkdownSplice {
-            device_id: device_id.to_string(),
-            thing_uuid: thing_uuid.to_string(),
-            block_id: block_id.to_string(),
-            index: u32::try_from(index).unwrap_or(u32::MAX),
-            delete: u32::try_from(delete).unwrap_or(u32::MAX),
-            insert: insert.to_string(),
-        });
+        self.emit_document_events(device_id, events);
 
         // For splice_text, we use 5-minute grouping for update logs
         // Check if there's a recent update log within 5 minutes
@@ -1420,8 +1270,10 @@ impl TriggerSdk {
         // - Title change (optional): upsert_thing_meta
         // - Content change (optional): splice_thing_text or set_thing_content
 
+        let mut events = Vec::new();
+
         if new_title.is_some() || operation == "set_title" {
-            doc_set.upsert_thing_meta(
+            events.extend(doc_set.upsert_thing_meta(
                 &thing.collection_uuid,
                 thing_uuid,
                 None, // datatype
@@ -1429,37 +1281,15 @@ impl TriggerSdk {
                 Some(final_title.to_string()),
                 thing.parent_uuid.clone(),
                 remi_things_crdt::TriggerUpdate::Noop,
-            )?;
+            )?);
         }
 
         if !title_only {
-            doc_set.replace_thing_markdown_text(thing_uuid, &final_content)?;
-
-            self.emit_things_event(ThingsEvent::ThingMarkdownSplice {
-                device_id: device_id.to_string(),
-                thing_uuid: thing_uuid.to_string(),
-                block_id: "main".to_string(),
-                index: 0,
-                delete: u32::MAX,
-                insert: final_content.clone(),
-            });
+            events.extend(doc_set.replace_thing_markdown_text(thing_uuid, &final_content)?);
         }
 
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        // Emit a lightweight UI patch directly (avoid re-extracting a full snapshot, which can be
-        // expensive for large markdown overwrites).
-        let mut fields: BTreeMap<String, JsonValue> = BTreeMap::new();
-        fields.insert(
-            "title".to_string(),
-            JsonValue::String(final_title.to_string()),
-        );
-        if !title_only {
-            fields.insert("data".to_string(), json!({"markdown": final_content}));
-        }
-        // Snapshot currently uses empty timestamps; keep behavior consistent.
-        fields.insert("updated_at".to_string(), JsonValue::String("".to_string()));
-        self.emit_things_field_patch(device_id, thing_uuid, fields);
+        self.emit_document_events(device_id, events);
 
         // Record change log with 5-minute grouping
         if self
@@ -1542,7 +1372,7 @@ impl TriggerSdk {
         let timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
 
         // V3: Update status via collection document
-        doc_set.upsert_thing_meta(
+        let events = doc_set.upsert_thing_meta(
             &collection_uuid,
             thing_uuid,
             None, // datatype
@@ -1553,14 +1383,7 @@ impl TriggerSdk {
         )?;
 
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        let ts = timestamp_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-        self.emit_things_event(ThingsEvent::ThingStatusSet {
-            device_id: device_id.to_string(),
-            thing_uuid: thing_uuid.to_string(),
-            status: status.to_string(),
-            status_timestamp_ms: ts,
-        });
+        self.emit_document_events(device_id, events);
 
         // Record change log
         let summary = format!("Set thing status to '{}'", status);
@@ -1610,24 +1433,13 @@ impl TriggerSdk {
         // V3: Delete thing from collection document.
         // Keep markdown docs locally so the metadata tombstone can converge
         // across devices and future reads stay consistent with reachability.
-        doc_set.delete_thing(collection_uuid, uuid)?;
+        let mut events = doc_set.delete_thing(collection_uuid, uuid)?;
         // Delete child things
         for child in &child_things {
-            doc_set.delete_thing(collection_uuid, &child.uuid)?;
+            events.extend(doc_set.delete_thing(collection_uuid, &child.uuid)?);
         }
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        // Emit incremental delete events (thing + cascade children).
-        self.emit_things_event(ThingsEvent::ThingDelete {
-            device_id: device_id.to_string(),
-            thing_uuid: uuid.to_string(),
-        });
-        for child in &child_things {
-            self.emit_things_event(ThingsEvent::ThingDelete {
-                device_id: device_id.to_string(),
-                thing_uuid: child.uuid.clone(),
-            });
-        }
+        self.emit_document_events(device_id, events);
 
         // Record change log
         let summary = format!("Deleted thing '{}'", thing_title);
@@ -1731,7 +1543,7 @@ impl TriggerSdk {
             };
 
         // V3: Apply status change via collection document
-        doc_set.upsert_thing_meta(
+        let events = doc_set.upsert_thing_meta(
             &collection_uuid,
             thing_uuid,
             None, // datatype
@@ -1741,14 +1553,7 @@ impl TriggerSdk {
             remi_things_crdt::TriggerUpdate::Noop,
         )?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
-
-        let ts = timestamp_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-        self.emit_things_event(ThingsEvent::ThingStatusSet {
-            device_id: device_id.to_string(),
-            thing_uuid: thing_uuid.to_string(),
-            status: status.to_string(),
-            status_timestamp_ms: ts,
-        });
+        self.emit_document_events(device_id, events);
 
         // Record change log
         let summary = format!("Changed status of '{}' to '{}'", thing_title, status);
@@ -1832,8 +1637,9 @@ impl TriggerSdk {
 
         let id = entry.id.clone();
 
-        doc_set.add_content_entry(&collection_uuid, thing_uuid, entry)?;
+        let events = doc_set.add_content_entry(&collection_uuid, thing_uuid, entry)?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
 
         Ok(id)
     }
@@ -1870,7 +1676,7 @@ impl TriggerSdk {
             }
         };
 
-        doc_set.update_content_entry(
+        let events = doc_set.update_content_entry(
             &collection_uuid,
             thing_uuid,
             &update.id,
@@ -1879,6 +1685,7 @@ impl TriggerSdk {
             update.payload,
         )?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
 
         Ok(())
     }
@@ -1909,8 +1716,9 @@ impl TriggerSdk {
             }
         };
 
-        doc_set.delete_content_entry(&collection_uuid, thing_uuid, entry_id)?;
+        let events = doc_set.delete_content_entry(&collection_uuid, thing_uuid, entry_id)?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
 
         Ok(())
     }

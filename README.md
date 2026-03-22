@@ -299,10 +299,12 @@ let _server_triggers = triggers.list_triggers("device-1", None, 50, 0).await?;
 
 对应的事件模型也比较明确：
 
-- Things 事件：`SnapshotReplace`、`CollectionUpsert`、`CollectionDelete`、`ThingUpsert`、`ThingDelete`、`ThingStatusSet`、`ThingMarkdownSplice`
+- Things 事件：`SnapshotReplaced`、`DocumentChanged`、`DataWiped`
 - Trigger 事件：`TriggerUpsert`、`TriggerDelete`、`TriggerFired`
 
-这使得 UI 不需要不断全量轮询，可以用“启动时读 snapshot，运行时订阅增量事件”的方式维护状态。
+其中 `DocumentChanged` 会携带 `document_kind`、`change_kind`、`document_uuid` 以及相关的 `collection_uuid` / `thing_uuid` / `entry_id`，让 UI 在运行期直接感知底层文档变化。
+
+这使得 UI 不需要不断全量轮询，可以用“启动时读 snapshot，运行时订阅文档变更事件”的方式维护状态。
 
 #### 本地 collection / things 最小示例
 

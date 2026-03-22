@@ -723,13 +723,11 @@ let rx = sdk.things_subscribe();
 
 当前主要事件包括：
 
-- `SnapshotReplace`
-- `CollectionUpsert`
-- `CollectionDelete`
-- `ThingUpsert`
-- `ThingDelete`
-- `ThingStatusSet`
-- `ThingMarkdownSplice`
+- `SnapshotReplaced`
+- `DocumentChanged`
+- `DataWiped`
+
+其中 `DocumentChanged` 直接映射底层文档变化，按 `document_kind` 区分 `root`、`collection`、`thing`、`thing_markdown`、`content_entry`。
 
 ## 同步层设计
 

@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
+use crate::things_events::{
+    ThingsDocumentChangeKind, ThingsDocumentEvent,
+};
+
 pub use remi_things_crdt::{
     ContentEntry, ContentEntryKind, ContentEntryPayload, ContentEntryUpdate, DateField, ImageField,
     LocationField, ThingDatatype, UrlField,
@@ -2063,9 +2067,24 @@ impl ThingsDocumentSet {
         title: Option<String>,
         status: Option<String>,
         trigger: TriggerUpdate,
-    ) -> Result<()> {
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let existed = self.collection_is_live(collection_uuid)?;
         self.domain_writer()
-            .update_collection_meta(collection_uuid, title, status, trigger)
+            .update_collection_meta(collection_uuid, title, status, trigger)?;
+
+        let mut events = Vec::new();
+        if !existed {
+            events.push(ThingsDocumentEvent::root(ThingsDocumentChangeKind::Updated));
+        }
+        events.push(ThingsDocumentEvent::collection(
+            if existed {
+                ThingsDocumentChangeKind::Updated
+            } else {
+                ThingsDocumentChangeKind::Created
+            },
+            collection_uuid,
+        ));
+        Ok(events)
     }
 
     /// Upsert a thing in a collection
@@ -2078,7 +2097,8 @@ impl ThingsDocumentSet {
         title: Option<String>,
         parent_uuid: Option<String>,
         trigger: TriggerUpdate,
-    ) -> Result<()> {
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let existed = self.thing_is_live_in_collection(collection_uuid, thing_uuid)?;
         self.domain_writer().upsert_thing_meta(
             collection_uuid,
             thing_uuid,
@@ -2087,20 +2107,51 @@ impl ThingsDocumentSet {
             title,
             parent_uuid,
             trigger,
-        )
+        )?;
+
+        Ok(vec![ThingsDocumentEvent::thing(
+            if existed {
+                ThingsDocumentChangeKind::Updated
+            } else {
+                ThingsDocumentChangeKind::Created
+            },
+            collection_uuid,
+            thing_uuid,
+        )])
     }
 
     /// Delete a collection by tombstoning its collection document and removing
     /// the root reference. Child things become unreachable through the deleted
     /// collection and are pruned from snapshots without deleting their docs.
-    pub fn delete_collection(&mut self, collection_uuid: &str) -> Result<()> {
-        self.domain_writer().delete_collection(collection_uuid)
+    pub fn delete_collection(&mut self, collection_uuid: &str) -> Result<Vec<ThingsDocumentEvent>> {
+        if !self.collection_is_live(collection_uuid)? {
+            return Ok(Vec::new());
+        }
+
+        self.domain_writer().delete_collection(collection_uuid)?;
+        Ok(vec![
+            ThingsDocumentEvent::collection(ThingsDocumentChangeKind::Deleted, collection_uuid),
+            ThingsDocumentEvent::root(ThingsDocumentChangeKind::Updated),
+        ])
     }
 
     /// Delete a thing from a collection
-    pub fn delete_thing(&mut self, collection_uuid: &str, thing_uuid: &str) -> Result<()> {
+    pub fn delete_thing(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        if !self.thing_is_live_in_collection(collection_uuid, thing_uuid)? {
+            return Ok(Vec::new());
+        }
+
         self.domain_writer()
-            .delete_thing(collection_uuid, thing_uuid)
+            .delete_thing(collection_uuid, thing_uuid)?;
+        Ok(vec![ThingsDocumentEvent::thing(
+            ThingsDocumentChangeKind::Deleted,
+            collection_uuid,
+            thing_uuid,
+        )])
     }
 
     /// Add a content entry to a thing (V3 multi-value)
@@ -2109,9 +2160,21 @@ impl ThingsDocumentSet {
         collection_uuid: &str,
         thing_uuid: &str,
         entry: ContentEntry,
-    ) -> Result<()> {
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let entry_id = entry.id.clone();
+        let existed = self.content_entry_exists(collection_uuid, thing_uuid, &entry_id)?;
         self.domain_writer()
-            .add_content_entry(collection_uuid, thing_uuid, entry)
+            .add_content_entry(collection_uuid, thing_uuid, entry)?;
+        Ok(vec![ThingsDocumentEvent::content_entry(
+            if existed {
+                ThingsDocumentChangeKind::Updated
+            } else {
+                ThingsDocumentChangeKind::Created
+            },
+            collection_uuid,
+            thing_uuid,
+            &entry_id,
+        )])
     }
 
     /// Update a content entry on a thing (V3 multi-value)
@@ -2123,7 +2186,8 @@ impl ThingsDocumentSet {
         title: Option<Option<String>>,
         order: Option<f64>,
         payload: Option<ContentEntryPayload>,
-    ) -> Result<()> {
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let existed = self.content_entry_exists(collection_uuid, thing_uuid, entry_id)?;
         self.domain_writer().update_content_entry(
             collection_uuid,
             thing_uuid,
@@ -2131,7 +2195,17 @@ impl ThingsDocumentSet {
             title,
             order,
             payload,
-        )
+        )?;
+        Ok(vec![ThingsDocumentEvent::content_entry(
+            if existed {
+                ThingsDocumentChangeKind::Updated
+            } else {
+                ThingsDocumentChangeKind::Created
+            },
+            collection_uuid,
+            thing_uuid,
+            entry_id,
+        )])
     }
 
     /// Delete a content entry from a thing (V3 multi-value)
@@ -2140,9 +2214,19 @@ impl ThingsDocumentSet {
         collection_uuid: &str,
         thing_uuid: &str,
         entry_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        if !self.content_entry_exists(collection_uuid, thing_uuid, entry_id)? {
+            return Ok(Vec::new());
+        }
+
         self.domain_writer()
-            .delete_content_entry(collection_uuid, thing_uuid, entry_id)
+            .delete_content_entry(collection_uuid, thing_uuid, entry_id)?;
+        Ok(vec![ThingsDocumentEvent::content_entry(
+            ThingsDocumentChangeKind::Deleted,
+            collection_uuid,
+            thing_uuid,
+            entry_id,
+        )])
     }
 
     /// Get content entries for a thing
@@ -2169,6 +2253,59 @@ impl ThingsDocumentSet {
         self.domain_reader().collection_view(collection_uuid)
     }
 
+    fn collection_is_live(&self, collection_uuid: &str) -> Result<bool> {
+        let key = DocumentKey::collection(collection_uuid);
+        let Some(state) = self.documents.get(&key) else {
+            return Ok(false);
+        };
+        let view = extract_collection_doc_view(&state.automerge_doc, collection_uuid)?;
+        Ok(!view
+            .meta
+            .tombstone
+            .as_ref()
+            .map(|t| t.deleted)
+            .unwrap_or(false))
+    }
+
+    fn thing_is_live_in_collection(&self, collection_uuid: &str, thing_uuid: &str) -> Result<bool> {
+        let view = self.collection_view(collection_uuid)?;
+        if view
+            .meta
+            .tombstone
+            .as_ref()
+            .map(|t| t.deleted)
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        Ok(view.things.iter().any(|thing| {
+            thing.id == thing_uuid
+                && !thing
+                    .tombstone
+                    .as_ref()
+                    .map(|t| t.deleted)
+                    .unwrap_or(false)
+        }))
+    }
+
+    fn content_entry_exists(
+        &self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .get_content_entries(collection_uuid, thing_uuid)?
+            .iter()
+            .any(|entry| entry.id == entry_id))
+    }
+
+    fn thing_markdown_document_exists(&self, thing_uuid: &str) -> bool {
+        self.documents
+            .contains_key(&DocumentKey::thing_markdown(thing_uuid))
+    }
+
     // ===== ThingMarkdown Operations =====
 
     /// Set content on a thing markdown document from a typed payload.
@@ -2177,13 +2314,27 @@ impl ThingsDocumentSet {
         thing_uuid: &str,
         datatype: &ThingDatatype,
         payload: &Value,
-    ) -> Result<()> {
+    ) -> Result<Vec<ThingsDocumentEvent>> {
         let content = ContentTypeRegistry::new().markdown_content_from_value(datatype, payload);
-        self.domain_writer().set_thing_content(thing_uuid, content)
+        let existed = self.thing_markdown_document_exists(thing_uuid);
+        self.domain_writer().set_thing_content(thing_uuid, content)?;
+        Ok(vec![ThingsDocumentEvent::thing_markdown(
+            if existed {
+                ThingsDocumentChangeKind::Updated
+            } else {
+                ThingsDocumentChangeKind::Created
+            },
+            self.find_thing_collection_uuid(thing_uuid).as_deref(),
+            thing_uuid,
+        )])
     }
 
     /// Set plain markdown text on a thing using the default markdown payload shape.
-    pub fn set_thing_markdown_text(&mut self, thing_uuid: &str, text: &str) -> Result<()> {
+    pub fn set_thing_markdown_text(
+        &mut self,
+        thing_uuid: &str,
+        text: &str,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
         self.set_thing_content_from_payload(
             thing_uuid,
             &ThingDatatype::Markdown,
@@ -2199,21 +2350,48 @@ impl ThingsDocumentSet {
         index: usize,
         delete: usize,
         insert: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<Vec<ThingsDocumentEvent>>> {
         let before = self.domain_reader().thing_markdown_view(thing_uuid)?;
         let had_content = before.content.is_some();
+        let existed = self.thing_markdown_document_exists(thing_uuid);
 
         self.domain_writer()
             .splice_thing_text(thing_uuid, block_id, index, delete, insert)?;
 
         let after = self.domain_reader().thing_markdown_view(thing_uuid)?;
-        Ok(before.content != after.content || !had_content)
+        if before.content != after.content || !had_content {
+            Ok(Some(vec![ThingsDocumentEvent::thing_markdown(
+                if existed {
+                    ThingsDocumentChangeKind::Updated
+                } else {
+                    ThingsDocumentChangeKind::Created
+                },
+                self.find_thing_collection_uuid(thing_uuid).as_deref(),
+                thing_uuid,
+            )]))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Replace the entire primary markdown block for a thing.
-    pub fn replace_thing_markdown_text(&mut self, thing_uuid: &str, text: &str) -> Result<()> {
+    pub fn replace_thing_markdown_text(
+        &mut self,
+        thing_uuid: &str,
+        text: &str,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let existed = self.thing_markdown_document_exists(thing_uuid);
         self.domain_writer()
-            .splice_thing_text(thing_uuid, "main", 0, usize::MAX, text)
+            .splice_thing_text(thing_uuid, "main", 0, usize::MAX, text)?;
+        Ok(vec![ThingsDocumentEvent::thing_markdown(
+            if existed {
+                ThingsDocumentChangeKind::Updated
+            } else {
+                ThingsDocumentChangeKind::Created
+            },
+            self.find_thing_collection_uuid(thing_uuid).as_deref(),
+            thing_uuid,
+        )])
     }
 
     /// Get plain markdown text from the primary markdown block, if present.
@@ -2307,6 +2485,133 @@ mod tests_v3 {
         assert_eq!(snapshot.collections[0].title, "My Collection");
         assert_eq!(snapshot.things.len(), 1);
         assert_eq!(snapshot.things[0].title, "Task 1");
+    }
+
+    #[test]
+    fn test_document_events_follow_crdt_mutations() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+
+        let collection_events = docs
+            .update_collection_meta(
+                "coll-1",
+                Some("Inbox".to_string()),
+                None,
+                TriggerUpdate::Noop,
+            )
+            .unwrap();
+        assert_eq!(
+            collection_events,
+            vec![
+                ThingsDocumentEvent::root(ThingsDocumentChangeKind::Updated),
+                ThingsDocumentEvent::collection(ThingsDocumentChangeKind::Created, "coll-1"),
+            ]
+        );
+
+        let thing_events = docs
+            .upsert_thing_meta(
+                "coll-1",
+                "thing-1",
+                Some(ThingDatatype::Markdown),
+                Some("none".to_string()),
+                Some("Task".to_string()),
+                None,
+                TriggerUpdate::Noop,
+            )
+            .unwrap();
+        assert_eq!(
+            thing_events,
+            vec![ThingsDocumentEvent::thing(
+                ThingsDocumentChangeKind::Created,
+                "coll-1",
+                "thing-1",
+            )]
+        );
+
+        let markdown_create = docs.set_thing_markdown_text("thing-1", "hello").unwrap();
+        assert_eq!(
+            markdown_create,
+            vec![ThingsDocumentEvent::thing_markdown(
+                ThingsDocumentChangeKind::Created,
+                Some("coll-1"),
+                "thing-1",
+            )]
+        );
+
+        let markdown_update = docs
+            .try_splice_thing_text("thing-1", "main", 5, 0, " world")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            markdown_update,
+            vec![ThingsDocumentEvent::thing_markdown(
+                ThingsDocumentChangeKind::Updated,
+                Some("coll-1"),
+                "thing-1",
+            )]
+        );
+
+        let entry = ContentEntry {
+            id: "entry-1".to_string(),
+            title: Some("Example".to_string()),
+            order: 0.0,
+            payload: ContentEntryPayload::Custom {
+                content_type: "test/custom".to_string(),
+                data: json!({ "value": 1 }),
+            },
+        };
+
+        let add_entry_events = docs.add_content_entry("coll-1", "thing-1", entry).unwrap();
+        assert_eq!(
+            add_entry_events,
+            vec![ThingsDocumentEvent::content_entry(
+                ThingsDocumentChangeKind::Created,
+                "coll-1",
+                "thing-1",
+                "entry-1",
+            )]
+        );
+
+        let update_entry_events = docs
+            .update_content_entry(
+                "coll-1",
+                "thing-1",
+                "entry-1",
+                Some(Some("Renamed".to_string())),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            update_entry_events,
+            vec![ThingsDocumentEvent::content_entry(
+                ThingsDocumentChangeKind::Updated,
+                "coll-1",
+                "thing-1",
+                "entry-1",
+            )]
+        );
+
+        let delete_entry_events = docs
+            .delete_content_entry("coll-1", "thing-1", "entry-1")
+            .unwrap();
+        assert_eq!(
+            delete_entry_events,
+            vec![ThingsDocumentEvent::content_entry(
+                ThingsDocumentChangeKind::Deleted,
+                "coll-1",
+                "thing-1",
+                "entry-1",
+            )]
+        );
+
+        let delete_collection_events = docs.delete_collection("coll-1").unwrap();
+        assert_eq!(
+            delete_collection_events,
+            vec![
+                ThingsDocumentEvent::collection(ThingsDocumentChangeKind::Deleted, "coll-1"),
+                ThingsDocumentEvent::root(ThingsDocumentChangeKind::Updated),
+            ]
+        );
     }
 
     #[test]

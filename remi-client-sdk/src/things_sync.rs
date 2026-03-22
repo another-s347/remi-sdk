@@ -33,6 +33,18 @@ pub struct ThingsV3SyncOutput {
     pub last_sync_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThingsSyncMode {
+    Incremental,
+    Full,
+}
+
+impl ThingsSyncMode {
+    fn allows_server_discovery(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// Convert CrdtDataType to proto enum value
 fn data_type_to_proto(data_type: &CrdtDataType) -> i32 {
     match data_type {
@@ -310,7 +322,16 @@ pub async fn sync_v3_documents_with_server(
     client: &mut TriggerClient,
     device_id: &str,
 ) -> Result<ThingsV3SyncOutput> {
-    sync_v3_documents_with_transport(sdk, client, device_id).await
+    sync_v3_documents_with_transport_mode(sdk, client, device_id, ThingsSyncMode::Full).await
+}
+
+pub async fn sync_v3_documents_with_server_mode(
+    sdk: &TriggerSdk,
+    client: &mut TriggerClient,
+    device_id: &str,
+    mode: ThingsSyncMode,
+) -> Result<ThingsV3SyncOutput> {
+    sync_v3_documents_with_transport_mode(sdk, client, device_id, mode).await
 }
 
 pub async fn sync_v3_documents_with_transport(
@@ -318,8 +339,21 @@ pub async fn sync_v3_documents_with_transport(
     client: &mut dyn CrdtSyncTransport,
     device_id: &str,
 ) -> Result<ThingsV3SyncOutput> {
+    sync_v3_documents_with_transport_mode(sdk, client, device_id, ThingsSyncMode::Full).await
+}
+
+pub async fn sync_v3_documents_with_transport_mode(
+    sdk: &TriggerSdk,
+    client: &mut dyn CrdtSyncTransport,
+    device_id: &str,
+    mode: ThingsSyncMode,
+) -> Result<ThingsV3SyncOutput> {
     let mut documents_synced = 0;
     let mut last_sync_at: Option<String> = None;
+    let mut effective_mode = mode;
+    let mut prefetched_server_keys: Option<Vec<ServerCrdtDocumentKey>> = None;
+
+    tracing::info!(device_id = device_id, ?mode, "Starting Things v3 sync run");
 
     // ── Pre-flight: detect first-ever sync ───────────────────────────────
     // If the client has never synced any document, the only local docs are
@@ -337,15 +371,41 @@ pub async fn sync_v3_documents_with_transport(
 
     let bootstrap_state = classify_local_bootstrap_state(sdk, &dirty_docs);
     let never_synced_dirty_keys = never_synced_dirty_keys(&dirty_docs);
+    tracing::info!(
+        device_id = device_id,
+        ?bootstrap_state,
+        dirty_doc_count = dirty_docs.len(),
+        never_synced_dirty_doc_count = never_synced_dirty_keys.len(),
+        "Computed local bootstrap state for Things sync"
+    );
+
+    if effective_mode == ThingsSyncMode::Incremental
+        && bootstrap_state != LocalBootstrapState::HasSyncedHistory
+    {
+        tracing::info!(
+            device_id = device_id,
+            requested_mode = ?mode,
+            ?bootstrap_state,
+            "Incremental sync upgraded to full sync because bootstrap discovery is required"
+        );
+        effective_mode = ThingsSyncMode::Full;
+    }
 
     // On true first sync, pull from server before pushing so that locally
     // auto-created docs don't fork the server's canonical root.
     let mut documents_pulled = 0;
-    if bootstrap_state != LocalBootstrapState::HasSyncedHistory {
+    if effective_mode.allows_server_discovery() && bootstrap_state != LocalBootstrapState::HasSyncedHistory {
         let stashed_local_snapshot = sdk
             .things_bootstrap_stash_local_snapshot_if_needed(device_id)
             .unwrap_or(false);
         let server_keys = client.list_crdt_document_keys().await.unwrap_or_default();
+        prefetched_server_keys = Some(server_keys.clone());
+        tracing::info!(
+            device_id = device_id,
+            server_doc_count = server_keys.len(),
+            stashed_local_snapshot = stashed_local_snapshot,
+            "Fetched server keys during bootstrap discovery"
+        );
 
         if !server_keys.is_empty() {
             tracing::info!(
@@ -442,6 +502,25 @@ pub async fn sync_v3_documents_with_transport(
         }
     }
 
+    tracing::info!(
+        device_id = device_id,
+        ?effective_mode,
+        phase1_documents_synced = documents_synced,
+        "Finished phase 1 dirty-document push"
+    );
+
+    if !effective_mode.allows_server_discovery() {
+        tracing::info!(
+            device_id = device_id,
+            documents_synced = documents_synced,
+            "Skipping server discovery phases because sync is incremental"
+        );
+        return Ok(ThingsV3SyncOutput {
+            documents_synced,
+            last_sync_at,
+        });
+    }
+
     // ── Phase 1b: receive updates from other devices for existing docs ───
     // Phase 1 only syncs dirty (locally-modified) documents. Clean docs that
     // already exist locally still need a receive path for changes made by
@@ -449,15 +528,31 @@ pub async fn sync_v3_documents_with_transport(
     // that are already converged. If key discovery itself is unavailable,
     // skip the receive/pull phases for this run rather than falling back to
     // a broad receive sync over every local document.
-    let server_key_discovery = match client.list_crdt_document_keys().await {
-        Ok(keys) => ServerKeyDiscovery::Available(keys),
-        Err(err) => {
-            tracing::warn!(
-                device_id = device_id,
-                error = %err,
-                "Failed to list server CRDT keys for phase 1b optimization; skipping receive/pull phases to avoid cold-start sync storms"
-            );
-            ServerKeyDiscovery::Unavailable
+    let server_key_discovery = if let Some(keys) = prefetched_server_keys.take() {
+        tracing::info!(
+            device_id = device_id,
+            server_doc_count = keys.len(),
+            "Reusing prefetched server keys for phase 1b/2"
+        );
+        ServerKeyDiscovery::Available(keys)
+    } else {
+        match client.list_crdt_document_keys().await {
+            Ok(keys) => {
+                tracing::info!(
+                    device_id = device_id,
+                    server_doc_count = keys.len(),
+                    "Fetched server keys for phase 1b/2"
+                );
+                ServerKeyDiscovery::Available(keys)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    device_id = device_id,
+                    error = %err,
+                    "Failed to list server CRDT keys for phase 1b optimization; skipping receive/pull phases to avoid cold-start sync storms"
+                );
+                ServerKeyDiscovery::Unavailable
+            }
         }
     };
     let server_head_by_key = server_key_discovery
@@ -607,18 +702,26 @@ pub async fn sync_v3_documents_with_transport(
         );
     }
 
-    // ── Notify Flutter if new documents were pulled ──────────────────────
-    // Emit a SnapshotReplace event so the UI refreshes with the newly
+    // ── Notify clients if new documents were pulled ──────────────────────
+    // Emit a SnapshotReplaced event so the UI refreshes with the newly
     // downloaded collections/things without requiring a manual reload.
     if documents_pulled > 0 {
         if let Err(err) = sdk.emit_snapshot_replace(device_id) {
             tracing::warn!(
                 device_id = device_id,
                 error = %err,
-                "Failed to emit SnapshotReplace after pull (non-fatal)"
+                "Failed to emit SnapshotReplaced after pull (non-fatal)"
             );
         }
     }
+
+    tracing::info!(
+        device_id = device_id,
+        ?effective_mode,
+        documents_synced = documents_synced,
+        last_sync_at = ?last_sync_at,
+        "Completed Things v3 sync run"
+    );
 
     Ok(ThingsV3SyncOutput {
         documents_synced,
@@ -960,7 +1063,79 @@ pub fn save_dirty_documents_to_storage(
 #[cfg(test)]
 mod tests_v3 {
     use super::*;
+    use automerge::transaction::Transactable;
+    use automerge::ROOT;
     use crate::things_crdt::DocumentKey;
+    use async_trait::async_trait;
+    use std::path::PathBuf;
+    use tempfile::Builder;
+
+    struct MockSyncTransport {
+        list_calls: usize,
+        sync_calls: usize,
+        server_keys: Vec<ServerCrdtDocumentKey>,
+    }
+
+    #[async_trait]
+    impl CrdtSyncTransport for MockSyncTransport {
+        async fn sync_crdt_document(
+            &mut self,
+            _device_id: String,
+            _document_uuid: String,
+            _data_type: i32,
+            _sync_message: Vec<u8>,
+        ) -> Result<(Vec<Vec<u8>>, String)> {
+            self.sync_calls += 1;
+            Ok((Vec::new(), String::new()))
+        }
+
+        async fn get_crdt_document_snapshot(
+            &mut self,
+            _device_id: String,
+            _document_uuid: String,
+            _data_type: i32,
+            _reset_sync_state: bool,
+        ) -> Result<(Vec<u8>, String)> {
+            Ok((Vec::new(), String::new()))
+        }
+
+        async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>> {
+            self.list_calls += 1;
+            Ok(self.server_keys.clone())
+        }
+    }
+
+    fn test_sdk() -> TriggerSdk {
+        let dir = Builder::new()
+            .prefix("remi-things-sync-test-")
+            .tempdir()
+            .expect("tempdir")
+            .keep();
+        let db_path: PathBuf = dir.join("sdk.sqlite3");
+        TriggerSdk::initialize(&db_path).expect("sdk init")
+    }
+
+    fn mutated_root_doc(device_id: &str) -> Vec<u8> {
+        let doc_bytes = remi_things_crdt::Schema::init_root_doc(device_id).expect("init root doc");
+        let mut doc = automerge::AutoCommit::load(&doc_bytes).expect("load root doc");
+        doc.put(ROOT, "_sync_test_marker", "changed")
+            .expect("mutate root doc");
+        doc.save()
+    }
+
+    fn advanced_sync_state_for(device_id: &str) -> Vec<u8> {
+        let _ = device_id;
+        vec![1, 2, 3]
+    }
+
+    fn seed_dirty_root_document(
+        sdk: &TriggerSdk,
+        doc: &[u8],
+        sync_state: Vec<u8>,
+    ) {
+        sdk.crdt_save_document("root", "root", doc, &sync_state, true, None)
+            .expect("save dirty root doc");
+    }
 
     fn test_doc_row(sync_state: Vec<u8>, last_sync_at: Option<&str>) -> crate::types::CrdtDocumentRow {
         crate::types::CrdtDocumentRow {
@@ -1012,20 +1187,14 @@ mod tests_v3 {
 
     #[test]
     fn sync_history_detects_advanced_sync_state_without_last_sync_at() {
-        let doc = remi_things_crdt::Schema::init_root_doc("device-a").unwrap();
-        let initial = crate::crdt_sync::init_sync_state();
-        let (_message, advanced_state) =
-            crate::crdt_sync::generate_sync_message(&doc, &initial).unwrap();
+        let advanced_state = advanced_sync_state_for("device-a");
 
         assert!(has_sync_history(&test_doc_row(advanced_state, None)));
     }
 
     #[test]
     fn never_synced_dirty_keys_follows_sync_state_history() {
-        let doc = remi_things_crdt::Schema::init_root_doc("device-a").unwrap();
-        let initial = crate::crdt_sync::init_sync_state();
-        let (_message, advanced_state) =
-            crate::crdt_sync::generate_sync_message(&doc, &initial).unwrap();
+        let advanced_state = advanced_sync_state_for("device-a");
 
         let unsynced = crate::types::CrdtDocumentRow {
             uuid: "unsynced".to_string(),
@@ -1038,5 +1207,58 @@ mod tests_v3 {
 
         let keys = never_synced_dirty_keys(&[unsynced, synced]);
         assert_eq!(keys, vec![("unsynced".to_string(), "root".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn incremental_mode_skips_server_key_discovery_when_sync_history_exists() {
+        let sdk = test_sdk();
+        let device_id = "device-a";
+        let advanced_state = advanced_sync_state_for(device_id);
+        let synced_doc = mutated_root_doc(device_id);
+        seed_dirty_root_document(&sdk, &synced_doc, advanced_state);
+
+        let mut transport = MockSyncTransport {
+            list_calls: 0,
+            sync_calls: 0,
+            server_keys: Vec::new(),
+        };
+
+        let output = sync_v3_documents_with_transport_mode(
+            &sdk,
+            &mut transport,
+            device_id,
+            ThingsSyncMode::Incremental,
+        )
+        .await
+        .expect("incremental sync succeeds");
+
+        assert_eq!(transport.list_calls, 0);
+        assert_eq!(transport.sync_calls, 1);
+        assert_eq!(output.documents_synced, 1);
+    }
+
+    #[tokio::test]
+    async fn incremental_mode_upgrades_to_full_when_bootstrap_discovery_is_required() {
+        let sdk = test_sdk();
+        seed_dirty_root_document(&sdk, &mutated_root_doc("device-a"), crate::crdt_sync::init_sync_state());
+
+        let mut transport = MockSyncTransport {
+            list_calls: 0,
+            sync_calls: 0,
+            server_keys: Vec::new(),
+        };
+
+        let output = sync_v3_documents_with_transport_mode(
+            &sdk,
+            &mut transport,
+            "device-a",
+            ThingsSyncMode::Incremental,
+        )
+        .await
+        .expect("bootstrap sync succeeds");
+
+        assert_eq!(transport.list_calls, 1);
+        assert!(transport.sync_calls >= 1);
+        assert!(output.documents_synced >= 1);
     }
 }

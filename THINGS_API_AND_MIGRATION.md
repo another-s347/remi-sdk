@@ -260,17 +260,20 @@ let rx = sdk.things_subscribe();
 
 1. 启动时读一次 snapshot
 2. 运行时订阅 ThingsEvent
-3. 本地 store 用增量 patch 更新
+3. 本地 store 按 `DocumentChanged` 或 `SnapshotReplaced` 做刷新/局部更新
 
 当前常用事件：
 
-- `SnapshotReplace`
-- `CollectionUpsert`
-- `CollectionDelete`
-- `ThingUpsert`
-- `ThingDelete`
-- `ThingStatusSet`
-- `ThingMarkdownSplice`
+- `SnapshotReplaced`
+- `DocumentChanged`
+- `DataWiped`
+
+`DocumentChanged` 会暴露：
+
+- `document_kind`: `root` / `collection` / `thing` / `thing_markdown` / `content_entry`
+- `change_kind`: `created` / `updated` / `deleted`
+- `document_uuid`
+- 以及必要的 `collection_uuid`、`thing_uuid`、`entry_id`
 
 ## 典型应用模式
 
