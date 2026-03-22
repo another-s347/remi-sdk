@@ -80,11 +80,9 @@ fn trigger_rule_published_rebind_deletes_old_trigger() {
     assert!(trigger_ids.contains(&new_trigger_uuid.to_string()));
     assert!(!trigger_ids.contains(&old_trigger_uuid.to_string()));
 
-    let snapshot_json = sdk
-        .things_list_snapshot_json(&device_id)
-        .expect("snapshot json");
-    let snapshot: remi_client_sdk::things_crdt::ThingsSnapshot =
-        serde_json::from_str(&snapshot_json).expect("parse snapshot");
+    let snapshot = sdk
+        .things_list_snapshot(&device_id)
+        .expect("snapshot");
     let collection = snapshot
         .collections
         .iter()

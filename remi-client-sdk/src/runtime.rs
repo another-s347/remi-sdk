@@ -4,18 +4,16 @@ use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
 use crate::storage::Storage;
 use crate::things_crdt::{
     ContentEntry, ContentEntryUpdate, ThingCollectionEntry, ThingCollectionUpsert, ThingEntry,
-    ThingUpsert, ThingsSnapshot,
+    ThingUpsert, ThingsSnapshot, ThingsSnapshotState,
 };
 use crate::things_events::ThingsEvent;
 use crate::trigger_events::TriggerEvent;
 use crate::types::{
-    EventPayload, NotificationSource, StoredTrigger,
-    ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
-    ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption,
-    TriggerExecutionSummary, TriggerInfo, TriggerLogLevel, TriggerRegistration,
-    TriggerReplaySummary, TriggerRule, TriggerRunType,
+    EventPayload, NotificationSource, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
+    ThingsOperationType, ThingsUndoConflict, ThingsUndoConflictType, ThingsUndoExecution,
+    ThingsUndoPreview, ThingsUndoResolutionOption, TriggerExecutionSummary, TriggerInfo,
+    TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
-use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
 use croner::Cron;
@@ -28,6 +26,7 @@ use serde_json::to_string;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -112,9 +111,11 @@ impl TriggerSdk {
     /// the server.
     pub fn emit_snapshot_replace(&self, device_id: &str) -> Result<()> {
         let doc_set = self.get_or_init_document_set(device_id)?;
-        let snapshot = doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
-            include_content: true,
-        }).context("Failed to extract snapshot for SnapshotReplace event")?;
+        let snapshot = doc_set
+            .extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+                include_content: true,
+            })
+            .context("Failed to extract snapshot for SnapshotReplace event")?;
         let dirty = doc_set.has_pending_changes();
         self.emit_things_event(ThingsEvent::SnapshotReplace {
             device_id: device_id.to_string(),
@@ -637,8 +638,8 @@ impl TriggerSdk {
         persistence.load_or_init_document_set(device_id)
     }
 
-    pub fn things_list_snapshot_json(&self, device_id: &str) -> Result<String> {
-        self.things_list_snapshot_json_with_options(
+    pub fn things_list_snapshot(&self, device_id: &str) -> Result<ThingsSnapshotState> {
+        self.things_list_snapshot_with_options(
             device_id,
             true,
             crate::things_crdt::SnapshotOptions {
@@ -651,8 +652,8 @@ impl TriggerSdk {
     ///
     /// - Omits thing `data.content` entirely.
     /// - Still returns collections + things metadata.
-    pub fn things_list_snapshot_json_lite(&self, device_id: &str) -> Result<String> {
-        self.things_list_snapshot_json_with_options(
+    pub fn things_list_snapshot_lite(&self, device_id: &str) -> Result<ThingsSnapshotState> {
+        self.things_list_snapshot_with_options(
             device_id,
             true,
             crate::things_crdt::SnapshotOptions {
@@ -664,12 +665,12 @@ impl TriggerSdk {
     /// Flexible snapshot builder for tools/UI.
     ///
     /// Use this to avoid extracting content (and optionally avoid extracting things at all).
-    pub fn things_list_snapshot_json_with_options(
+    pub fn things_list_snapshot_with_options(
         &self,
         device_id: &str,
         _include_things: bool,
         snapshot_options: crate::things_crdt::SnapshotOptions,
-    ) -> Result<String> {
+    ) -> Result<ThingsSnapshotState> {
         let doc_set = self.get_or_init_document_set(device_id)?;
         let mut snapshot = doc_set
             .extract_snapshot_with_options(snapshot_options)
@@ -694,13 +695,12 @@ impl TriggerSdk {
             }
         }
 
-        let payload = json!({
-            "collections": snapshot.collections,
-            "things": snapshot.things,
-            "dirty": dirty,
-            "last_sync_at": null,
-        });
-        to_string(&payload).context("Failed to serialize things snapshot")
+        Ok(ThingsSnapshotState {
+            collections: snapshot.collections,
+            things: snapshot.things,
+            dirty,
+            last_sync_at: None,
+        })
     }
 
     /// Store a batch of actor attribution metadata (fetched from server) into the local cache.
@@ -946,7 +946,6 @@ impl TriggerSdk {
     }
 
     pub fn things_upsert_thing(&self, device_id: &str, upsert: ThingUpsert) -> Result<ThingEntry> {
-
         // Guard: collection_uuid must be non-empty
         if upsert.collection_uuid.trim().is_empty() {
             anyhow::bail!(
@@ -1193,9 +1192,10 @@ impl TriggerSdk {
     ) -> Result<bool> {
         let mut doc_set = self.get_or_init_document_set(device_id)?;
 
-        let snapshot = doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
-            include_content: false,
-        })?;
+        let snapshot =
+            doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+                include_content: false,
+            })?;
         if !snapshot.things.iter().any(|t| t.uuid == thing_uuid) {
             tracing::debug!(
                 thing_uuid,
@@ -1259,9 +1259,10 @@ impl TriggerSdk {
         thing_uuid: &str,
     ) -> Result<Option<String>> {
         let doc_set = self.get_or_init_document_set(device_id)?;
-        let snapshot = doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
-            include_content: false,
-        })?;
+        let snapshot =
+            doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+                include_content: false,
+            })?;
         if !snapshot.things.iter().any(|t| t.uuid == thing_uuid) {
             return Ok(None);
         }
@@ -1315,7 +1316,9 @@ impl TriggerSdk {
 
         // Get current markdown content on-demand for the target thing only.
         let current_markdown = if include_content_for_read {
-            doc_set.get_thing_markdown_text(thing_uuid)?.unwrap_or_default()
+            doc_set
+                .get_thing_markdown_text(thing_uuid)?
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -1937,65 +1940,6 @@ impl TriggerSdk {
         };
 
         doc_set.get_content_entries(&collection_uuid, thing_uuid)
-    }
-
-    // Legacy single-value getters for backward compatibility
-    // (deprecated: use content entries instead)
-
-    /// Get location field of a thing as JSON string (backward compat).
-    /// Returns the first location content entry if any.
-    pub fn things_get_location(&self, device_id: &str, thing_uuid: &str) -> Result<Option<String>> {
-        let content_registry = crate::things_crdt::ContentTypeRegistry::new();
-        let doc_set = self.get_or_init_document_set(device_id)?;
-        let snapshot = doc_set.extract_snapshot()?;
-        let thing = snapshot.things.iter().find(|t| t.uuid == thing_uuid);
-        if thing.is_none() {
-            // Fallback: try direct collection scan for the content entries
-            let coll = doc_set.find_thing_collection_uuid(thing_uuid);
-            if coll.is_none() {
-                anyhow::bail!("Thing not found: {}", thing_uuid);
-            }
-            let entries = doc_set.get_content_entries(&coll.unwrap(), thing_uuid)?;
-            return content_registry
-                .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Location)
-                .map(|payload| serde_json::to_string(&payload).context("serialize location payload"))
-                .transpose();
-        }
-
-        let collection_uuid = thing.unwrap().collection_uuid.clone();
-        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
-        content_registry
-            .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Location)
-            .map(|payload| serde_json::to_string(&payload).context("serialize location payload"))
-            .transpose()
-    }
-
-    /// Get date field of a thing as JSON string (backward compat).
-    /// Returns the first date content entry if any.
-    pub fn things_get_date(&self, device_id: &str, thing_uuid: &str) -> Result<Option<String>> {
-        let content_registry = crate::things_crdt::ContentTypeRegistry::new();
-        let doc_set = self.get_or_init_document_set(device_id)?;
-        let snapshot = doc_set.extract_snapshot()?;
-        let thing = snapshot.things.iter().find(|t| t.uuid == thing_uuid);
-        if thing.is_none() {
-            // Fallback: try direct collection scan for the content entries
-            let coll = doc_set.find_thing_collection_uuid(thing_uuid);
-            if coll.is_none() {
-                anyhow::bail!("Thing not found: {}", thing_uuid);
-            }
-            let entries = doc_set.get_content_entries(&coll.unwrap(), thing_uuid)?;
-            return content_registry
-                .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Date)
-                .map(|payload| serde_json::to_string(&payload).context("serialize date payload"))
-                .transpose();
-        }
-
-        let collection_uuid = thing.unwrap().collection_uuid.clone();
-        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
-        content_registry
-            .find_first_payload_by_kind(&entries, &remi_things_crdt::ContentEntryKind::Date)
-            .map(|payload| serde_json::to_string(&payload).context("serialize date payload"))
-            .transpose()
     }
 
     /// V3: Replace state after sync - this needs to be rewritten for multi-doc
@@ -4028,8 +3972,8 @@ impl TriggerSdk {
 #[cfg(test)]
 mod db_observability_tests {
     use super::TriggerSdk;
-    use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
     use crate::storage::{test_sqlite_counters_get, test_sqlite_counters_reset};
+    use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
     use std::time::Instant;
     use tempfile::tempdir;
 
@@ -4054,7 +3998,7 @@ mod db_observability_tests {
                 updated_at: None,
             },
         )
-            .expect("seed collection");
+        .expect("seed collection");
 
         sdk.things_upsert_thing(
             device_id,
@@ -4070,7 +4014,7 @@ mod db_observability_tests {
                 updated_at: None,
             },
         )
-            .expect("seed thing");
+        .expect("seed thing");
 
         // Measure overwrite behavior.
         test_sqlite_counters_reset();
@@ -4166,7 +4110,7 @@ mod db_observability_tests {
                 updated_at: None,
             },
         )
-            .expect("seed collection");
+        .expect("seed collection");
 
         sdk.things_upsert_thing(
             device_id,
@@ -4182,7 +4126,7 @@ mod db_observability_tests {
                 updated_at: None,
             },
         )
-            .expect("seed thing");
+        .expect("seed thing");
 
         let long = "A".repeat(200_000);
 

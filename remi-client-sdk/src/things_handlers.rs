@@ -97,8 +97,8 @@ fn load_things_snapshot(
     device_id: &str,
     include_things: bool,
 ) -> Result<ThingsSnapshot, String> {
-    let snapshot_json = sdk
-        .things_list_snapshot_json_with_options(
+    let snapshot = sdk
+        .things_list_snapshot_with_options(
             device_id,
             include_things,
             crate::things_crdt::SnapshotOptions {
@@ -107,8 +107,10 @@ fn load_things_snapshot(
         )
         .map_err(|e| format!("Failed to read local things snapshot: {e}"))?;
 
-    serde_json::from_str(&snapshot_json)
-        .map_err(|e| format!("Failed to parse local things snapshot: {e}"))
+    Ok(ThingsSnapshot {
+        collections: snapshot.collections,
+        things: snapshot.things,
+    })
 }
 
 /// Payload for things_thing_content_edit - matches agent's interrupt data
@@ -578,22 +580,12 @@ impl InterruptHandler for ThingMovedHandler {
             }));
         }
 
-        let snapshot_json = match self.sdk.things_list_snapshot_json(&self.device_id) {
+        let snapshot = match self.sdk.things_list_snapshot(&self.device_id) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(json!({
                     "confirmed": false,                    "uuid": info.uuid,
                     "error": format!("Failed to read local things snapshot: {e}"),
-                }));
-            }
-        };
-
-        let snapshot: ThingsSnapshot = match serde_json::from_str(&snapshot_json) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(json!({
-                    "confirmed": false,                    "uuid": info.uuid,
-                    "error": format!("Failed to parse local things snapshot: {e}"),
                 }));
             }
         };
@@ -780,17 +772,14 @@ impl InterruptHandler for ThingsListSnapshotHandler {
         let include_things = !matches!(entity_type.as_str(), "collection" | "collections");
         let include_content = req.include_content.unwrap_or(false);
 
-        let snapshot_json = self
+        let snapshot = self
             .sdk
-            .things_list_snapshot_json_with_options(
+            .things_list_snapshot_with_options(
                 &self.device_id,
                 include_things,
                 crate::things_crdt::SnapshotOptions { include_content },
             )
             .map_err(|e| format!("Failed to get snapshot: {}", e))?;
-
-        let snapshot: JsonValue = serde_json::from_str(&snapshot_json)
-            .map_err(|e| format!("Failed to parse snapshot: {}", e))?;
 
         tracing::info!("Things list snapshot provided via interrupt");
 

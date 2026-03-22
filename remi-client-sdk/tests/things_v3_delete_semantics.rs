@@ -12,8 +12,8 @@ fn temp_db_path() -> Result<String> {
 }
 
 fn parse_snapshot(sdk: &TriggerSdk, device_id: &str) -> Result<serde_json::Value> {
-    let raw = sdk.things_list_snapshot_json(device_id)?;
-    serde_json::from_str(&raw).context("parse snapshot")
+    let snapshot = sdk.things_list_snapshot(device_id)?;
+    serde_json::to_value(snapshot).context("serialize snapshot")
 }
 
 #[test]

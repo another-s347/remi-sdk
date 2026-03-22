@@ -10,6 +10,12 @@
 
 另外，仓库根目录的 `proto/` 是一个 Git submodule，用来提供共享 protobuf 定义。
 
+Things / ThingCollection 当前文档分为三份：
+
+- `THINGS_CRDT_ARCHITECTURE.md`：整体架构、分层、同步与扩展
+- `THINGS_SCHEMA_REFERENCE.md`：root / collection / markdown / content entry 的 schema 参考
+- `THINGS_API_AND_MIGRATION.md`：typed API 使用方式与旧 JSON API 迁移说明
+
 ## 适用场景
 
 如果你正在做下面这些事情，通常应该从这个仓库开始：
@@ -286,7 +292,7 @@ let _server_triggers = triggers.list_triggers("device-1", None, 50, 0).await?;
 
 `TriggerSdk` 在 collection / things 这块最重要的能力可以分成 4 类：
 
-- 快照读取：`things_list_snapshot_json(...)`、`things_list_snapshot_json_lite(...)`、`things_has_pending_changes(...)`
+- 快照读取：`things_list_snapshot(...)`、`things_list_snapshot_lite(...)`、`things_has_pending_changes(...)`
 - 本地写入：`things_upsert_collection_json(...)`、`things_upsert_thing_json(...)`、`things_delete_collection(...)`、`things_delete_thing(...)`、`things_set_status(...)`
 - trigger 绑定：`things_set_collection_trigger_uuid(...)`、`things_set_thing_trigger_uuid(...)`、`delete_trigger_and_bindings(...)`
 - UI 订阅：`things_subscribe()`、`triggers_subscribe()`、`events_subscribe()`
@@ -332,8 +338,8 @@ sdk.things_upsert_thing_json(
     .to_string(),
 )?;
 
-let snapshot_json = sdk.things_list_snapshot_json(device_id)?;
-println!("{}", snapshot_json);
+let snapshot = sdk.things_list_snapshot(device_id)?;
+println!("{}", serde_json::to_string_pretty(&snapshot)?);
 ```
 
 这个例子里有两个设计点值得注意：

@@ -6,23 +6,37 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 pub use remi_things_crdt::{
-    ContentEntry, ContentEntryKind, ContentEntryPayload, ContentEntryUpdate, DateField,
-    ImageField, LocationField, ThingDatatype, UrlField,
+    ContentEntry, ContentEntryKind, ContentEntryPayload, ContentEntryUpdate, DateField, ImageField,
+    LocationField, ThingDatatype, UrlField,
 };
 
 use remi_things_crdt::{
-    CURRENT_SCHEMA_VERSION, CrdtDataType, Content, Op, Schema, TriggerUpdate,
-    ROOT_DOC_UUID,
+    CURRENT_SCHEMA_VERSION,
+    CollectionDocView,
     // V3 types
-    CollectionOp, ThingMarkdownOp,
-    RootView, CollectionDocView, ThingMarkdownView,
-    apply_collection_op, apply_thing_markdown_op,
-    extract_root_view, extract_collection_doc_view, extract_thing_markdown_view,
-    // V3 compaction
-    needs_compaction, compact_root_doc, compact_collection_doc, compact_thing_markdown_doc,
+    CollectionOp,
+    Content,
+    CrdtDataType,
     DEFAULT_COMPACTION_THRESHOLD,
+    Op,
+    ROOT_DOC_UUID,
+    RootView,
+    Schema,
     // V3 built-in fields (multi-value)
     ThingBuiltInFieldsUpdate,
+    ThingMarkdownOp,
+    ThingMarkdownView,
+    TriggerUpdate,
+    apply_collection_op,
+    apply_thing_markdown_op,
+    compact_collection_doc,
+    compact_root_doc,
+    compact_thing_markdown_doc,
+    extract_collection_doc_view,
+    extract_root_view,
+    extract_thing_markdown_view,
+    // V3 compaction
+    needs_compaction,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +147,14 @@ pub struct ThingsSnapshot {
     pub things: Vec<ThingEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThingsSnapshotState {
+    pub collections: Vec<ThingCollectionEntry>,
+    pub things: Vec<ThingEntry>,
+    pub dirty: bool,
+    pub last_sync_at: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ContentTypeRegistry;
 
@@ -178,7 +200,10 @@ impl ContentTypeRegistry {
             .get("title")
             .and_then(|item| item.as_str())
             .map(|item| item.to_string());
-        let order = value.get("order").and_then(|item| item.as_f64()).unwrap_or(0.0);
+        let order = value
+            .get("order")
+            .and_then(|item| item.as_f64())
+            .unwrap_or(0.0);
         let payload_value = value
             .get("payload")
             .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
@@ -194,10 +219,15 @@ impl ContentTypeRegistry {
     pub fn parse_content_entry_update(
         &self,
         value: &Value,
-    ) -> Result<(Option<Option<String>>, Option<f64>, Option<ContentEntryPayload>)> {
+    ) -> Result<(
+        Option<Option<String>>,
+        Option<f64>,
+        Option<ContentEntryPayload>,
+    )> {
         let title = if value.get("title").is_some() {
             Some(
-                value.get("title")
+                value
+                    .get("title")
                     .and_then(|item| item.as_str())
                     .map(|item| item.to_string()),
             )
@@ -327,7 +357,10 @@ impl ContentTypeRegistry {
             .get("site_name")
             .and_then(|item| item.as_str())
             .map(|item| item.to_string());
-        let resolved = value.get("resolved").and_then(|item| item.as_bool()).unwrap_or(false);
+        let resolved = value
+            .get("resolved")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false);
         Ok(ContentEntryPayload::Url(remi_things_crdt::UrlField {
             url,
             title,
@@ -423,8 +456,14 @@ impl ContentTypeRegistry {
             .get("caption")
             .and_then(|item| item.as_str())
             .map(|item| item.to_string());
-        let width = value.get("width").and_then(|item| item.as_u64()).map(|item| item as u32);
-        let height = value.get("height").and_then(|item| item.as_u64()).map(|item| item as u32);
+        let width = value
+            .get("width")
+            .and_then(|item| item.as_u64())
+            .map(|item| item as u32);
+        let height = value
+            .get("height")
+            .and_then(|item| item.as_u64())
+            .map(|item| item as u32);
         let size_bytes = value.get("size_bytes").and_then(|item| item.as_u64());
         let device_id = value
             .get("device_id")
@@ -446,7 +485,11 @@ impl ContentTypeRegistry {
     //   For object payloads, every field except `type` is preserved verbatim.
     //   For scalar/array payloads, callers should wrap the value as
     //   {"type":"<external-type>","data":<json>} so round-tripping stays lossless.
-    fn parse_custom_payload(&self, content_type: &str, value: &Value) -> Result<ContentEntryPayload> {
+    fn parse_custom_payload(
+        &self,
+        content_type: &str,
+        value: &Value,
+    ) -> Result<ContentEntryPayload> {
         let data = if content_type == "custom" {
             value.get("data").cloned().unwrap_or(Value::Null)
         } else {
@@ -566,9 +609,9 @@ impl ContentTypeRegistry {
             .and_then(|content| content.get("blocks"))
             .and_then(|blocks| blocks.as_array())
             .and_then(|blocks| {
-                blocks.iter().find(|block| {
-                    block.get("id") == Some(&Value::String("main".to_string()))
-                })
+                blocks
+                    .iter()
+                    .find(|block| block.get("id") == Some(&Value::String("main".to_string())))
             })
             .and_then(|block| block.get("text"))
             .and_then(|text| text.as_str())
@@ -626,7 +669,10 @@ impl ContentTypeRegistry {
         }
     }
 
-    pub fn extract_content_entries_from_snapshot_data(&self, data: &Value) -> Result<Vec<ContentEntry>> {
+    pub fn extract_content_entries_from_snapshot_data(
+        &self,
+        data: &Value,
+    ) -> Result<Vec<ContentEntry>> {
         let Some(entries) = data
             .get("built_in")
             .and_then(|built_in| built_in.get("content_entries"))
@@ -651,7 +697,10 @@ impl ContentTypeRegistry {
                     .get("title")
                     .and_then(|value| value.as_str())
                     .map(|value| value.to_string()),
-                order: entry.get("order").and_then(|value| value.as_f64()).unwrap_or(0.0),
+                order: entry
+                    .get("order")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0),
                 payload: self.parse_content_entry_payload(payload)?,
             });
         }
@@ -704,9 +753,10 @@ pub fn upsert_thing(doc_bytes: &[u8], device_id: &str, upsert: ThingUpsert) -> R
     let trigger = trigger_update_from_tri_state(upsert.trigger_uuid.as_deref());
     let content_registry = ContentTypeRegistry::new();
 
-    let content = upsert.data.as_ref().map(|payload| {
-        content_registry.markdown_content_from_value(&upsert.datatype, payload)
-    });
+    let content = upsert
+        .data
+        .as_ref()
+        .map(|payload| content_registry.markdown_content_from_value(&upsert.datatype, payload));
     remi_things_crdt::apply_op(
         doc_bytes,
         device_id,
@@ -807,8 +857,9 @@ pub fn extract_snapshot_with_options(
         include_things: true,
         include_content: options.include_content,
     };
-    let (view, _scale) = remi_things_crdt::extract_view_with_options_and_scale(doc_bytes, extract_opts)
-        .context("Failed to extract v2 view")?;
+    let (view, _scale) =
+        remi_things_crdt::extract_view_with_options_and_scale(doc_bytes, extract_opts)
+            .context("Failed to extract v2 view")?;
     snapshot_from_view_with_options(&view, options)
 }
 
@@ -864,7 +915,10 @@ pub fn snapshot_from_view_with_options(
         });
     }
 
-    Ok(ThingsSnapshot { collections, things })
+    Ok(ThingsSnapshot {
+        collections,
+        things,
+    })
 }
 
 /// Check if document is a supported single-document format (v2 or v3 unified)
@@ -880,7 +934,9 @@ pub fn is_v2_doc(doc_bytes: &[u8]) -> bool {
     match doc.get(automerge::ROOT, Schema::KEY_SCHEMA_VERSION) {
         Ok(Some((AmValue::Scalar(sv), _))) => match sv.as_ref() {
             // Support both legacy v2 and current v3 unified docs
-            automerge::ScalarValue::Int(i) => (*i as u32) >= 2 && (*i as u32) <= CURRENT_SCHEMA_VERSION,
+            automerge::ScalarValue::Int(i) => {
+                (*i as u32) >= 2 && (*i as u32) <= CURRENT_SCHEMA_VERSION
+            }
             _ => false,
         },
         _ => false,
@@ -1022,7 +1078,10 @@ struct DocumentStoreMut<'a> {
 
 impl<'a> DocumentStoreMut<'a> {
     fn new(device_id: &'a str, documents: &'a mut HashMap<DocumentKey, DocumentState>) -> Self {
-        Self { device_id, documents }
+        Self {
+            device_id,
+            documents,
+        }
     }
 
     fn set(&mut self, key: DocumentKey, state: DocumentState) {
@@ -1057,7 +1116,11 @@ impl<'a> DocumentStoreMut<'a> {
         self.documents.remove(key)
     }
 
-    fn maybe_compact_with_threshold(&mut self, key: &DocumentKey, threshold: usize) -> Result<bool> {
+    fn maybe_compact_with_threshold(
+        &mut self,
+        key: &DocumentKey,
+        threshold: usize,
+    ) -> Result<bool> {
         let Some(state) = self.documents.get(key) else {
             return Ok(false);
         };
@@ -1067,10 +1130,8 @@ impl<'a> DocumentStoreMut<'a> {
         }
 
         let compacted = match key.data_type {
-            CrdtDataType::Root => {
-                compact_root_doc(&state.automerge_doc, self.device_id)
-                    .context("Failed to compact root document")?
-            }
+            CrdtDataType::Root => compact_root_doc(&state.automerge_doc, self.device_id)
+                .context("Failed to compact root document")?,
             CrdtDataType::Collection => {
                 compact_collection_doc(&state.automerge_doc, &key.uuid, self.device_id)
                     .context("Failed to compact collection document")?
@@ -1168,10 +1229,7 @@ impl<'a> ThingsDomainReader<'a> {
         thing_uuid: &str,
     ) -> Result<Vec<ContentEntry>> {
         let key = DocumentKey::collection(collection_uuid);
-        let state = self
-            .store
-            .get(&key)
-            .context("Collection not found")?;
+        let state = self.store.get(&key).context("Collection not found")?;
 
         let view = extract_collection_doc_view(&state.automerge_doc, collection_uuid)?;
         let collection_deleted = view
@@ -1190,11 +1248,7 @@ impl<'a> ThingsDomainReader<'a> {
             .find(|thing| thing.id == thing_uuid)
             .context("Thing not found")?;
 
-        let thing_deleted = thing
-            .tombstone
-            .as_ref()
-            .map(|t| t.deleted)
-            .unwrap_or(false);
+        let thing_deleted = thing.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
         if thing_deleted {
             anyhow::bail!("Thing not found");
         }
@@ -1224,11 +1278,7 @@ impl<'a> ThingsDomainReader<'a> {
             }
 
             for thing in &view.things {
-                let thing_deleted = thing
-                    .tombstone
-                    .as_ref()
-                    .map(|t| t.deleted)
-                    .unwrap_or(false);
+                let thing_deleted = thing.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
                 if !thing_deleted && thing.id == thing_uuid {
                     return Some(key.uuid.clone());
                 }
@@ -1296,12 +1346,7 @@ impl<'a> ThingsDomainReader<'a> {
             }
 
             for thing in &view.things {
-                if !thing
-                    .tombstone
-                    .as_ref()
-                    .map(|t| t.deleted)
-                    .unwrap_or(false)
-                {
+                if !thing.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false) {
                     live_things.insert(thing.id.clone());
                 }
             }
@@ -1322,7 +1367,12 @@ impl<'a> ThingsDomainReader<'a> {
         for coll_uuid in &self.collection_uuids_from_documents()? {
             let coll_view = self.collection_view(coll_uuid)?;
 
-            let deleted = coll_view.meta.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
+            let deleted = coll_view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false);
             if deleted {
                 continue;
             }
@@ -1340,7 +1390,11 @@ impl<'a> ThingsDomainReader<'a> {
             });
 
             for thing_meta in &coll_view.things {
-                let thing_deleted = thing_meta.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false);
+                let thing_deleted = thing_meta
+                    .tombstone
+                    .as_ref()
+                    .map(|t| t.deleted)
+                    .unwrap_or(false);
                 if thing_deleted {
                     continue;
                 }
@@ -1377,7 +1431,10 @@ impl<'a> ThingsDomainReader<'a> {
             }
         }
 
-        Ok(ThingsSnapshot { collections, things })
+        Ok(ThingsSnapshot {
+            collections,
+            things,
+        })
     }
 }
 
@@ -1388,7 +1445,10 @@ struct ThingsDomainWriter<'a> {
 
 impl<'a> ThingsDomainWriter<'a> {
     fn new(device_id: &'a str, documents: &'a mut HashMap<DocumentKey, DocumentState>) -> Self {
-        Self { device_id, documents }
+        Self {
+            device_id,
+            documents,
+        }
     }
 
     fn new_document_state(&self, automerge_doc: Vec<u8>) -> DocumentState {
@@ -1407,7 +1467,8 @@ impl<'a> ThingsDomainWriter<'a> {
         }
 
         let doc_bytes = Schema::init_root_doc(self.device_id)?;
-        self.documents.insert(key, self.new_document_state(doc_bytes));
+        self.documents
+            .insert(key, self.new_document_state(doc_bytes));
         Ok(())
     }
 
@@ -1554,8 +1615,12 @@ impl<'a> ThingsDomainWriter<'a> {
                     doc.put_object(automerge::ROOT, Schema::KEY_COLLECTION_UUIDS, ObjType::List)
                         .context("Failed to create collection_uuids list")?
                 };
-                doc.insert(&target_list, doc.length(&target_list), collection_uuid.to_string())
-                    .context("Failed to add collection uuid to root list")?;
+                doc.insert(
+                    &target_list,
+                    doc.length(&target_list),
+                    collection_uuid.to_string(),
+                )
+                .context("Failed to add collection uuid to root list")?;
             }
         } else {
             Self::remove_collection_from_root_lists(&mut doc, collection_uuid)?;
@@ -1656,7 +1721,10 @@ impl<'a> ThingsDomainWriter<'a> {
     }
 
     fn delete_thing(&mut self, collection_uuid: &str, thing_uuid: &str) -> Result<()> {
-        if !self.documents.contains_key(&DocumentKey::collection(collection_uuid)) {
+        if !self
+            .documents
+            .contains_key(&DocumentKey::collection(collection_uuid))
+        {
             return Ok(());
         }
 
@@ -1864,8 +1932,11 @@ impl ThingsDocumentSet {
     /// Returns the number of collections that were added back to the root index.
     pub fn maintain_root_index_from_live_collections(&mut self) -> Result<usize> {
         let root_view = self.root_view()?;
-        let root_uuids: std::collections::HashSet<&str> =
-            root_view.collection_uuids.iter().map(|s| s.as_str()).collect();
+        let root_uuids: std::collections::HashSet<&str> = root_view
+            .collection_uuids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
 
         let orphaned_colls: Vec<String> = self
             .documents
@@ -1937,8 +2008,13 @@ impl ThingsDocumentSet {
 
     /// Try to compact a document if it exceeds the specified threshold.
     /// Returns true if compaction was performed.
-    pub fn maybe_compact_with_threshold(&mut self, key: &DocumentKey, threshold: usize) -> Result<bool> {
-        self.store_mut().maybe_compact_with_threshold(key, threshold)
+    pub fn maybe_compact_with_threshold(
+        &mut self,
+        key: &DocumentKey,
+        threshold: usize,
+    ) -> Result<bool> {
+        self.store_mut()
+            .maybe_compact_with_threshold(key, threshold)
     }
 
     /// Compact all documents that exceed the threshold.
@@ -1974,7 +2050,8 @@ impl ThingsDocumentSet {
 
     /// Get or create a collection document
     pub fn get_or_init_collection(&mut self, collection_uuid: &str) -> Result<&DocumentState> {
-        self.domain_writer().get_or_init_collection(collection_uuid)?;
+        self.domain_writer()
+            .get_or_init_collection(collection_uuid)?;
         let key = DocumentKey::collection(collection_uuid);
         Ok(self.documents.get(&key).unwrap())
     }
@@ -2022,7 +2099,8 @@ impl ThingsDocumentSet {
 
     /// Delete a thing from a collection
     pub fn delete_thing(&mut self, collection_uuid: &str, thing_uuid: &str) -> Result<()> {
-        self.domain_writer().delete_thing(collection_uuid, thing_uuid)
+        self.domain_writer()
+            .delete_thing(collection_uuid, thing_uuid)
     }
 
     /// Add a content entry to a thing (V3 multi-value)
@@ -2159,7 +2237,10 @@ impl ThingsDocumentSet {
     }
 
     /// Extract a snapshot with options
-    pub fn extract_snapshot_with_options(&self, options: SnapshotOptions) -> Result<ThingsSnapshot> {
+    pub fn extract_snapshot_with_options(
+        &self,
+        options: SnapshotOptions,
+    ) -> Result<ThingsSnapshot> {
         self.domain_reader().extract_snapshot_with_options(options)
     }
 }
@@ -2199,7 +2280,13 @@ mod tests_v3 {
     fn test_document_set_snapshot() {
         let mut docs = ThingsDocumentSet::new("test-device");
         docs.get_or_init_collection("coll-1").unwrap();
-        docs.update_collection_meta("coll-1", Some("My Collection".to_string()), None, TriggerUpdate::Noop).unwrap();
+        docs.update_collection_meta(
+            "coll-1",
+            Some("My Collection".to_string()),
+            None,
+            TriggerUpdate::Noop,
+        )
+        .unwrap();
         docs.upsert_thing_meta(
             "coll-1",
             "thing-1",
@@ -2211,7 +2298,11 @@ mod tests_v3 {
         )
         .unwrap();
 
-        let snapshot = docs.extract_snapshot_with_options(SnapshotOptions { include_content: false }).unwrap();
+        let snapshot = docs
+            .extract_snapshot_with_options(SnapshotOptions {
+                include_content: false,
+            })
+            .unwrap();
         assert_eq!(snapshot.collections.len(), 1);
         assert_eq!(snapshot.collections[0].title, "My Collection");
         assert_eq!(snapshot.things.len(), 1);
@@ -2234,7 +2325,8 @@ mod tests_v3 {
             .expect_err("thing upsert without collection should fail");
 
         assert!(
-            err.to_string().contains("must exist before adding or reparenting things"),
+            err.to_string()
+                .contains("must exist before adding or reparenting things"),
             "{err:?}"
         );
     }
@@ -2322,7 +2414,6 @@ mod tests_v3 {
         assert!(!live_things.contains("thing-1"));
     }
 
-
     #[test]
     fn test_snapshot_uses_collection_docs_when_root_index_is_stale() {
         let mut docs = ThingsDocumentSet::new("test-device");
@@ -2402,7 +2493,14 @@ impl CrdtDocumentRepository for crate::storage::Storage {
         dirty: bool,
         last_sync_at: Option<&str>,
     ) -> Result<()> {
-        self.save_crdt_document(uuid, data_type, automerge_doc, sync_state, dirty, last_sync_at)
+        self.save_crdt_document(
+            uuid,
+            data_type,
+            automerge_doc,
+            sync_state,
+            dirty,
+            last_sync_at,
+        )
     }
 
     fn delete_crdt_document(&self, uuid: &str, data_type: &str) -> Result<()> {
@@ -2432,7 +2530,14 @@ impl CrdtDocumentRepository for crate::TriggerSdk {
         dirty: bool,
         last_sync_at: Option<&str>,
     ) -> Result<()> {
-        self.crdt_save_document(uuid, data_type, automerge_doc, sync_state, dirty, last_sync_at)
+        self.crdt_save_document(
+            uuid,
+            data_type,
+            automerge_doc,
+            sync_state,
+            dirty,
+            last_sync_at,
+        )
     }
 
     fn delete_crdt_document(&self, uuid: &str, data_type: &str) -> Result<()> {
@@ -2603,7 +2708,9 @@ impl<'a, R: CrdtDocumentRepository + ?Sized> DocumentPersistence<'a, R> {
         for thing_uuid in &thing_uuids {
             let key = DocumentKey::thing_markdown(thing_uuid);
             doc_set.remove_document(&key);
-            self.repository.delete_crdt_document(thing_uuid, "thing_markdown").ok();
+            self.repository
+                .delete_crdt_document(thing_uuid, "thing_markdown")
+                .ok();
         }
 
         let key = DocumentKey::collection(collection_uuid);
