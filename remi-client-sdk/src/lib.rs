@@ -1,6 +1,7 @@
 pub mod app_keys_client;
 pub mod app_update;
 pub mod auth;
+mod chat_agent;
 pub mod chat_client;
 pub mod chat_runtime;
 pub mod chat_types;
@@ -8,6 +9,7 @@ mod context_prompt;
 pub mod crdt_sync;
 pub mod data_lifecycle;
 pub mod events_events;
+pub mod external_tools;
 pub mod interrupt_handler;
 mod local_wasm;
 pub mod location_service;
@@ -44,6 +46,7 @@ pub use chat_types::{
     CachedMessage, ChatLocalWasmConfig, ChatLocalWasmSource, ChatRunState, ChatRunStatus,
     ChatRuntimeBackend, ChatRuntimeConfig, ChatRuntimeEvent, InterruptAction, PendingInterrupt,
 };
+pub use external_tools::ExternalToolExecutor;
 pub use interrupt_handler::{InterruptHandler, InterruptHandlerRegistry};
 pub use location_service::{
     LocationService, LocationServiceError, haversine_distance, is_within_range,

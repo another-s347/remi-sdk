@@ -53,6 +53,27 @@ struct ThingsCollectionEnvelope {
     pub collection: ThingCollectionInfo,
 }
 
+fn parse_thing_info(data: &JsonValue) -> Result<ThingInfo, String> {
+    if let Some(thing_value) = data.get("thing").filter(|value| !value.is_null()) {
+        if let Ok(info) = serde_json::from_value::<ThingInfo>(thing_value.clone()) {
+            return Ok(info);
+        }
+    }
+
+    let direct_err = match serde_json::from_value::<ThingInfo>(data.clone()) {
+        Ok(info) => return Ok(info),
+        Err(err) => err,
+    };
+
+    serde_json::from_value::<ThingsThingEnvelope>(data.clone())
+        .map(|envelope| envelope.thing)
+        .map_err(|envelope_err| {
+            format!(
+                "Failed to parse thing payload: {direct_err}; envelope parse failed: {envelope_err}"
+            )
+        })
+}
+
 fn deserialize_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -324,13 +345,7 @@ impl ThingAddedHandler {
 impl InterruptHandler for ThingAddedHandler {
     fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_thing_added");
-        let info: ThingInfo = if data.get("thing").is_some() {
-            let env: ThingsThingEnvelope = serde_json::from_value(data)
-                .map_err(|e| format!("Failed to parse thing envelope: {}", e))?;
-            env.thing
-        } else {
-            serde_json::from_value(data).map_err(|e| format!("Failed to parse thing: {}", e))?
-        };
+        let info = parse_thing_info(&data)?;
 
         let thing_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
         let collection_uuid = normalize_required_uuid(&info.collection_uuid, "collection_uuid")?;
@@ -391,13 +406,7 @@ impl ThingEditedHandler {
 impl InterruptHandler for ThingEditedHandler {
     fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_thing_edited");
-        let info: ThingInfo = if data.get("thing").is_some() {
-            let env: ThingsThingEnvelope = serde_json::from_value(data)
-                .map_err(|e| format!("Failed to parse thing envelope: {}", e))?;
-            env.thing
-        } else {
-            serde_json::from_value(data).map_err(|e| format!("Failed to parse thing: {}", e))?
-        };
+        let info = parse_thing_info(&data)?;
 
         let thing_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
         let collection_uuid = normalize_required_uuid(&info.collection_uuid, "collection_uuid")?;
@@ -434,6 +443,45 @@ impl InterruptHandler for ThingEditedHandler {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_thing_info_prefers_embedded_thing_object() {
+        let info = parse_thing_info(&json!({
+            "type": "things_thing_added",
+            "thing": {
+                "uuid": "thing-1",
+                "title": "hello",
+                "datatype": null,
+                "data_json": null,
+                "collection_uuid": "collection-1"
+            }
+        }))
+        .expect("embedded thing object should deserialize");
+
+        assert_eq!(info.uuid, "thing-1");
+        assert_eq!(info.collection_uuid, "collection-1");
+        assert_eq!(info.datatype, "");
+        assert_eq!(info.data_json, "");
+    }
+
+    #[test]
+    fn parse_thing_info_falls_back_when_thing_key_is_null() {
+        let info = parse_thing_info(&json!({
+            "type": "things_thing_added",
+            "thing": null,
+            "uuid": "thing-2",
+            "title": "hello",
+            "datatype": null,
+            "data_json": null,
+            "collection_uuid": "collection-2"
+        }))
+        .expect("direct payload should deserialize when thing is null");
+
+        assert_eq!(info.uuid, "thing-2");
+        assert_eq!(info.collection_uuid, "collection-2");
+        assert_eq!(info.datatype, "");
+        assert_eq!(info.data_json, "");
+    }
 
     #[test]
     fn thing_envelope_allows_nullable_required_strings() {

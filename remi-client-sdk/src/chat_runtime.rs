@@ -4,11 +4,15 @@
 //! handles interrupts automatically, and supports manual resume.
 
 use crate::TriggerSdk;
+use crate::chat_agent::{SharedChatAgent, build_chat_agent, default_chat_agent};
 use crate::chat_client::proto as chat_proto;
-use crate::chat_client::{ChatClient, ChatStreamEvent, chat_stream_event};
+use crate::chat_client::{ChatStreamEvent, chat_stream_event};
 use crate::chat_types::*;
+use crate::external_tools::{
+    ExternalToolCallRequest, ExternalToolExecutor, manual_resume_outcomes,
+};
 use crate::interrupt_handler::InterruptHandlerRegistry;
-use crate::local_wasm::{self, ChatEventStream};
+use crate::local_wasm::ChatEventStream;
 use crate::remi_uri::{RemiUri, mime_from_extension};
 use base64::Engine as _;
 use serde_json::{Value as JsonValue, json};
@@ -30,11 +34,13 @@ fn extract_fatal_error_from_event(event: &ChatStreamEvent) -> Option<String> {
     }
 }
 
-#[derive(Clone, Default)]
-enum ChatExecutionBackend {
-    #[default]
-    RemoteSharedTransport,
-    LocalWasm(Arc<remi_agentloop_wasm::WasmAgentWithHttp>),
+#[derive(Clone)]
+struct ChatExecutionBackend(SharedChatAgent);
+
+impl Default for ChatExecutionBackend {
+    fn default() -> Self {
+        Self(default_chat_agent())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -292,9 +298,15 @@ enum Command {
         reply: oneshot::Sender<()>,
     },
 
-    /// Register interrupt handler registry
+    /// Register legacy interrupt handler registry
     SetHandlerRegistry {
         registry: InterruptHandlerRegistry,
+        reply: oneshot::Sender<()>,
+    },
+
+    /// Register unified external tool executor
+    SetExternalToolExecutor {
+        executor: ExternalToolExecutor,
         reply: oneshot::Sender<()>,
     },
 
@@ -324,8 +336,8 @@ struct ActorState {
     // Sessions
     sessions: HashMap<String, SessionState>,
 
-    // Interrupt handling
-    handler_registry: InterruptHandlerRegistry,
+    // External tool execution
+    external_tool_executor: ExternalToolExecutor,
 
     // Event subscribers
     subscribers: Vec<mpsc::Sender<ChatRuntimeEvent>>,
@@ -348,7 +360,7 @@ impl ActorState {
             last_error: None,
             pending_interrupt: None,
             sessions: HashMap::new(),
-            handler_registry: InterruptHandlerRegistry::new(),
+            external_tool_executor: ExternalToolExecutor::new(),
             subscribers: Vec::new(),
             cancel_tx: None,
             sdk: None,
@@ -384,12 +396,7 @@ impl ActorState {
 }
 
 fn build_execution_backend(config: &ChatRuntimeConfig) -> Result<ChatExecutionBackend, String> {
-    match &config.backend {
-        ChatRuntimeBackend::RemoteServer => Ok(ChatExecutionBackend::RemoteSharedTransport),
-        ChatRuntimeBackend::LocalWasm(local) => {
-            local_wasm::load_agent(&local.source).map(ChatExecutionBackend::LocalWasm)
-        }
-    }
+    build_chat_agent(config).map(ChatExecutionBackend)
 }
 
 async fn open_chat_stream(
@@ -400,38 +407,15 @@ async fn open_chat_stream(
     start_input: Option<chat_proto::ChatStartInput>,
     resume_input: Option<chat_proto::ChatResumeInput>,
 ) -> Result<ChatEventStream, String> {
-    match backend {
-        ChatExecutionBackend::RemoteSharedTransport => {
-            let current_access_token = crate::auth::auth_get_access_token()
-                .await
-                .unwrap_or_else(|| access_token.to_string());
-            tracing::info!(session_id = %session_id, "[ChatRuntime] creating ChatClient via shared transport");
-            let mut client = ChatClient::new_with_shared_transport(current_access_token)
-                .await
-                .map_err(|e| {
-                    tracing::error!(session_id = %session_id, error = %e, "[ChatRuntime] failed to create ChatClient");
-                    format!("Failed to create chat client: {}", e)
-                })?;
-            tracing::info!(session_id = %session_id, "[ChatRuntime] ChatClient created, starting remote stream");
-
-            let stream = client
-                .chat_streaming_multimodal(session_id, start_input, resume_input)
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "[ChatRuntime] failed to start remote stream");
-                    format!("Failed to start stream: {}", e)
-                })?
-                .map(|item| item.map_err(|error| error.to_string()));
-
-            let stream: ChatEventStream = Box::pin(stream);
-            Ok(stream)
-        }
-        ChatExecutionBackend::LocalWasm(agent) => {
-            tracing::info!(session_id = %session_id, "[ChatRuntime] starting local WASM chat stream");
-            local_wasm::start_stream(agent.clone(), config, &session_id, start_input, resume_input)
-                .await
-        }
-    }
+    tracing::debug!(
+        session_id = %session_id,
+        backend = backend.0.backend_name(),
+        "[ChatRuntime] opening chat stream via shared chat agent"
+    );
+    backend
+        .0
+        .open_stream(access_token, config, session_id, start_input, resume_input)
+        .await
 }
 
 async fn ensure_protocol_state_loaded(
@@ -659,215 +643,6 @@ fn parse_tool_arguments_json(arguments_json: &str) -> JsonValue {
 
     serde_json::from_str(arguments_json)
         .unwrap_or_else(|_| JsonValue::String(arguments_json.to_string()))
-}
-
-fn json_arg_string(arguments: &JsonValue, key: &str) -> Option<String> {
-    arguments
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
-}
-
-fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValue {
-    match tool_name {
-        "list_things_tool" => json!({
-            "type": "things_list_snapshot_request",
-            "entity_type": arguments.get("entity_type").cloned().unwrap_or(JsonValue::Null),
-            "include_content": arguments.get("include_content").cloned().unwrap_or_else(|| JsonValue::Bool(false)),
-        }),
-        "get_things_tool" => json!({
-            "type": "things_get_thing_markdown_request",
-            "uuid": arguments.get("uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-        }),
-        "add_things_tool" => json!({
-            "type": "things_thing_added",
-            "thing": {
-                "uuid": json_arg_string(arguments, "uuid")
-                    .map(JsonValue::String)
-                    .unwrap_or_else(|| JsonValue::String(uuid::Uuid::new_v4().to_string())),
-                "title": JsonValue::String(json_arg_string(arguments, "title").unwrap_or_default()),
-                "datatype": "markdown",
-                "data_json": if let Some(content) = json_arg_string(arguments, "content") {
-                    if content.trim().is_empty() { JsonValue::String("{}".to_string()) } else { JsonValue::String(json!({"markdown": content}).to_string()) }
-                } else {
-                    JsonValue::String("{}".to_string())
-                },
-                "parent_uuid": json_arg_string(arguments, "parent_uuid")
-                    .map(JsonValue::String)
-                    .unwrap_or(JsonValue::Null),
-                "collection_uuid": JsonValue::String(json_arg_string(arguments, "collection_uuid").unwrap_or_default()),
-                "created_at": "",
-                "updated_at": "",
-            }
-        }),
-        "edit_things_tool" => {
-            let edit = arguments.get("edit").cloned().unwrap_or_else(|| json!({}));
-            json!({
-                "type": "things_thing_content_edit",
-                "uuid": arguments.get("uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-                "operation": edit.get("operation").cloned().unwrap_or_else(|| JsonValue::String("replace_all".to_string())),
-                "new_title": edit.get("new_title").cloned().unwrap_or(JsonValue::Null),
-                "new_content": edit.get("new_content").cloned().unwrap_or(JsonValue::Null),
-                "old_str": edit.get("old_str").cloned().unwrap_or(JsonValue::Null),
-                "new_str": edit.get("new_str").cloned().unwrap_or(JsonValue::Null),
-                "line_number": edit.get("line_number").cloned().unwrap_or(JsonValue::Null),
-                "insert_text": edit.get("insert_text").cloned().unwrap_or(JsonValue::Null),
-                "append_text": edit.get("append_text").cloned().unwrap_or(JsonValue::Null),
-            })
-        }
-        "remove_things_tool" => json!({
-            "type": "things_thing_removed",
-            "uuid": arguments.get("uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-            "collection_uuid": "",
-            "message": "",
-        }),
-        "move_things_tool" => json!({
-            "type": "things_thing_moved",
-            "uuid": arguments.get("uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-            "to_collection_uuid": arguments.get("new_collection_uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-            "to_parent_uuid": arguments.get("new_parent_uuid").cloned().unwrap_or(JsonValue::Null),
-        }),
-        "create_trigger_simple" => json!({
-            "type": "trigger_rule_published",
-            "trigger_uuid": uuid::Uuid::new_v4().to_string(),
-            "name": arguments.get("name").cloned().unwrap_or_else(|| JsonValue::String("trigger".to_string())),
-            "rule_config_json": {
-                "name": arguments.get("name").cloned().unwrap_or_else(|| JsonValue::String("trigger".to_string())),
-                "precondition": [{
-                    "rule": format!("cron('{}')", arguments.get("cron").and_then(|v| v.as_str()).unwrap_or_default()),
-                    "description": format!("Cron schedule: {}", arguments.get("cron").and_then(|v| v.as_str()).unwrap_or_default()),
-                }],
-                "condition": arguments
-                    .get("condition")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.trim().is_empty())
-                    .map(|condition| vec![json!({
-                        "rule": condition,
-                        "description": "User-specified condition",
-                    })])
-                    .unwrap_or_default(),
-            },
-            "user_request": arguments.get("user_request").cloned().unwrap_or(JsonValue::Null),
-            "event_analysis": JsonValue::Null,
-            "bind_uuid": arguments.get("bind_uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-            "bind_type": arguments.get("bind_type").cloned().unwrap_or_else(|| JsonValue::String("thing".to_string())),
-            "version": 1,
-        }),
-        "create_trigger" => json!({
-            "type": "trigger_rule_published",
-            "trigger_uuid": arguments.get("trigger_uuid").cloned().unwrap_or_else(|| JsonValue::String(uuid::Uuid::new_v4().to_string())),
-            "name": arguments.get("trigger").cloned().unwrap_or_else(|| JsonValue::String("trigger".to_string())),
-            "rule_config_json": arguments.get("trigger").cloned().unwrap_or_else(|| JsonValue::String("{}".to_string())),
-            "user_request": arguments.get("user_request").cloned().unwrap_or(JsonValue::Null),
-            "event_analysis": arguments.get("event_analysis").cloned().unwrap_or(JsonValue::Null),
-            "bind_uuid": arguments.get("bind_uuid").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-            "bind_type": arguments.get("bind_type").cloned().unwrap_or_else(|| JsonValue::String("thing".to_string())),
-            "version": if arguments.get("trigger_uuid").is_some() { 2 } else { 1 },
-        }),
-        "delete_trigger" => json!({
-            "type": "external_tool_call",
-            "tool_name": "delete_trigger",
-            "arguments": arguments,
-            "message": "delete_trigger currently needs bind_uuid and bind_type for legacy auto-handlers",
-        }),
-        "test_trigger" => json!({
-            "type": "trigger_test_request",
-            "trigger_json": arguments.get("trigger").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-            "start_iso": JsonValue::Null,
-            "end_iso": JsonValue::Null,
-            "manual": false,
-        }),
-        "list_triggers_tool" => json!({
-            "type": "triggers_list_request",
-        }),
-        "retrieve_events" => json!({
-            "type": "events_retrieve_request",
-            "start_time": arguments.get("start_time").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-            "end_time": arguments.get("end_time").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-        }),
-        "abstract_events" => json!({
-            "type": "events_abstract_request",
-            "top_n": arguments.get("top_n").cloned().unwrap_or_else(|| json!(3)),
-        }),
-        "resolve_uri" => json!({
-            "type": "resolve_uri",
-            "uri": arguments.get("uri").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
-        }),
-        _ => json!({
-            "type": "external_tool_call",
-            "tool_name": tool_name,
-            "arguments": arguments,
-        }),
-    }
-}
-
-fn raw_resume_value_to_outcome(call: &PendingToolCall, raw: RichHandlerResult) -> ToolExecutionOutcome {
-    match raw {
-        RichHandlerResult::Image(img) => ToolExecutionOutcome {
-            tool_call_id: call.tool_call_id.clone(),
-            tool_name: call.tool_name.clone(),
-            result: None,
-            result_parts: Some(vec![img]),
-            error: None,
-        },
-        RichHandlerResult::Json(json_val) => {
-            let error = json_val
-                .get("error")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string())
-                .or_else(|| json_val.get("error").map(|value| value.to_string()));
-
-            match error {
-                Some(error) => ToolExecutionOutcome {
-                    tool_call_id: call.tool_call_id.clone(),
-                    tool_name: call.tool_name.clone(),
-                    result: None,
-                    result_parts: None,
-                    error: Some(error),
-                },
-                None => ToolExecutionOutcome {
-                    tool_call_id: call.tool_call_id.clone(),
-                    tool_name: call.tool_name.clone(),
-                    result: Some(match json_val {
-                        JsonValue::String(text) => text,
-                        other => serde_json::to_string(&other).unwrap_or_default(),
-                    }),
-                    result_parts: None,
-                    error: None,
-                },
-            }
-        }
-    }
-}
-
-fn build_manual_resume_outcomes(
-    pending: &PendingToolExecutionState,
-    resume_value: JsonValue,
-) -> Result<Vec<ToolExecutionOutcome>, String> {
-    if pending.pending_calls.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mapping = resume_value.as_object().cloned();
-    let mut outcomes = Vec::with_capacity(pending.pending_calls.len());
-
-    for call in &pending.pending_calls {
-        let raw = mapping
-            .as_ref()
-            .and_then(|map| map.get(&call.tool_call_id).cloned())
-            .or_else(|| {
-                if pending.pending_calls.len() == 1 {
-                    Some(resume_value.clone())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| format!("Missing resume value for tool call {}", call.tool_call_id))?;
-
-        outcomes.push(raw_resume_value_to_outcome(call, RichHandlerResult::Json(raw)));
-    }
-
-    Ok(outcomes)
 }
 
 fn outcome_to_protocol_tool_message(outcome: &ToolExecutionOutcome) -> ProtocolHistoryMessage {
@@ -1117,13 +892,29 @@ impl ChatRuntime {
         }
     }
 
-    /// Set interrupt handler registry
+    /// Set interrupt handler registry for legacy callers.
     pub async fn set_handler_registry(&self, registry: InterruptHandlerRegistry) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
             .send(Command::SetHandlerRegistry {
                 registry,
+                reply: reply_tx,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = reply_rx.await;
+        }
+    }
+
+    /// Set the unified external tool executor.
+    pub async fn set_external_tool_executor(&self, executor: ExternalToolExecutor) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(Command::SetExternalToolExecutor {
+                executor,
                 reply: reply_tx,
             })
             .await
@@ -1285,7 +1076,13 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
             }
 
             Command::SetHandlerRegistry { registry, reply } => {
-                state.write().await.handler_registry = registry;
+                state.write().await.external_tool_executor =
+                    ExternalToolExecutor::from_registry(registry);
+                let _ = reply.send(());
+            }
+
+            Command::SetExternalToolExecutor { executor, reply } => {
+                state.write().await.external_tool_executor = executor;
                 let _ = reply.send(());
             }
 
@@ -1848,7 +1645,7 @@ async fn handle_resume(
             .clone()
             .ok_or_else(|| "No pending tool execution state".to_string())?;
 
-        let manual_results = build_manual_resume_outcomes(&pending, resume_value)?;
+        let manual_results = manual_resume_outcomes(&pending, resume_value)?;
         let mut all_results = Vec::new();
         all_results.extend(pending.completed_results.clone());
         all_results.extend(pending.resolved_results.clone());
@@ -2473,115 +2270,55 @@ async fn handle_need_tool_execution_event(
         turn_state.record_tool_result_message(outcome);
     }
 
-    let mut resolved_results = Vec::new();
-    let mut pending_calls = Vec::new();
-    let mut things_changed = false;
-    let mut trigger_scheduler_sync_needed = false;
-
-    let handler_outcomes = {
+    let execution_plan = {
         let s = state.read().await;
-        event
-            .tool_calls
-            .iter()
-            .map(|tool_call| {
-                let arguments = tool_call
+        s.external_tool_executor.resolve_calls(
+            event.tool_calls.iter().map(|tool_call| ExternalToolCallRequest {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.tool_name.clone(),
+                arguments: tool_call
                     .arguments
                     .as_ref()
                     .map(prost_struct_to_json)
-                    .unwrap_or_else(|| json!({}));
-                let default_display = tool_call_display_payload(&tool_call.tool_name, &arguments);
-                let action = s.handler_registry.process(&tool_call.id, &default_display);
-                (tool_call.clone(), arguments, default_display, action)
-            })
-            .collect::<Vec<_>>()
+                    .unwrap_or_else(|| json!({})),
+            }),
+        )
     };
 
-    for (tool_call, arguments, default_display, action) in handler_outcomes {
-        let pending_call = PendingToolCall {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.tool_name.clone(),
-            arguments,
-            display_data: default_display.clone(),
-        };
-
-        match action {
-            InterruptAction::AutoResume(values) => {
-                let resume_value = values
-                    .get(&tool_call.id)
-                    .cloned()
-                    .or_else(|| values.values().next().cloned())
-                    .unwrap_or_else(|| RichHandlerResult::Json(json!({ "error": "handler did not return a resume value" })));
-                let outcome = raw_resume_value_to_outcome(&pending_call, resume_value);
-                if crate::interrupt_handler::extract_interrupt_type(&default_display)
-                    == "trigger_rule_published"
-                    && outcome.error.is_none()
-                {
-                    trigger_scheduler_sync_needed = true;
-                }
-                things_changed = true;
-                turn_state.record_tool_result_message(&outcome);
-                resolved_results.push(outcome);
-            }
-            InterruptAction::WaitForUser { pending } => {
-                let display_data = pending
-                    .iter()
-                    .find(|item| item.interrupt_id == tool_call.id)
-                    .map(|item| item.display_data.clone())
-                    .unwrap_or_else(|| default_display.clone());
-                pending_calls.push(PendingToolCall {
-                    display_data,
-                    ..pending_call
-                });
-            }
-            InterruptAction::Skip => {
-                pending_calls.push(pending_call);
-            }
-        }
+    for outcome in &execution_plan.resolved_results {
+        turn_state.record_tool_result_message(outcome);
     }
-
-    let first_pending_interrupt = pending_calls.first().map(|call| PendingInterrupt {
-        interrupt_id: call.tool_call_id.clone(),
-        interrupt_type: {
-            let extracted = crate::interrupt_handler::extract_interrupt_type(&call.display_data);
-            if extracted.trim().is_empty() {
-                call.tool_name.clone()
-            } else {
-                extracted
-            }
-        },
-        display_data: call.display_data.clone(),
-    });
 
     let mut s = state.write().await;
     if let Some(session) = s.sessions.get_mut(session_id) {
-        if pending_calls.is_empty() {
+        if execution_plan.pending_calls.is_empty() {
             turn_state.commit_completed(session, assistant_id);
         } else {
             let pending_state = PendingToolExecutionState {
                 state: state_json,
                 completed_results: completed_results.clone(),
-                resolved_results: resolved_results.clone(),
-                pending_calls: pending_calls.clone(),
+                resolved_results: execution_plan.resolved_results.clone(),
+                pending_calls: execution_plan.pending_calls.clone(),
             };
             turn_state.commit_need_tool_execution(session, assistant_id, pending_state);
         }
     }
 
-    if trigger_scheduler_sync_needed {
+    if execution_plan.trigger_scheduler_sync_needed {
         s.emit_event(ChatRuntimeEvent::TriggerSchedulerSyncRequested);
     }
-    if things_changed {
+    if execution_plan.things_changed {
         s.emit_event(ChatRuntimeEvent::ThingsChanged);
     }
     drop(s);
 
-    if let Some(pending) = first_pending_interrupt {
+    if let Some(pending) = execution_plan.first_pending_interrupt {
         return Ok(StreamControl::WaitForUser(pending));
     }
 
     let mut all_results = Vec::new();
     all_results.extend(completed_results);
-    all_results.extend(resolved_results);
+    all_results.extend(execution_plan.resolved_results);
 
     Ok(StreamControl::AutoResume(chat_proto::ChatResumeInput {
         state: event.state.clone(),
