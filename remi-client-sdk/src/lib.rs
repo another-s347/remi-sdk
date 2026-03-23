@@ -9,6 +9,7 @@ mod context_prompt;
 pub mod crdt_sync;
 pub mod data_lifecycle;
 pub mod events_events;
+mod external_tool_schema;
 pub mod external_tools;
 pub mod interrupt_handler;
 mod local_wasm;

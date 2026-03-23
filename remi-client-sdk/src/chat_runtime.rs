@@ -8,6 +8,7 @@ use crate::chat_agent::{SharedChatAgent, build_chat_agent, default_chat_agent};
 use crate::chat_client::proto as chat_proto;
 use crate::chat_client::{ChatStreamEvent, chat_stream_event};
 use crate::chat_types::*;
+use crate::external_tool_schema;
 use crate::external_tools::{
     ExternalToolCallRequest, ExternalToolExecutor, manual_resume_outcomes,
 };
@@ -1490,6 +1491,7 @@ async fn handle_send_message(
                 .collect(),
             current: Some(current_input.clone()),
             metadata: None,
+            extra_tools: external_tool_schema::chat_start_extra_tools(None),
         }
     };
 
@@ -1650,6 +1652,8 @@ async fn handle_resume(
         all_results.extend(pending.completed_results.clone());
         all_results.extend(pending.resolved_results.clone());
         all_results.extend(manual_results);
+        let normalized_state =
+            external_tool_schema::normalize_resume_state_tool_definitions(pending.state.clone());
 
         for outcome in &all_results {
             session
@@ -1660,7 +1664,7 @@ async fn handle_resume(
         session.protocol_state.pending_tool_execution = None;
 
         let resume_input = chat_proto::ChatResumeInput {
-            state: Some(json_value_to_prost_struct(pending.state.clone())),
+            state: Some(json_value_to_prost_struct(normalized_state)),
             results: all_results.iter().filter_map(tool_outcome_to_proto).collect(),
         };
 
@@ -2260,6 +2264,8 @@ async fn handle_need_tool_execution_event(
         .as_ref()
         .map(prost_struct_to_json)
         .ok_or_else(|| "NeedToolExecution missing resume state".to_string())?;
+    let normalized_state =
+        external_tool_schema::normalize_resume_state_tool_definitions(state_json);
 
     let completed_results = event
         .completed_results
@@ -2295,7 +2301,7 @@ async fn handle_need_tool_execution_event(
             turn_state.commit_completed(session, assistant_id);
         } else {
             let pending_state = PendingToolExecutionState {
-                state: state_json,
+                state: normalized_state.clone(),
                 completed_results: completed_results.clone(),
                 resolved_results: execution_plan.resolved_results.clone(),
                 pending_calls: execution_plan.pending_calls.clone(),
@@ -2321,7 +2327,7 @@ async fn handle_need_tool_execution_event(
     all_results.extend(execution_plan.resolved_results);
 
     Ok(StreamControl::AutoResume(chat_proto::ChatResumeInput {
-        state: event.state.clone(),
+        state: Some(json_value_to_prost_struct(normalized_state)),
         results: all_results.iter().filter_map(tool_outcome_to_proto).collect(),
     }))
 }

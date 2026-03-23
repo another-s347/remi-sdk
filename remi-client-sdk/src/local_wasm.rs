@@ -5,6 +5,7 @@ use base64::Engine as _;
 use futures::{Stream, StreamExt as FuturesStreamExt};
 use prost_types::{Struct as ProstStruct, Value as ProstValue};
 use remi_agentloop::agent::Agent;
+use remi_agentloop::prelude::ToolDefinition;
 use remi_agentloop::protocol::ProtocolEvent;
 use remi_agentloop::state::AgentState;
 use remi_agentloop::types::{
@@ -107,11 +108,19 @@ async fn loop_input_from_start(
         ChatRuntimeBackend::LocalWasm(local) => local.model.clone(),
         ChatRuntimeBackend::RemoteServer => None,
     };
+    let mut extra_tools = Vec::with_capacity(input.extra_tools.len());
+    for definition in input.extra_tools {
+        let definition_json = prost_struct_to_json(&definition);
+        let definition = serde_json::from_value::<ToolDefinition>(definition_json).map_err(|error| {
+            format!("Invalid ChatStartInput extra_tools entry for local WASM chat: {error}")
+        })?;
+        extra_tools.push(definition);
+    }
 
     Ok(LoopInput::Start {
         content: content_from_input_message(current).await?,
         history,
-        extra_tools: Vec::new(),
+        extra_tools,
         model,
         temperature: None,
         max_tokens: None,

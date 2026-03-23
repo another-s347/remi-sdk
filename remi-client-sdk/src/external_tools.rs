@@ -159,35 +159,17 @@ pub fn manual_resume_outcomes(
 
 fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValue {
     match tool_name {
-        "list_things_tool" => json!({
-            "type": "things_list_snapshot_request",
-            "arguments": arguments,
-        }),
-        "get_things_tool" => json!({
-            "type": "things_get_request",
-            "arguments": arguments,
-        }),
-        "add_things_tool" => json!({
-            "type": "things_thing_added",
-            "arguments": arguments,
-        }),
-        "edit_things_tool" => json!({
-            "type": "things_thing_edited",
-            "arguments": arguments,
-        }),
-        "remove_things_tool" => json!({
-            "type": "things_thing_removed",
-            "arguments": arguments,
-        }),
-        "move_things_tool" => json!({
-            "type": "things_thing_moved",
-            "arguments": arguments,
-        }),
-        "create_trigger" | "create_trigger_simple" => json!({
-            "type": "trigger_rule_published",
-            "arguments": arguments,
-            "version": if arguments.get("trigger_uuid").is_some() { 2 } else { 1 },
-        }),
+        "list_things_tool" => merge_tool_payload("things_list_snapshot_request", arguments),
+        "get_things_tool" => merge_tool_payload("things_get_thing_markdown_request", arguments),
+        "add_things_tool" => merge_tool_payload("things_thing_added", arguments),
+        "edit_things_tool" => merge_tool_payload("things_thing_edited", arguments),
+        "remove_things_tool" => merge_tool_payload("things_thing_removed", arguments),
+        "move_things_tool" => merge_tool_payload("things_thing_moved", arguments),
+        "create_trigger" | "create_trigger_simple" => {
+            let mut payload = merge_tool_payload("trigger_rule_published", arguments);
+            payload["version"] = json!(if arguments.get("trigger_uuid").is_some() { 2 } else { 1 });
+            payload
+        }
         "delete_trigger" => json!({
             "type": "external_tool_call",
             "tool_name": "delete_trigger",
@@ -223,6 +205,19 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
             "arguments": arguments,
         }),
     }
+}
+
+fn merge_tool_payload(interrupt_type: &str, arguments: &JsonValue) -> JsonValue {
+    let mut payload = serde_json::Map::new();
+    payload.insert("type".to_string(), JsonValue::String(interrupt_type.to_string()));
+
+    if let Some(object) = arguments.as_object() {
+        payload.extend(object.clone());
+    } else {
+        payload.insert("arguments".to_string(), arguments.clone());
+    }
+
+    JsonValue::Object(payload)
 }
 
 fn raw_resume_value_to_outcome(
@@ -271,7 +266,10 @@ fn raw_resume_value_to_outcome(
 mod tests {
     use serde_json::{Value as JsonValue, json};
 
-    use super::{ExternalToolCallRequest, ExternalToolExecutor, manual_resume_outcomes};
+    use super::{
+        ExternalToolCallRequest, ExternalToolExecutor, manual_resume_outcomes,
+        tool_call_display_payload,
+    };
     use crate::chat_types::{PendingToolCall, PendingToolExecutionState};
     use crate::interrupt_handler::InterruptHandler;
 
@@ -325,5 +323,33 @@ mod tests {
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].result.as_deref(), Some("{\"title\":\"Example\"}"));
+    }
+
+    #[test]
+    fn get_things_tool_payload_matches_registered_handler_shape() {
+        let payload = tool_call_display_payload("get_things_tool", &json!({ "uuid": "thing-1" }));
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("things_get_thing_markdown_request"));
+        assert_eq!(payload.get("uuid").and_then(JsonValue::as_str), Some("thing-1"));
+        assert!(payload.get("arguments").is_none());
+    }
+
+    #[test]
+    fn resolve_calls_auto_resumes_get_things_when_handler_registered() {
+        let mut executor = ExternalToolExecutor::new();
+        executor.register("things_get_thing_markdown_request", EchoHandler);
+
+        let plan = executor.resolve_calls([ExternalToolCallRequest {
+            tool_call_id: "get_things_tool:0".to_string(),
+            tool_name: "get_things_tool".to_string(),
+            arguments: json!({ "uuid": "thing-1" }),
+        }]);
+
+        assert!(plan.pending_calls.is_empty());
+        assert_eq!(plan.resolved_results.len(), 1);
+        assert_eq!(
+            plan.resolved_results[0].result.as_deref(),
+            Some("{\"type\":\"things_get_thing_markdown_request\",\"uuid\":\"thing-1\"}")
+        );
     }
 }
