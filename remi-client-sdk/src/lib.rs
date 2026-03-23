@@ -56,7 +56,7 @@ pub use realtime::{RealtimeConfig, RemiRealtimeEvent, SupabaseRealtimeManager};
 pub use remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 pub use runtime::{NotificationCallback, TriggerCallback, TriggerSdk};
 pub use things_client::ThingsClient;
-pub use things_handlers::register_things_handlers;
+pub use things_handlers::{register_things_external_tools, register_things_handlers};
 pub use trigger_client::{ServerTriggerInfo, TriggerClient};
 pub use types::{
     ChatSession, ChatSessionUpdate, CoordinateSystem, EventPayload, Location, LocationCacheEntry,
@@ -66,7 +66,7 @@ pub use types::{
     TriggerLogEntry, TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule,
     TriggerRunType,
 };
-pub use url_handlers::register_url_handlers;
+pub use url_handlers::{register_url_external_tools, register_url_handlers};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TriggerContext;

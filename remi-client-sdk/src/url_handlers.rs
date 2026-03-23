@@ -5,6 +5,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::InterruptHandler;
 use crate::chat_types::{RichHandlerResult, ToolImagePart};
+use crate::external_tools::ExternalToolExecutor;
 use crate::interrupt_handler::InterruptHandlerRegistry;
 use crate::remi_uri::{RemiUri, RemiUriLocation};
 pub struct ResolveUriHandler;
@@ -26,7 +27,43 @@ impl InterruptHandler for ResolveUriHandler {
 }
 
 pub fn register_url_handlers(registry: &mut InterruptHandlerRegistry) {
-    registry.register("resolve_uri", ResolveUriHandler);
+    register_url_handlers_inner(registry);
+}
+
+pub fn register_url_external_tools(executor: &mut ExternalToolExecutor) {
+    register_url_handlers_inner(executor);
+}
+
+trait UrlHandlerRegistrar {
+    fn register_handler<H: InterruptHandler + 'static>(
+        &mut self,
+        interrupt_type: impl Into<String>,
+        handler: H,
+    );
+}
+
+impl UrlHandlerRegistrar for InterruptHandlerRegistry {
+    fn register_handler<H: InterruptHandler + 'static>(
+        &mut self,
+        interrupt_type: impl Into<String>,
+        handler: H,
+    ) {
+        self.register(interrupt_type, handler);
+    }
+}
+
+impl UrlHandlerRegistrar for ExternalToolExecutor {
+    fn register_handler<H: InterruptHandler + 'static>(
+        &mut self,
+        interrupt_type: impl Into<String>,
+        handler: H,
+    ) {
+        self.register(interrupt_type, handler);
+    }
+}
+
+fn register_url_handlers_inner<R: UrlHandlerRegistrar>(registry: &mut R) {
+    registry.register_handler("resolve_uri", ResolveUriHandler);
 }
 
 fn extract_uri(payload: &JsonValue) -> Result<&str, String> {

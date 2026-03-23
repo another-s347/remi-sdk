@@ -1,6 +1,7 @@
 //! Built-in interrupt handlers for Things operations and Trigger publishing.
 
 use crate::TriggerSdk;
+use crate::external_tools::ExternalToolExecutor;
 use crate::interrupt_handler::{InterruptHandler, extract_interrupt_data};
 use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert, ThingsSnapshot};
 use crate::types::{TriggerRegistration, TriggerRule};
@@ -1258,6 +1259,34 @@ impl InterruptHandler for TriggerRuleDeletedHandler {
 
 use crate::interrupt_handler::InterruptHandlerRegistry;
 
+trait ThingsHandlerRegistrar {
+    fn register_handler<H: InterruptHandler + 'static>(
+        &mut self,
+        interrupt_type: impl Into<String>,
+        handler: H,
+    );
+}
+
+impl ThingsHandlerRegistrar for InterruptHandlerRegistry {
+    fn register_handler<H: InterruptHandler + 'static>(
+        &mut self,
+        interrupt_type: impl Into<String>,
+        handler: H,
+    ) {
+        self.register(interrupt_type, handler);
+    }
+}
+
+impl ThingsHandlerRegistrar for ExternalToolExecutor {
+    fn register_handler<H: InterruptHandler + 'static>(
+        &mut self,
+        interrupt_type: impl Into<String>,
+        handler: H,
+    ) {
+        self.register(interrupt_type, handler);
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Triggers List Handler
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1346,69 +1375,86 @@ pub fn register_things_handlers(
     sdk: Arc<TriggerSdk>,
     device_id: &str,
 ) {
+    register_things_handlers_inner(registry, sdk, device_id);
+}
+
+/// Register all built-in things handlers on the unified external tool executor.
+pub fn register_things_external_tools(
+    executor: &mut ExternalToolExecutor,
+    sdk: Arc<TriggerSdk>,
+    device_id: &str,
+) {
+    register_things_handlers_inner(executor, sdk, device_id);
+}
+
+fn register_things_handlers_inner<R: ThingsHandlerRegistrar>(
+    registry: &mut R,
+    sdk: Arc<TriggerSdk>,
+    device_id: &str,
+) {
     let device_id = device_id.to_string();
 
-    registry.register(
+    registry.register_handler(
         "things_collection_added",
         CollectionAddedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_collection_edited",
         CollectionEditedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_collection_removed",
         CollectionRemovedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_thing_added",
         ThingAddedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_thing_edited",
         ThingEditedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_thing_removed",
         ThingRemovedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_thing_content_edit",
         ThingContentEditHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_thing_moved",
         ThingMovedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_list_snapshot_request",
         ThingsListSnapshotHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "things_get_thing_markdown_request",
         ThingsGetThingMarkdownHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "events_retrieve_request",
         EventsRetrieveRequestHandler::new(sdk.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "events_abstract_request",
         EventsAbstractRequestHandler::new(sdk.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "trigger_rule_published",
         TriggerRulePublishedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "trigger_rule_deleted",
         TriggerRuleDeletedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "triggers_list_request",
         TriggersListHandler::new(sdk.clone()),
     );
-    registry.register(
+    registry.register_handler(
         "trigger_test_request",
         TriggerTestRequestHandler::new(sdk.clone()),
     );
