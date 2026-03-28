@@ -112,9 +112,9 @@ impl ProtocolTurnState {
         }
     }
 
-    fn record_delta(&mut self, delta: &str) {
-        self.assistant_content.push_str(delta);
-    }
+	fn record_delta(&mut self, delta: &str) {
+		self.assistant_content.push_str(delta);
+	}
 
     fn record_reasoning(&mut self, thinking: &str) {
         self.assistant_reasoning = Some(thinking.to_string());
@@ -1490,7 +1490,7 @@ async fn handle_send_message(
                 .map(protocol_history_to_proto)
                 .collect(),
             current: Some(current_input.clone()),
-            metadata: None,
+            metadata: build_chat_start_metadata(&config, &session_id),
             extra_tools: external_tool_schema::chat_start_extra_tools(None),
         }
     };
@@ -2424,6 +2424,96 @@ fn json_value_to_prost_value(val: JsonValue) -> prost_types::Value {
     prost_types::Value { kind: Some(kind) }
 }
 
+fn build_chat_start_metadata(
+    config: &ChatRuntimeConfig,
+    session_id: &str,
+) -> Option<prost_types::Struct> {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "session_id".to_string(),
+        JsonValue::String(session_id.to_string()),
+    );
+    metadata.insert(
+        "traffic_mark".to_string(),
+        JsonValue::String(match config.backend {
+            ChatRuntimeBackend::RemoteServer => "backend",
+            ChatRuntimeBackend::LocalWasm(_) => "local_wasm",
+        }
+        .to_string()),
+    );
+
+    if !config.device_id.trim().is_empty() {
+        metadata.insert(
+            "device_id".to_string(),
+            JsonValue::String(config.device_id.clone()),
+        );
+    }
+
+    metadata.insert(
+        "reporting_consent".to_string(),
+        JsonValue::String(config.tracing.reporting_enabled.to_string()),
+    );
+
+    if config.tracing.reporting_enabled {
+        if let Some(api_key) = config
+            .tracing
+            .langsmith_api_key
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            metadata.insert(
+                "langsmith_api_key".to_string(),
+                JsonValue::String(api_key.clone()),
+            );
+        }
+        if let Some(project) = config
+            .tracing
+            .langsmith_project
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            metadata.insert(
+                "langsmith_project".to_string(),
+                JsonValue::String(project.clone()),
+            );
+        }
+        if let Some(api_url) = config
+            .tracing
+            .langsmith_api_url
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            metadata.insert(
+                "langsmith_api_url".to_string(),
+                JsonValue::String(api_url.clone()),
+            );
+        }
+    }
+
+	normalize_metadata_object_to_string_values(&mut metadata);
+
+    Some(json_value_to_prost_struct(JsonValue::Object(metadata)))
+}
+
+fn normalize_metadata_object_to_string_values(metadata: &mut serde_json::Map<String, JsonValue>) {
+    metadata.retain(|_, value| match value {
+        JsonValue::Null => false,
+        JsonValue::String(_) => true,
+        JsonValue::Bool(inner) => {
+            *value = JsonValue::String(inner.to_string());
+            true
+        }
+        JsonValue::Number(inner) => {
+            *value = JsonValue::String(inner.to_string());
+            true
+        }
+        JsonValue::Array(_) | JsonValue::Object(_) => {
+            *value = JsonValue::String(value.to_string());
+            true
+        }
+    });
+}
+
 fn prost_struct_to_json(s: &prost_types::Struct) -> JsonValue {
     let map: serde_json::Map<String, JsonValue> = s
         .fields
@@ -2431,6 +2521,94 @@ fn prost_struct_to_json(s: &prost_types::Struct) -> JsonValue {
         .map(|(k, v)| (k.clone(), prost_value_to_json(v)))
         .collect();
     JsonValue::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_types::{ChatLocalWasmConfig, ChatRuntimeBackend, ChatTracingConfig};
+    use std::sync::Arc;
+
+    #[test]
+    fn build_chat_start_metadata_uses_string_values() {
+        let metadata = build_chat_start_metadata(
+            &ChatRuntimeConfig {
+                device_id: "desktop-machine".to_string(),
+                backend: ChatRuntimeBackend::RemoteServer,
+                tracing: ChatTracingConfig {
+                    reporting_enabled: false,
+                    langsmith_api_key: None,
+                    langsmith_project: None,
+                    langsmith_api_url: None,
+                },
+                ..Default::default()
+            },
+            "session-123",
+        )
+        .expect("metadata");
+
+        let metadata_json = prost_struct_to_json(&metadata);
+        assert_eq!(
+            metadata_json.get("reporting_consent").and_then(|value| value.as_str()),
+            Some("false")
+        );
+        assert_eq!(
+            metadata_json.get("traffic_mark").and_then(|value| value.as_str()),
+            Some("backend")
+        );
+    }
+
+    #[test]
+    fn normalize_metadata_object_to_string_values_converts_non_strings() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("flag".to_string(), JsonValue::Bool(true));
+        metadata.insert(
+            "count".to_string(),
+            JsonValue::Number(serde_json::Number::from(3)),
+        );
+        metadata.insert("nested".to_string(), json!({ "a": false }));
+        metadata.insert("nullish".to_string(), JsonValue::Null);
+
+        normalize_metadata_object_to_string_values(&mut metadata);
+
+        assert_eq!(metadata.get("flag").and_then(|value| value.as_str()), Some("true"));
+        assert_eq!(metadata.get("count").and_then(|value| value.as_str()), Some("3"));
+        assert_eq!(metadata.get("nested").and_then(|value| value.as_str()), Some("{\"a\":false}"));
+        assert!(!metadata.contains_key("nullish"));
+    }
+
+    #[test]
+    fn local_backend_metadata_still_uses_string_consent() {
+        let metadata = build_chat_start_metadata(
+            &ChatRuntimeConfig {
+                backend: ChatRuntimeBackend::LocalWasm(ChatLocalWasmConfig {
+                    source: crate::chat_types::ChatLocalWasmSource::Bytes(Arc::new(vec![])),
+                    api_key: String::new(),
+                    base_url: None,
+                    model: None,
+                }),
+                tracing: ChatTracingConfig {
+                    reporting_enabled: true,
+                    langsmith_api_key: None,
+                    langsmith_project: None,
+                    langsmith_api_url: None,
+                },
+                ..Default::default()
+            },
+            "session-456",
+        )
+        .expect("metadata");
+
+        let metadata_json = prost_struct_to_json(&metadata);
+        assert_eq!(
+            metadata_json.get("reporting_consent").and_then(|value| value.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            metadata_json.get("traffic_mark").and_then(|value| value.as_str()),
+            Some("local_wasm")
+        );
+    }
 }
 
 fn prost_value_to_json(v: &prost_types::Value) -> JsonValue {

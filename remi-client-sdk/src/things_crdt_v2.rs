@@ -1,9 +1,0 @@
-use anyhow::Result;
-
-/// Temporary v2 shim module.
-///
-/// This is not yet integrated with the SDK runtime/storage/sync loops; it just
-/// provides a thin wrapper around the shared v2 crate.
-pub fn extract_view_v2(doc_bytes: &[u8]) -> Result<remi_things_crdt::View> {
-    Ok(remi_things_crdt::extract_view(doc_bytes)?)
-}

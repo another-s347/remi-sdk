@@ -12,14 +12,24 @@ pub mod proto {
 }
 
 use proto::{
-    GetCrdtDocumentSnapshotRequest, GetThingsSnapshotRequest, GetThingsSyncStatusRequest,
-    ListCrdtDocumentKeysRequest, ListTriggersRequest, ListTriggersResponse,
-    QueryThingsChangeLogsRequest, ReportTriggerFiredRequest, SyncCrdtDocumentRequest,
+    CrdtDocumentRef, GetCrdtDocumentSnapshotRequest, GetCrdtDocumentSnapshotsRequest,
+    GetThingsSnapshotRequest, GetThingsSyncStatusRequest, ListCrdtDocumentKeysRequest,
+    ListTriggersRequest, ListTriggersResponse, QueryThingsChangeLogsRequest,
+    ReportTriggerFiredRequest, SyncCrdtDocumentInput, SyncCrdtDocumentRequest,
+    SyncCrdtDocumentsRequest,
     SyncThingsChangeLogsRequest, SyncThingsChangeLogsResponse, SyncThingsRequest,
     ThingsChangeLogEntry as ProtoThingsChangeLogEntry,
     ThingsContentSnapshot as ProtoThingsContentSnapshot, TriggerInfo, UploadTriggerChunk,
     UploadTriggerResponse, public_service_client::PublicServiceClient,
 };
+
+const MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+fn configured_public_service_client(channel: Channel) -> PublicServiceClient<Channel> {
+    PublicServiceClient::new(channel)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+}
 
 /// Client for exploring and installing triggers from the server
 pub struct TriggerClient {
@@ -37,7 +47,7 @@ impl TriggerClient {
             .await
             .context("Failed to connect to server")?;
 
-        let client = PublicServiceClient::new(channel);
+        let client = configured_public_service_client(channel);
 
         Ok(Self {
             client,
@@ -56,7 +66,7 @@ impl TriggerClient {
             .await
             .map_err(|err| anyhow::anyhow!(err))?;
 
-        let client = PublicServiceClient::new(channel);
+        let client = configured_public_service_client(channel);
 
         Ok(Self {
             client,
@@ -228,6 +238,26 @@ pub trait CrdtSyncTransport: Send {
         sync_message: Vec<u8>,
     ) -> Result<(Vec<Vec<u8>>, String)>;
 
+    async fn sync_crdt_documents(
+        &mut self,
+        device_id: String,
+        documents: Vec<(String, i32, Vec<u8>)>,
+    ) -> Result<Vec<(String, i32, Vec<Vec<u8>>, String)>> {
+        let mut responses = Vec::with_capacity(documents.len());
+        for (document_uuid, data_type, sync_message) in documents {
+            let (sync_messages, last_sync_at) = self
+                .sync_crdt_document(
+                    device_id.clone(),
+                    document_uuid.clone(),
+                    data_type,
+                    sync_message,
+                )
+                .await?;
+            responses.push((document_uuid, data_type, sync_messages, last_sync_at));
+        }
+        Ok(responses)
+    }
+
     async fn get_crdt_document_snapshot(
         &mut self,
         device_id: String,
@@ -235,6 +265,27 @@ pub trait CrdtSyncTransport: Send {
         data_type: i32,
         reset_sync_state: bool,
     ) -> Result<(Vec<u8>, String)>;
+
+    async fn get_crdt_document_snapshots(
+        &mut self,
+        device_id: String,
+        documents: Vec<(String, i32)>,
+        reset_sync_state: bool,
+    ) -> Result<Vec<(String, i32, Vec<u8>, String)>> {
+        let mut snapshots = Vec::with_capacity(documents.len());
+        for (document_uuid, data_type) in documents {
+            let (automerge_doc, last_sync_at) = self
+                .get_crdt_document_snapshot(
+                    device_id.clone(),
+                    document_uuid.clone(),
+                    data_type,
+                    reset_sync_state,
+                )
+                .await?;
+            snapshots.push((document_uuid, data_type, automerge_doc, last_sync_at));
+        }
+        Ok(snapshots)
+    }
 
     async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>>;
 }
@@ -266,6 +317,14 @@ impl CrdtSyncTransport for TriggerClient {
             .await
     }
 
+    async fn sync_crdt_documents(
+        &mut self,
+        device_id: String,
+        documents: Vec<(String, i32, Vec<u8>)>,
+    ) -> Result<Vec<(String, i32, Vec<Vec<u8>>, String)>> {
+        TriggerClient::sync_crdt_documents(self, device_id, documents).await
+    }
+
     async fn get_crdt_document_snapshot(
         &mut self,
         device_id: String,
@@ -281,6 +340,16 @@ impl CrdtSyncTransport for TriggerClient {
             reset_sync_state,
         )
         .await
+    }
+
+    async fn get_crdt_document_snapshots(
+        &mut self,
+        device_id: String,
+        documents: Vec<(String, i32)>,
+        reset_sync_state: bool,
+    ) -> Result<Vec<(String, i32, Vec<u8>, String)>> {
+        TriggerClient::get_crdt_document_snapshots(self, device_id, documents, reset_sync_state)
+            .await
     }
 
     async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>> {
@@ -340,6 +409,48 @@ impl TriggerClient {
         Ok((response.sync_messages, response.last_sync_at))
     }
 
+    /// Sync multiple CRDT documents with the server in a single roundtrip.
+    pub async fn sync_crdt_documents(
+        &mut self,
+        device_id: String,
+        documents: Vec<(String, i32, Vec<u8>)>,
+    ) -> Result<Vec<(String, i32, Vec<Vec<u8>>, String)>> {
+        let request = Request::new(SyncCrdtDocumentsRequest {
+            device_id,
+            documents: documents
+                .into_iter()
+                .map(|(document_uuid, data_type, sync_message)| SyncCrdtDocumentInput {
+                    document_uuid,
+                    data_type,
+                    sync_message,
+                })
+                .collect(),
+        });
+
+        let request = self.add_auth_header(request).await?;
+
+        let response = timeout(
+            self.request_timeout,
+            self.client.sync_crdt_documents(request),
+        )
+        .await
+        .context("Sync CRDT documents timed out")??
+        .into_inner();
+
+        Ok(response
+            .documents
+            .into_iter()
+            .map(|document| {
+                (
+                    document.document_uuid,
+                    document.data_type,
+                    document.sync_messages,
+                    document.last_sync_at,
+                )
+            })
+            .collect())
+    }
+
     /// Fetch the latest CRDT document snapshot (for bootstrap).
     pub async fn get_crdt_document_snapshot(
         &mut self,
@@ -366,6 +477,49 @@ impl TriggerClient {
         .into_inner();
 
         Ok((response.automerge_doc, response.last_sync_at))
+    }
+
+    /// Fetch multiple CRDT document snapshots in one request.
+    pub async fn get_crdt_document_snapshots(
+        &mut self,
+        device_id: String,
+        documents: Vec<(String, i32)>,
+        reset_sync_state: bool,
+    ) -> Result<Vec<(String, i32, Vec<u8>, String)>> {
+        let request = Request::new(GetCrdtDocumentSnapshotsRequest {
+            device_id,
+            documents: documents
+                .into_iter()
+                .map(|(document_uuid, data_type)| CrdtDocumentRef {
+                    document_uuid,
+                    data_type,
+                })
+                .collect(),
+            reset_sync_state,
+        });
+
+        let request = self.add_auth_header(request).await?;
+
+        let response = timeout(
+            self.request_timeout,
+            self.client.get_crdt_document_snapshots(request),
+        )
+        .await
+        .context("Get CRDT document snapshots timed out")??
+        .into_inner();
+
+        Ok(response
+            .snapshots
+            .into_iter()
+            .map(|snapshot| {
+                (
+                    snapshot.document_uuid,
+                    snapshot.data_type,
+                    snapshot.automerge_doc,
+                    snapshot.last_sync_at,
+                )
+            })
+            .collect())
     }
 
     /// List all CRDT document keys for the user, including the current canonical server head.

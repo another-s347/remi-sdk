@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 
 use crate::TriggerClient;
@@ -12,6 +14,8 @@ struct ThingsSyncOutput {
     pub doc_bytes: Vec<u8>,
     pub sync_state_bytes: Vec<u8>,
     pub last_sync_at: Option<String>,
+    pub rpc_rounds: usize,
+    pub server_reply_messages: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,11 +30,32 @@ enum LocalBootstrapState {
 // ============================================================================
 
 /// Output from v3 batched sync
+pub struct ThingsV3SyncMetrics {
+    pub total_elapsed_ms: u64,
+    pub bootstrap_pull_ms: u64,
+    pub phase1_push_ms: u64,
+    pub phase1b_receive_ms: u64,
+    pub phase2_pull_ms: u64,
+    pub list_keys_calls: usize,
+    pub snapshot_downloads: usize,
+    pub phase1_documents_synced: usize,
+    pub phase1b_documents_synced: usize,
+    pub phase2_documents_synced: usize,
+    pub phase1_rpc_rounds: usize,
+    pub phase1b_rpc_rounds: usize,
+    pub phase1_batch_calls: usize,
+    pub phase1b_batch_calls: usize,
+    pub phase1_server_reply_messages: usize,
+    pub phase1b_server_reply_messages: usize,
+}
+
 pub struct ThingsV3SyncOutput {
     /// Number of documents synced
     pub documents_synced: usize,
     /// Last sync timestamp (from server)
     pub last_sync_at: Option<String>,
+    /// Timing and work-distribution metrics for the sync run.
+    pub metrics: ThingsV3SyncMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +76,15 @@ fn data_type_to_proto(data_type: &CrdtDataType) -> i32 {
         CrdtDataType::Root => 1,
         CrdtDataType::Collection => 2,
         CrdtDataType::ThingMarkdown => 3,
+    }
+}
+
+fn parse_row_data_type(data_type: &str) -> Result<CrdtDataType> {
+    match data_type {
+        "root" => Ok(CrdtDataType::Root),
+        "collection" => Ok(CrdtDataType::Collection),
+        "thing_markdown" => Ok(CrdtDataType::ThingMarkdown),
+        _ => anyhow::bail!("Unknown CRDT data type: {data_type}"),
     }
 }
 
@@ -172,6 +206,13 @@ struct LocalReachabilityFilters {
     active_things: Option<std::collections::HashSet<String>>,
 }
 
+struct PullMissingDocumentsOutput {
+    documents_pulled: usize,
+    last_sync_at: Option<String>,
+    snapshot_downloads: usize,
+    list_keys_calls: usize,
+}
+
 fn build_local_reachability_filters(
     sdk: &TriggerSdk,
     device_id: &str,
@@ -238,11 +279,11 @@ fn should_pull_missing_document(
     filters: &LocalReachabilityFilters,
 ) -> bool {
     match data_type_str {
-        "collection" => filters
-            .active_collections
-            .as_ref()
-            .map(|active| active.contains(uuid))
-            .unwrap_or(true),
+        // Collections are top-level discoverable documents. Filtering them by
+        // the current local root index prevents devices from learning about
+        // collections created elsewhere after both sides already have sync
+        // history.
+        "collection" => true,
         "thing_markdown" => filters
             .active_things
             .as_ref()
@@ -334,24 +375,46 @@ pub async fn sync_v3_documents_with_server_mode(
     sync_v3_documents_with_transport_mode(sdk, client, device_id, mode).await
 }
 
-pub async fn sync_v3_documents_with_transport(
+pub async fn sync_v3_documents_with_transport<T>(
     sdk: &TriggerSdk,
-    client: &mut dyn CrdtSyncTransport,
+    client: &mut T,
     device_id: &str,
-) -> Result<ThingsV3SyncOutput> {
+) -> Result<ThingsV3SyncOutput>
+where
+    T: CrdtSyncTransport,
+{
     sync_v3_documents_with_transport_mode(sdk, client, device_id, ThingsSyncMode::Full).await
 }
 
-pub async fn sync_v3_documents_with_transport_mode(
+pub async fn sync_v3_documents_with_transport_mode<T>(
     sdk: &TriggerSdk,
-    client: &mut dyn CrdtSyncTransport,
+    client: &mut T,
     device_id: &str,
     mode: ThingsSyncMode,
-) -> Result<ThingsV3SyncOutput> {
+) -> Result<ThingsV3SyncOutput>
+where
+    T: CrdtSyncTransport,
+{
+    let total_started_at = Instant::now();
     let mut documents_synced = 0;
     let mut last_sync_at: Option<String> = None;
     let mut effective_mode = mode;
     let mut prefetched_server_keys: Option<Vec<ServerCrdtDocumentKey>> = None;
+    let mut bootstrap_pull_ms = 0u64;
+    let phase1_push_ms: u64;
+    let mut phase1b_receive_ms = 0u64;
+    let mut phase2_pull_ms = 0u64;
+    let mut list_keys_calls = 0usize;
+    let mut snapshot_downloads = 0usize;
+    let mut phase1_documents_synced = 0usize;
+    let mut phase1b_documents_synced = 0usize;
+    let mut phase2_documents_synced = 0usize;
+    let mut phase1_rpc_rounds = 0usize;
+    let mut phase1b_rpc_rounds = 0usize;
+    let mut phase1_batch_calls = 0usize;
+    let mut phase1b_batch_calls = 0usize;
+    let mut phase1_server_reply_messages = 0usize;
+    let mut phase1b_server_reply_messages = 0usize;
 
     tracing::info!(device_id = device_id, ?mode, "Starting Things v3 sync run");
 
@@ -395,9 +458,11 @@ pub async fn sync_v3_documents_with_transport_mode(
     // auto-created docs don't fork the server's canonical root.
     let mut documents_pulled = 0;
     if effective_mode.allows_server_discovery() && bootstrap_state != LocalBootstrapState::HasSyncedHistory {
+        let bootstrap_started_at = Instant::now();
         let stashed_local_snapshot = sdk
             .things_bootstrap_stash_local_snapshot_if_needed(device_id)
             .unwrap_or(false);
+        list_keys_calls += 1;
         let server_keys = client.list_crdt_document_keys().await.unwrap_or_default();
         prefetched_server_keys = Some(server_keys.clone());
         tracing::info!(
@@ -421,12 +486,16 @@ pub async fn sync_v3_documents_with_transport_mode(
                 let _ = sdk.crdt_delete_document(uuid, data_type);
             }
 
-            let pulled = pull_missing_documents(sdk, client, device_id, Some(&server_keys)).await;
+            let pulled = pull_missing_documents(sdk, client, device_id, Some(&server_keys), None)
+                .await;
             match pulled {
-                Ok((count, pull_last_sync)) => {
-                    documents_pulled = count;
-                    documents_synced += count;
-                    observe_sync_timestamp(&mut last_sync_at, pull_last_sync);
+                Ok(output) => {
+                    documents_pulled = output.documents_pulled;
+                    documents_synced += output.documents_pulled;
+                    phase2_documents_synced += output.documents_pulled;
+                    snapshot_downloads += output.snapshot_downloads;
+                    list_keys_calls += output.list_keys_calls;
+                    observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
 
                     if stashed_local_snapshot {
                         sdk.things_bootstrap_replay_stash_onto_current_documents(device_id)
@@ -444,6 +513,7 @@ pub async fn sync_v3_documents_with_transport_mode(
                 }
             }
         }
+        bootstrap_pull_ms = bootstrap_started_at.elapsed().as_millis() as u64;
     }
 
     // ── Phase 1: push dirty local documents ──────────────────────────────
@@ -455,52 +525,56 @@ pub async fn sync_v3_documents_with_transport_mode(
         .context("Failed to load dirty CRDT documents")?;
 
     let mut synced_in_phase1 = std::collections::HashSet::new();
+    let phase1_started_at = Instant::now();
 
+    let mut dirty_root_docs = Vec::new();
+    let mut dirty_collection_docs = Vec::new();
+    let mut dirty_markdown_docs = Vec::new();
     for doc_row in dirty_docs {
-        let data_type = match doc_row.data_type.as_str() {
-            "root" => CrdtDataType::Root,
-            "collection" => CrdtDataType::Collection,
-            "thing_markdown" => CrdtDataType::ThingMarkdown,
-            _ => continue,
-        };
+        match doc_row.data_type.as_str() {
+            "root" => dirty_root_docs.push(doc_row),
+            "collection" => dirty_collection_docs.push(doc_row),
+            "thing_markdown" => dirty_markdown_docs.push(doc_row),
+            _ => {}
+        }
+    }
 
-        let result = sync_single_v3_document(
-            client,
-            device_id,
-            &doc_row.uuid,
-            &data_type,
-            doc_row.automerge_doc,
-            doc_row.sync_state,
-        )
-        .await;
+    for dirty_batch in [dirty_root_docs, dirty_collection_docs, dirty_markdown_docs] {
+        let (results, batch_calls) = sync_document_rows_batch(client, device_id, dirty_batch).await;
+        phase1_batch_calls += batch_calls;
+        for (doc_row, result) in results {
+            match result {
+                Ok(output) => {
+                    synced_in_phase1.insert((doc_row.uuid.clone(), doc_row.data_type.clone()));
+                    sdk.crdt_save_document(
+                        &doc_row.uuid,
+                        &doc_row.data_type,
+                        &output.doc_bytes,
+                        &output.sync_state_bytes,
+                        false,
+                        output.last_sync_at.as_deref(),
+                    )
+                    .context("Failed to save synced CRDT document")?;
 
-        match result {
-            Ok(output) => {
-                synced_in_phase1.insert((doc_row.uuid.clone(), doc_row.data_type.clone()));
-                sdk.crdt_save_document(
-                    &doc_row.uuid,
-                    &doc_row.data_type,
-                    &output.doc_bytes,
-                    &output.sync_state_bytes,
-                    false, // no longer dirty
-                    output.last_sync_at.as_deref(),
-                )
-                .context("Failed to save synced CRDT document")?;
-
-                documents_synced += 1;
-                observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    device_id = device_id,
-                    uuid = doc_row.uuid,
-                    data_type = doc_row.data_type,
-                    error = %err,
-                    "Failed to sync CRDT document, will retry later"
-                );
+                    documents_synced += 1;
+                    phase1_documents_synced += 1;
+                    phase1_rpc_rounds += output.rpc_rounds;
+                    phase1_server_reply_messages += output.server_reply_messages;
+                    observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        device_id = device_id,
+                        uuid = doc_row.uuid,
+                        data_type = doc_row.data_type,
+                        error = %err,
+                        "Failed to sync CRDT document, will retry later"
+                    );
+                }
             }
         }
     }
+    phase1_push_ms = phase1_started_at.elapsed().as_millis() as u64;
 
     tracing::info!(
         device_id = device_id,
@@ -518,6 +592,24 @@ pub async fn sync_v3_documents_with_transport_mode(
         return Ok(ThingsV3SyncOutput {
             documents_synced,
             last_sync_at,
+            metrics: ThingsV3SyncMetrics {
+                total_elapsed_ms: total_started_at.elapsed().as_millis() as u64,
+                bootstrap_pull_ms,
+                phase1_push_ms,
+                phase1b_receive_ms,
+                phase2_pull_ms,
+                list_keys_calls,
+                snapshot_downloads,
+                phase1_documents_synced,
+                phase1b_documents_synced,
+                phase2_documents_synced,
+                phase1_rpc_rounds,
+                phase1b_rpc_rounds,
+                phase1_batch_calls,
+                phase1b_batch_calls,
+                phase1_server_reply_messages,
+                phase1b_server_reply_messages,
+            },
         });
     }
 
@@ -538,6 +630,7 @@ pub async fn sync_v3_documents_with_transport_mode(
     } else {
         match client.list_crdt_document_keys().await {
             Ok(keys) => {
+                list_keys_calls += 1;
                 tracing::info!(
                     device_id = device_id,
                     server_doc_count = keys.len(),
@@ -559,7 +652,7 @@ pub async fn sync_v3_documents_with_transport_mode(
         .keys()
         .map(build_server_head_map)
         .unwrap_or_default();
-    let reachability = match build_local_reachability_filters(sdk, device_id) {
+    let mut reachability = match build_local_reachability_filters(sdk, device_id) {
         Ok(filters) => filters,
         Err(err) => {
             tracing::warn!(
@@ -571,6 +664,7 @@ pub async fn sync_v3_documents_with_transport_mode(
         }
     };
 
+    let phase1b_started_at = Instant::now();
     if server_key_discovery.keys().is_some() {
         let mut all_keys = sdk.crdt_list_document_keys().unwrap_or_default();
 
@@ -581,6 +675,10 @@ pub async fn sync_v3_documents_with_transport_mode(
             "thing_markdown" => 2,
             _ => 3,
         });
+
+        let mut receive_root_docs = Vec::new();
+        let mut receive_collection_docs = Vec::new();
+        let mut receive_markdown_docs = Vec::new();
 
         for (uuid, data_type_str) in all_keys {
             if synced_in_phase1.contains(&(uuid.clone(), data_type_str.clone())) {
@@ -632,41 +730,45 @@ pub async fn sync_v3_documents_with_transport_mode(
                 }
             }
 
-            let result = sync_single_v3_document(
-                client,
-                device_id,
-                &uuid,
-                &data_type,
-                doc_row.automerge_doc,
-                doc_row.sync_state,
-            )
-            .await;
+            match data_type {
+                CrdtDataType::Root => receive_root_docs.push(doc_row),
+                CrdtDataType::Collection => receive_collection_docs.push(doc_row),
+                CrdtDataType::ThingMarkdown => receive_markdown_docs.push(doc_row),
+            }
+        }
 
-            match result {
-                Ok(output) => {
-                    sdk.crdt_save_document(
-                        &uuid,
-                        &data_type_str,
-                        &output.doc_bytes,
-                        &output.sync_state_bytes,
-                        false,
-                        output.last_sync_at.as_deref(),
-                    )
-                    .context("Failed to save synced CRDT document")?;
+        for receive_batch in [receive_root_docs, receive_collection_docs, receive_markdown_docs] {
+            let (results, batch_calls) = sync_document_rows_batch(client, device_id, receive_batch).await;
+            phase1b_batch_calls += batch_calls;
+            for (doc_row, result) in results {
+                match result {
+                    Ok(output) => {
+                        sdk.crdt_save_document(
+                            &doc_row.uuid,
+                            &doc_row.data_type,
+                            &output.doc_bytes,
+                            &output.sync_state_bytes,
+                            false,
+                            output.last_sync_at.as_deref(),
+                        )
+                        .context("Failed to save synced CRDT document")?;
 
-                    documents_synced += 1;
-                    // Count as "pulled" so SnapshotReplace is emitted for UI refresh
-                    documents_pulled += 1;
-                    observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        device_id = device_id,
-                        uuid = uuid,
-                        data_type = data_type_str,
-                        error = %err,
-                        "Phase 1b: failed to receive updates for document (non-fatal)"
-                    );
+                        documents_synced += 1;
+                        phase1b_documents_synced += 1;
+                        phase1b_rpc_rounds += output.rpc_rounds;
+                        phase1b_server_reply_messages += output.server_reply_messages;
+                        documents_pulled += 1;
+                        observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            device_id = device_id,
+                            uuid = doc_row.uuid,
+                            data_type = doc_row.data_type,
+                            error = %err,
+                            "Phase 1b: failed to receive updates for document (non-fatal)"
+                        );
+                    }
                 }
             }
         }
@@ -676,16 +778,28 @@ pub async fn sync_v3_documents_with_transport_mode(
             "Skipping phase 1b receive sync because server key discovery is unavailable"
         );
     }
+    phase1b_receive_ms = phase1b_started_at.elapsed().as_millis() as u64;
 
     // ── Phase 2: pull any remaining missing server-side documents ────────
 
     if let Some(server_keys) = server_key_discovery.keys() {
-        let pulled = pull_missing_documents(sdk, client, device_id, Some(server_keys)).await;
+        let phase2_started_at = Instant::now();
+        let pulled = pull_missing_documents(
+            sdk,
+            client,
+            device_id,
+            Some(server_keys),
+            Some(&mut reachability),
+        )
+        .await;
         match pulled {
-            Ok((count, pull_last_sync)) => {
-                documents_pulled += count;
-                documents_synced += count;
-                observe_sync_timestamp(&mut last_sync_at, pull_last_sync);
+            Ok(output) => {
+                documents_pulled += output.documents_pulled;
+                documents_synced += output.documents_pulled;
+                phase2_documents_synced += output.documents_pulled;
+                snapshot_downloads += output.snapshot_downloads;
+                list_keys_calls += output.list_keys_calls;
+                observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
             }
             Err(err) => {
                 tracing::warn!(
@@ -695,6 +809,7 @@ pub async fn sync_v3_documents_with_transport_mode(
                 );
             }
         }
+        phase2_pull_ms = phase2_started_at.elapsed().as_millis() as u64;
     } else {
         tracing::warn!(
             device_id = device_id,
@@ -726,18 +841,45 @@ pub async fn sync_v3_documents_with_transport_mode(
     Ok(ThingsV3SyncOutput {
         documents_synced,
         last_sync_at,
+        metrics: ThingsV3SyncMetrics {
+            total_elapsed_ms: total_started_at.elapsed().as_millis() as u64,
+            bootstrap_pull_ms,
+            phase1_push_ms,
+            phase1b_receive_ms,
+            phase2_pull_ms,
+            list_keys_calls,
+            snapshot_downloads,
+            phase1_documents_synced,
+            phase1b_documents_synced,
+            phase2_documents_synced,
+            phase1_rpc_rounds,
+            phase1b_rpc_rounds,
+            phase1_batch_calls,
+            phase1b_batch_calls,
+            phase1_server_reply_messages,
+            phase1b_server_reply_messages,
+        },
     })
 }
 
 /// Discover server-side CRDT documents and download any that are missing locally.
 ///
-/// Returns (documents_pulled, last_sync_at).
-async fn pull_missing_documents(
+/// Downloaded snapshots are saved directly with an initial sync state instead of
+/// immediately performing a follow-up Automerge handshake. That extra handshake
+/// was generating large numbers of no-op round trips during cold-start bootstrap
+/// because the snapshot already contains the canonical server document bytes.
+///
+/// Returns pulled-document counts plus timing/work metrics useful for profiling.
+async fn pull_missing_documents<T>(
     sdk: &TriggerSdk,
-    client: &mut dyn CrdtSyncTransport,
+    client: &mut T,
     device_id: &str,
     prefetched_server_keys: Option<&[ServerCrdtDocumentKey]>,
-) -> Result<(usize, Option<String>)> {
+    mut reachability: Option<&mut LocalReachabilityFilters>,
+) -> Result<PullMissingDocumentsOutput>
+where
+    T: CrdtSyncTransport,
+{
     // Get a set of all local document keys for fast lookup
     let local_keys: std::collections::HashSet<(String, String)> = sdk
         .crdt_list_document_keys()
@@ -745,15 +887,24 @@ async fn pull_missing_documents(
         .into_iter()
         .collect();
 
-    let mut reachability = match build_local_reachability_filters(sdk, device_id) {
-        Ok(filters) => filters,
-        Err(err) => {
-            tracing::warn!(
-                device_id = device_id,
-                error = %err,
-                "Failed to build local reachability filters for phase 2; falling back to broad pull"
-            );
-            LocalReachabilityFilters::default()
+    let mut owned_reachability = None;
+    let reachability = match reachability.as_deref_mut() {
+        Some(filters) => filters,
+        None => {
+            owned_reachability = Some(match build_local_reachability_filters(sdk, device_id) {
+                Ok(filters) => filters,
+                Err(err) => {
+                    tracing::warn!(
+                        device_id = device_id,
+                        error = %err,
+                        "Failed to build local reachability filters for phase 2; falling back to broad pull"
+                    );
+                    LocalReachabilityFilters::default()
+                }
+            });
+            owned_reachability
+                .as_mut()
+                .expect("owned reachability should be initialized")
         }
     };
 
@@ -785,7 +936,12 @@ async fn pull_missing_documents(
 
     if missing.is_empty() {
         tracing::debug!(device_id = device_id, "No missing server documents to pull");
-        return Ok((0, None));
+        return Ok(PullMissingDocumentsOutput {
+            documents_pulled: 0,
+            last_sync_at: None,
+            snapshot_downloads: 0,
+            list_keys_calls: usize::from(prefetched_server_keys.is_none()),
+        });
     }
 
     tracing::info!(
@@ -796,39 +952,46 @@ async fn pull_missing_documents(
 
     let mut documents_pulled = 0;
     let mut last_sync_at: Option<String> = None;
+    let mut local_snapshot_downloads = 0usize;
 
     // Sort: Root first, then Collection, then ThingMarkdown (matches push order)
     missing.sort_by_key(|(_, dt)| *dt);
 
-    for (uuid, proto_dt) in &missing {
-        let dt_str = proto_data_type_to_str(*proto_dt);
-        let data_type = match dt_str {
-            "root" => CrdtDataType::Root,
-            "collection" => CrdtDataType::Collection,
-            "thing_markdown" => CrdtDataType::ThingMarkdown,
-            _ => continue,
-        };
+    let batch_documents: Vec<(String, i32)> = missing
+        .iter()
+        .filter_map(|(uuid, proto_dt)| {
+            let dt_str = proto_data_type_to_str(*proto_dt);
+            if should_pull_missing_document(uuid, dt_str, reachability) {
+                Some((uuid.clone(), *proto_dt))
+            } else {
+                tracing::debug!(
+                    uuid = %uuid,
+                    data_type = dt_str,
+                    "Skipping pull for unreachable document"
+                );
+                None
+            }
+        })
+        .collect();
 
-        if !should_pull_missing_document(uuid, dt_str, &reachability) {
-            tracing::debug!(
-                uuid = %uuid,
-                data_type = dt_str,
-                "Skipping pull for unreachable document"
-            );
-            continue;
-        }
+    if batch_documents.is_empty() {
+        return Ok(PullMissingDocumentsOutput {
+            documents_pulled: 0,
+            last_sync_at: None,
+            snapshot_downloads: 0,
+            list_keys_calls: usize::from(prefetched_server_keys.is_none()),
+        });
+    }
 
-        // Download snapshot from server
-        match client
-            .get_crdt_document_snapshot(
-                device_id.to_string(),
-                uuid.clone(),
-                *proto_dt,
-                true, // reset_sync_state — we have no local sync state yet
-            )
-            .await
-        {
-            Ok((doc_bytes, sync_at)) => {
+    match client
+        .get_crdt_document_snapshots(device_id.to_string(), batch_documents, true)
+        .await
+    {
+        Ok(snapshots) => {
+            for (uuid, proto_dt, doc_bytes, sync_at) in snapshots {
+                local_snapshot_downloads += 1;
+                let dt_str = proto_data_type_to_str(proto_dt);
+
                 if doc_bytes.is_empty() {
                     tracing::debug!(
                         uuid = uuid,
@@ -838,81 +1001,101 @@ async fn pull_missing_documents(
                     continue;
                 }
 
-                // Clone before move into sync_single_v3_document so we can
-                // fall back to saving the raw snapshot on sync failure.
-                let doc_bytes_fallback = doc_bytes.clone();
-
-                // Now run a single Automerge sync round so both sides share sync state.
-                // Start from the downloaded snapshot (local doc) with empty sync state.
-                let sync_result = sync_single_v3_document(
-                    client,
-                    device_id,
-                    uuid,
-                    &data_type,
-                    doc_bytes,
-                    Vec::new(), // fresh sync state
+                let snapshot_sync_at = optional_sync_timestamp(sync_at);
+                sdk.crdt_save_document(
+                    &uuid,
+                    dt_str,
+                    &doc_bytes,
+                    &[],
+                    false,
+                    snapshot_sync_at.as_deref(),
                 )
-                .await;
+                .context("Failed to save pulled CRDT document snapshot")?;
 
-                match sync_result {
-                    Ok(output) => {
-                        sdk.crdt_save_document(
-                            uuid,
-                            dt_str,
-                            &output.doc_bytes,
-                            &output.sync_state_bytes,
-                            false,
-                            output.last_sync_at.as_deref(),
-                        )
-                        .context("Failed to save pulled CRDT document")?;
+                update_reachability_from_downloaded_doc(
+                    &uuid,
+                    dt_str,
+                    &doc_bytes,
+                    reachability,
+                );
 
-                        update_reachability_from_downloaded_doc(
-                            uuid,
-                            dt_str,
-                            &output.doc_bytes,
-                            &mut reachability,
-                        );
+                documents_pulled += 1;
+                observe_sync_timestamp(&mut last_sync_at, snapshot_sync_at);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                device_id = device_id,
+                error = %err,
+                "Batch snapshot download failed, falling back to per-document pulls"
+            );
 
-                        documents_pulled += 1;
-                        observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
-                    }
-                    Err(err) => {
-                        // Sync round failed; still save the raw snapshot so we have *something*
+            for (uuid, proto_dt) in &missing {
+                let dt_str = proto_data_type_to_str(*proto_dt);
+                if !should_pull_missing_document(uuid, dt_str, reachability) {
+                    continue;
+                }
+
+                match client
+                    .get_crdt_document_snapshot(
+                        device_id.to_string(),
+                        uuid.clone(),
+                        *proto_dt,
+                        true,
+                    )
+                    .await
+                {
+                    Ok((doc_bytes, sync_at)) => {
+                        local_snapshot_downloads += 1;
+                        if doc_bytes.is_empty() {
+                            tracing::debug!(
+                                uuid = uuid,
+                                data_type = dt_str,
+                                "Server returned empty doc, skipping"
+                            );
+                            continue;
+                        }
+
                         let snapshot_sync_at = optional_sync_timestamp(sync_at);
-                        tracing::warn!(uuid = uuid, data_type = dt_str, error = %err,
-                            "Sync round after snapshot download failed, saving raw snapshot");
                         sdk.crdt_save_document(
                             uuid,
                             dt_str,
-                            &doc_bytes_fallback,
+                            &doc_bytes,
                             &[],
                             false,
                             snapshot_sync_at.as_deref(),
                         )
-                        .context("Failed to save raw snapshot")?;
+                        .context("Failed to save pulled CRDT document snapshot")?;
+
                         update_reachability_from_downloaded_doc(
                             uuid,
                             dt_str,
-                            &doc_bytes_fallback,
-                            &mut reachability,
+                            &doc_bytes,
+                            reachability,
                         );
+
                         documents_pulled += 1;
                         observe_sync_timestamp(&mut last_sync_at, snapshot_sync_at);
                     }
+                    Err(err) => {
+                        tracing::warn!(
+                            uuid = uuid,
+                            data_type = dt_str,
+                            error = %err,
+                            "Failed to download CRDT document snapshot, skipping"
+                        );
+                    }
                 }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    uuid = uuid,
-                    data_type = dt_str,
-                    error = %err,
-                    "Failed to download CRDT document snapshot, skipping"
-                );
             }
         }
     }
 
-    Ok((documents_pulled, last_sync_at))
+    Ok(PullMissingDocumentsOutput {
+        documents_pulled,
+        last_sync_at,
+        snapshot_downloads: local_snapshot_downloads,
+        list_keys_calls: usize::from(prefetched_server_keys.is_none()),
+    })
 }
 
 /// Convert proto data_type integer to storage string.
@@ -926,14 +1109,17 @@ fn proto_data_type_to_str(proto_dt: i32) -> &'static str {
 }
 
 /// Sync a single v3 CRDT document with the server
-async fn sync_single_v3_document(
-    client: &mut dyn CrdtSyncTransport,
+async fn sync_single_v3_document<T>(
+    client: &mut T,
     device_id: &str,
     uuid: &str,
     data_type: &CrdtDataType,
     doc_bytes: Vec<u8>,
     sync_state_bytes: Vec<u8>,
-) -> Result<ThingsSyncOutput> {
+) -> Result<ThingsSyncOutput>
+where
+    T: CrdtSyncTransport,
+{
     let mut session = crdt_sync::AutomergeSyncSession::new_with_device_id(
         &doc_bytes,
         &sync_state_bytes,
@@ -949,6 +1135,8 @@ async fn sync_single_v3_document(
     let mut prev_outgoing: Vec<u8> = Vec::new();
     let mut prev_server_msgs: Vec<Vec<u8>> = Vec::new();
     let mut stall_rounds: usize = 0;
+    let mut rpc_rounds: usize = 0;
+    let mut server_reply_messages: usize = 0;
 
     let proto_data_type = data_type_to_proto(data_type);
 
@@ -984,6 +1172,8 @@ async fn sync_single_v3_document(
             )
             .await
             .context("Failed to sync CRDT document with server")?;
+        rpc_rounds += 1;
+        server_reply_messages += next_server_msgs.len();
 
         last_sync_at = optional_sync_timestamp(last);
 
@@ -1036,7 +1226,295 @@ async fn sync_single_v3_document(
         doc_bytes: session.doc_bytes(),
         sync_state_bytes: session.sync_state_bytes(),
         last_sync_at,
+        rpc_rounds,
+        server_reply_messages,
     })
+}
+
+struct BatchSyncSession {
+    uuid: String,
+    data_type: CrdtDataType,
+    session: crdt_sync::AutomergeSyncSession,
+    pending_server_messages: Vec<Vec<u8>>,
+    prev_outgoing: Vec<u8>,
+    prev_server_messages: Vec<Vec<u8>>,
+    stall_rounds: usize,
+    last_sync_at: Option<String>,
+    rpc_rounds: usize,
+    server_reply_messages: usize,
+    finished: bool,
+}
+
+struct BatchSyncRunOutput {
+    outputs: Vec<ThingsSyncOutput>,
+    batch_calls: usize,
+}
+
+async fn sync_v3_document_batch<T>(
+    client: &mut T,
+    device_id: &str,
+    documents: Vec<(String, CrdtDataType, Vec<u8>, Vec<u8>)>,
+) -> Result<BatchSyncRunOutput>
+where
+    T: CrdtSyncTransport,
+{
+    if documents.is_empty() {
+        return Ok(BatchSyncRunOutput {
+            outputs: Vec::new(),
+            batch_calls: 0,
+        });
+    }
+
+    const MAX_ROUNDS: usize = 20;
+    const MAX_STALL_ROUNDS: usize = 3;
+
+    let mut sessions = Vec::with_capacity(documents.len());
+    for (uuid, data_type, doc_bytes, sync_state_bytes) in documents {
+        sessions.push(BatchSyncSession {
+            uuid,
+            data_type,
+            session: crdt_sync::AutomergeSyncSession::new_with_device_id(
+                &doc_bytes,
+                &sync_state_bytes,
+                device_id,
+            )
+            .context("Failed to init CRDT document sync session")?,
+            pending_server_messages: Vec::new(),
+            prev_outgoing: Vec::new(),
+            prev_server_messages: Vec::new(),
+            stall_rounds: 0,
+            last_sync_at: None,
+            rpc_rounds: 0,
+            server_reply_messages: 0,
+            finished: false,
+        });
+    }
+
+    let mut batch_calls = 0usize;
+    for round in 0..MAX_ROUNDS {
+        let mut batch_requests = Vec::new();
+        let mut request_indices = Vec::new();
+
+        for (index, state) in sessions.iter_mut().enumerate() {
+            if state.finished {
+                continue;
+            }
+
+            if !state.pending_server_messages.is_empty() {
+                state
+                    .session
+                    .apply_server_messages(&state.pending_server_messages)
+                    .context("Failed to apply server messages for CRDT document batch")?;
+                state.pending_server_messages.clear();
+            }
+
+            let outgoing = state.session.generate_client_message().unwrap_or_default();
+            if outgoing.is_empty() {
+                tracing::debug!(
+                    device_id = device_id,
+                    uuid = state.uuid,
+                    data_type = state.data_type.as_str(),
+                    round = round + 1,
+                    "sync_v3_document_batch: document converged with no outgoing message"
+                );
+                state.finished = true;
+                continue;
+            }
+
+            request_indices.push((index, outgoing.clone()));
+            batch_requests.push((
+                state.uuid.clone(),
+                data_type_to_proto(&state.data_type),
+                outgoing,
+            ));
+        }
+
+        if batch_requests.is_empty() {
+            break;
+        }
+
+        let responses = client
+            .sync_crdt_documents(device_id.to_string(), batch_requests)
+            .await
+            .context("Failed to sync CRDT document batch with server")?;
+        batch_calls += 1;
+        let mut responses_by_key = responses
+            .into_iter()
+            .map(|(document_uuid, data_type, sync_messages, last_sync_at)| {
+                ((document_uuid, data_type), (sync_messages, last_sync_at))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for (index, outgoing_for_compare) in request_indices {
+            let state = &mut sessions[index];
+            let response_key = (state.uuid.clone(), data_type_to_proto(&state.data_type));
+            let (next_server_messages, last_sync_at) = responses_by_key
+                .remove(&response_key)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Batch CRDT sync response missing document {} ({})",
+                        state.uuid,
+                        state.data_type.as_str()
+                    )
+                })?;
+
+            state.rpc_rounds += 1;
+            state.server_reply_messages += next_server_messages.len();
+            state.last_sync_at = optional_sync_timestamp(last_sync_at);
+
+            if outgoing_for_compare == state.prev_outgoing
+                && next_server_messages == state.prev_server_messages
+            {
+                state.stall_rounds += 1;
+            } else {
+                state.stall_rounds = 0;
+            }
+
+            state.prev_outgoing = outgoing_for_compare;
+            state.prev_server_messages = next_server_messages.clone();
+            state.pending_server_messages = next_server_messages;
+
+            let reply_bytes: usize = state.pending_server_messages.iter().map(|msg| msg.len()).sum();
+            tracing::debug!(
+                device_id = device_id,
+                uuid = state.uuid,
+                data_type = state.data_type.as_str(),
+                round = round + 1,
+                outgoing_bytes = state.prev_outgoing.len(),
+                reply_count = state.pending_server_messages.len(),
+                reply_bytes = reply_bytes,
+                stall_rounds = state.stall_rounds,
+                "sync_v3_document_batch: round complete"
+            );
+
+            if state.stall_rounds >= MAX_STALL_ROUNDS {
+                tracing::warn!(
+                    device_id = device_id,
+                    uuid = state.uuid,
+                    data_type = state.data_type.as_str(),
+                    round = round + 1,
+                    "sync_v3_document_batch: breaking after repeated identical handshake rounds"
+                );
+                state
+                    .session
+                    .apply_server_messages(&state.pending_server_messages)
+                    .context("Failed to apply stalled server messages in batch sync")?;
+                state.pending_server_messages.clear();
+                state.finished = true;
+            }
+        }
+
+        if !responses_by_key.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Batch CRDT sync returned {} unexpected document responses",
+                responses_by_key.len()
+            ));
+        }
+    }
+
+    let mut outputs = Vec::with_capacity(sessions.len());
+    for mut state in sessions {
+        if !state.pending_server_messages.is_empty() {
+            state
+                .session
+                .apply_server_messages(&state.pending_server_messages)
+                .context("Failed to apply final server messages for batched CRDT sync")?;
+        }
+
+        outputs.push(ThingsSyncOutput {
+            doc_bytes: state.session.doc_bytes(),
+            sync_state_bytes: state.session.sync_state_bytes(),
+            last_sync_at: state.last_sync_at,
+            rpc_rounds: state.rpc_rounds,
+            server_reply_messages: state.server_reply_messages,
+        });
+    }
+
+    Ok(BatchSyncRunOutput {
+        outputs,
+        batch_calls,
+    })
+}
+
+async fn sync_document_rows_batch<T>(
+    client: &mut T,
+    device_id: &str,
+    doc_rows: Vec<crate::types::CrdtDocumentRow>,
+) -> (
+    Vec<(crate::types::CrdtDocumentRow, Result<ThingsSyncOutput>)>,
+    usize,
+)
+where
+    T: CrdtSyncTransport,
+{
+    if doc_rows.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let batch_inputs = match doc_rows
+        .iter()
+        .map(|doc_row| {
+            Ok((
+                doc_row.uuid.clone(),
+                parse_row_data_type(&doc_row.data_type)?,
+                doc_row.automerge_doc.clone(),
+                doc_row.sync_state.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(inputs) => inputs,
+        Err(err) => {
+            return (
+                doc_rows
+                    .into_iter()
+                    .map(|doc_row| {
+                        let message = format!("Failed to prepare CRDT document for batch sync: {err}");
+                        (doc_row, Err(anyhow::anyhow!(message)))
+                    })
+                    .collect(),
+                0,
+            );
+        }
+    };
+
+    match sync_v3_document_batch(client, device_id, batch_inputs).await {
+        Ok(run_output) => (
+            doc_rows
+                .into_iter()
+                .zip(run_output.outputs.into_iter().map(Ok))
+                .collect(),
+            run_output.batch_calls,
+        ),
+        Err(err) => {
+            tracing::warn!(
+                device_id = device_id,
+                error = %err,
+                document_count = doc_rows.len(),
+                "Batch CRDT sync failed; falling back to per-document sync"
+            );
+
+            let mut results = Vec::with_capacity(doc_rows.len());
+            for doc_row in doc_rows {
+                let result = match parse_row_data_type(&doc_row.data_type) {
+                    Ok(data_type) => {
+                        sync_single_v3_document(
+                            client,
+                            device_id,
+                            &doc_row.uuid,
+                            &data_type,
+                            doc_row.automerge_doc.clone(),
+                            doc_row.sync_state.clone(),
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
+                };
+                results.push((doc_row, result));
+            }
+            (results, 0)
+        }
+    }
 }
 
 /// Load all v3 CRDT documents from storage into a ThingsDocumentSet
@@ -1072,8 +1550,12 @@ mod tests_v3 {
 
     struct MockSyncTransport {
         list_calls: usize,
+        snapshot_calls: usize,
+        batch_snapshot_calls: usize,
+        batch_sync_calls: usize,
         sync_calls: usize,
         server_keys: Vec<ServerCrdtDocumentKey>,
+        snapshots: std::collections::HashMap<(String, i32), (Vec<u8>, String)>,
     }
 
     #[async_trait]
@@ -1089,14 +1571,54 @@ mod tests_v3 {
             Ok((Vec::new(), String::new()))
         }
 
+        async fn sync_crdt_documents(
+            &mut self,
+            _device_id: String,
+            documents: Vec<(String, i32, Vec<u8>)>,
+        ) -> Result<Vec<(String, i32, Vec<Vec<u8>>, String)>> {
+            self.batch_sync_calls += 1;
+            self.sync_calls += documents.len();
+            Ok(documents
+                .into_iter()
+                .map(|(document_uuid, data_type, _sync_message)| {
+                    (document_uuid, data_type, Vec::new(), String::new())
+                })
+                .collect())
+        }
+
         async fn get_crdt_document_snapshot(
             &mut self,
             _device_id: String,
-            _document_uuid: String,
-            _data_type: i32,
+            document_uuid: String,
+            data_type: i32,
             _reset_sync_state: bool,
         ) -> Result<(Vec<u8>, String)> {
-            Ok((Vec::new(), String::new()))
+            self.snapshot_calls += 1;
+            Ok(self
+                .snapshots
+                .get(&(document_uuid, data_type))
+                .cloned()
+                .unwrap_or_else(|| (Vec::new(), String::new())))
+        }
+
+        async fn get_crdt_document_snapshots(
+            &mut self,
+            _device_id: String,
+            documents: Vec<(String, i32)>,
+            _reset_sync_state: bool,
+        ) -> Result<Vec<(String, i32, Vec<u8>, String)>> {
+            self.batch_snapshot_calls += 1;
+            Ok(documents
+                .into_iter()
+                .map(|(document_uuid, data_type)| {
+                    let (automerge_doc, last_sync_at) = self
+                        .snapshots
+                        .get(&(document_uuid.clone(), data_type))
+                        .cloned()
+                        .unwrap_or_else(|| (Vec::new(), String::new()));
+                    (document_uuid, data_type, automerge_doc, last_sync_at)
+                })
+                .collect())
         }
 
         async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>> {
@@ -1135,6 +1657,18 @@ mod tests_v3 {
     ) {
         sdk.crdt_save_document("root", "root", doc, &sync_state, true, None)
             .expect("save dirty root doc");
+    }
+
+    fn seed_dirty_collection_document(
+        sdk: &TriggerSdk,
+        uuid: &str,
+        device_id: &str,
+        sync_state: Vec<u8>,
+    ) {
+        let doc = remi_things_crdt::Schema::init_collection_doc(device_id, uuid)
+            .expect("init collection doc");
+        sdk.crdt_save_document(uuid, "collection", &doc, &sync_state, true, None)
+            .expect("save dirty collection doc");
     }
 
     fn test_doc_row(sync_state: Vec<u8>, last_sync_at: Option<&str>) -> crate::types::CrdtDocumentRow {
@@ -1219,8 +1753,12 @@ mod tests_v3 {
 
         let mut transport = MockSyncTransport {
             list_calls: 0,
+            snapshot_calls: 0,
+            batch_snapshot_calls: 0,
+            batch_sync_calls: 0,
             sync_calls: 0,
             server_keys: Vec::new(),
+            snapshots: std::collections::HashMap::new(),
         };
 
         let output = sync_v3_documents_with_transport_mode(
@@ -1233,7 +1771,9 @@ mod tests_v3 {
         .expect("incremental sync succeeds");
 
         assert_eq!(transport.list_calls, 0);
+        assert_eq!(transport.snapshot_calls, 0);
         assert_eq!(transport.sync_calls, 1);
+        assert_eq!(transport.batch_sync_calls, 1);
         assert_eq!(output.documents_synced, 1);
     }
 
@@ -1244,8 +1784,12 @@ mod tests_v3 {
 
         let mut transport = MockSyncTransport {
             list_calls: 0,
+            snapshot_calls: 0,
+            batch_snapshot_calls: 0,
+            batch_sync_calls: 0,
             sync_calls: 0,
             server_keys: Vec::new(),
+            snapshots: std::collections::HashMap::new(),
         };
 
         let output = sync_v3_documents_with_transport_mode(
@@ -1259,6 +1803,101 @@ mod tests_v3 {
 
         assert_eq!(transport.list_calls, 1);
         assert!(transport.sync_calls >= 1);
+        assert!(transport.batch_sync_calls >= 1);
         assert!(output.documents_synced >= 1);
+    }
+
+    #[tokio::test]
+    async fn pull_missing_documents_saves_snapshots_without_followup_sync_roundtrips() {
+        let sdk = test_sdk();
+        let device_id = "device-a";
+        let root_doc = remi_things_crdt::Schema::init_root_doc("server-device")
+            .expect("init root doc");
+        let root_head = local_canonical_head(&root_doc).expect("root head");
+
+        let mut transport = MockSyncTransport {
+            list_calls: 0,
+            snapshot_calls: 0,
+            batch_snapshot_calls: 0,
+            batch_sync_calls: 0,
+            sync_calls: 0,
+            server_keys: vec![ServerCrdtDocumentKey {
+                document_uuid: "root".to_string(),
+                data_type: 1,
+                canonical_head: root_head,
+            }],
+            snapshots: std::collections::HashMap::from([(
+                ("root".to_string(), 1),
+                (root_doc.clone(), "2026-03-25T00:00:00Z".to_string()),
+            )]),
+        };
+
+        let prefetched_keys = transport.server_keys.clone();
+
+        let output = pull_missing_documents(
+            &sdk,
+            &mut transport,
+            device_id,
+            Some(&prefetched_keys),
+            None,
+        )
+        .await
+        .expect("pull_missing_documents succeeds");
+
+        assert_eq!(transport.list_calls, 0);
+        assert_eq!(transport.snapshot_calls, 0);
+        assert_eq!(transport.batch_snapshot_calls, 1);
+        assert_eq!(transport.sync_calls, 0);
+        assert_eq!(output.documents_pulled, 1);
+        assert_eq!(output.last_sync_at.as_deref(), Some("2026-03-25T00:00:00Z"));
+        assert_eq!(output.snapshot_downloads, 1);
+
+        let saved = sdk
+            .crdt_get_document("root", "root")
+            .expect("load root")
+            .expect("root exists after pull");
+        assert_eq!(saved.automerge_doc, root_doc);
+        assert!(!saved.dirty);
+    }
+
+    #[tokio::test]
+    async fn phase1_batches_same_priority_documents_into_one_transport_call() {
+        let sdk = test_sdk();
+        let device_id = "device-a";
+        seed_dirty_collection_document(
+            &sdk,
+            "collection-a",
+            device_id,
+            advanced_sync_state_for(device_id),
+        );
+        seed_dirty_collection_document(
+            &sdk,
+            "collection-b",
+            device_id,
+            advanced_sync_state_for(device_id),
+        );
+
+        let mut transport = MockSyncTransport {
+            list_calls: 0,
+            snapshot_calls: 0,
+            batch_snapshot_calls: 0,
+            batch_sync_calls: 0,
+            sync_calls: 0,
+            server_keys: Vec::new(),
+            snapshots: std::collections::HashMap::new(),
+        };
+
+        let output = sync_v3_documents_with_transport_mode(
+            &sdk,
+            &mut transport,
+            device_id,
+            ThingsSyncMode::Full,
+        )
+        .await
+        .expect("batched phase1 sync succeeds");
+
+        assert_eq!(transport.batch_sync_calls, 1);
+        assert_eq!(transport.sync_calls, 2);
+        assert_eq!(output.documents_synced, 2);
     }
 }

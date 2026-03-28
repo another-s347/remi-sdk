@@ -490,6 +490,20 @@ pub struct ChatRuntimeConfig {
     pub max_auto_resumes: usize,
     /// Execution backend for chat requests.
     pub backend: ChatRuntimeBackend,
+    /// Consent-gated tracing configuration shared by remote and local-wasm backends.
+    pub tracing: ChatTracingConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatTracingConfig {
+    /// True only when the user has explicitly allowed reporting/tracing.
+    pub reporting_enabled: bool,
+    /// Optional LangSmith API key. For remote mode this may be omitted and resolved server-side.
+    pub langsmith_api_key: Option<String>,
+    /// Optional LangSmith project/session name.
+    pub langsmith_project: Option<String>,
+    /// Optional LangSmith API URL override.
+    pub langsmith_api_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -526,6 +540,7 @@ impl Default for ChatRuntimeConfig {
             request_timeout_secs: 120,
             max_auto_resumes: 16,
             backend: ChatRuntimeBackend::RemoteServer,
+            tracing: ChatTracingConfig::default(),
         }
     }
 }

@@ -8,6 +8,7 @@ use remi_agentloop::agent::Agent;
 use remi_agentloop::prelude::ToolDefinition;
 use remi_agentloop::protocol::ProtocolEvent;
 use remi_agentloop::state::AgentState;
+use remi_agentloop::tracing::{InterruptTrace, LangSmithTracer, RunEndTrace, RunStartTrace, RunStatus, Tracer};
 use remi_agentloop::types::{
     Content, ContentPart, FunctionCall, ImageUrlDetail, LoopInput, Message, MessageId, Role,
     ToolCallMessage, ToolCallOutcome,
@@ -24,6 +25,192 @@ use crate::remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 
 pub(crate) type ChatEventStream =
     Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, String>> + Send>>;
+
+struct LocalWasmRunTracer {
+    tracer: LangSmithTracer,
+    model: String,
+    input_messages: Vec<Message>,
+    run_id: Option<remi_agentloop::types::RunId>,
+    thread_id: Option<remi_agentloop::types::ThreadId>,
+    run_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    metadata: Option<JsonValue>,
+    assistant_output: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+impl LocalWasmRunTracer {
+    fn from_loop_input(loop_input: &LoopInput, config: &ChatRuntimeConfig) -> Option<Self> {
+        if !config.tracing.reporting_enabled {
+            return None;
+        }
+
+        let api_key = config
+            .tracing
+            .langsmith_api_key
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())?
+            .clone();
+
+        let mut tracer = LangSmithTracer::new(api_key);
+        if let Some(project) = config
+            .tracing
+            .langsmith_project
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            tracer = tracer.with_project(project.clone());
+        }
+        if let Some(api_url) = config
+            .tracing
+            .langsmith_api_url
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            tracer = tracer.with_api_url(api_url.clone());
+        }
+
+        match loop_input {
+            LoopInput::Start {
+                content,
+                history,
+                model,
+                metadata,
+                ..
+            } => {
+                let mut input_messages = history.clone();
+                input_messages.push(Message {
+                    id: MessageId::new(),
+                    role: Role::User,
+                    content: content.clone(),
+                    tool_calls: Some(Vec::new()),
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                    metadata: None,
+                });
+
+                Some(Self {
+                    tracer,
+                    model: model.clone().unwrap_or_else(|| "local-wasm".to_string()),
+                    input_messages,
+                    run_id: None,
+                    thread_id: None,
+                    run_started_at: None,
+                    metadata: metadata.clone(),
+                    assistant_output: String::new(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                })
+            }
+            LoopInput::Resume { .. } | LoopInput::Cancel { .. } => None,
+        }
+    }
+
+    async fn on_protocol_event(&mut self, event: &ProtocolEvent) {
+        match event {
+            ProtocolEvent::RunStart {
+                thread_id,
+                run_id,
+                metadata,
+            } => {
+                let timestamp = chrono::Utc::now();
+                let run_id = remi_agentloop::types::RunId(run_id.clone());
+                let thread_id = remi_agentloop::types::ThreadId(thread_id.clone());
+                self.run_id = Some(run_id.clone());
+                self.thread_id = Some(thread_id.clone());
+                self.run_started_at = Some(timestamp);
+                if metadata.is_some() {
+                    self.metadata = metadata.clone();
+                }
+                self.tracer
+                    .on_run_start(&RunStartTrace {
+                        thread_id: Some(thread_id.clone()),
+                        run_id: run_id.clone(),
+                        model: self.model.clone(),
+                        system_prompt: None,
+                        input_messages: self.input_messages.clone(),
+                        metadata: self.metadata.clone(),
+                        timestamp,
+                    })
+                    .await;
+            }
+            ProtocolEvent::Delta { content, .. } => {
+                self.assistant_output.push_str(content);
+            }
+            ProtocolEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                self.prompt_tokens = *prompt_tokens;
+                self.completion_tokens = *completion_tokens;
+            }
+            ProtocolEvent::Interrupt { interrupts } => {
+                if let Some(run_id) = &self.run_id {
+                    self.tracer
+                        .on_interrupt(&InterruptTrace {
+                            run_id: run_id.clone(),
+                            interrupts: interrupts.clone(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                }
+            }
+            ProtocolEvent::Done => {
+                self.finish(RunStatus::Completed, None).await;
+            }
+            ProtocolEvent::Cancelled => {
+                self.finish(RunStatus::Interrupted, None).await;
+            }
+            ProtocolEvent::Error { message, .. } => {
+                self.finish(RunStatus::Error, Some(message.clone())).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn finish(&mut self, status: RunStatus, error: Option<String>) {
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+
+        let output_messages = if self.assistant_output.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![Message {
+                id: MessageId::new(),
+                role: Role::Assistant,
+                content: Content::Text(self.assistant_output.clone()),
+                tool_calls: Some(Vec::new()),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                metadata: None,
+            }]
+        };
+
+        let started_at = self.run_started_at.unwrap_or_else(chrono::Utc::now);
+        let ended_at = chrono::Utc::now();
+
+        self.tracer
+            .on_run_end(&RunEndTrace {
+                run_id,
+                status,
+                output_messages,
+                total_turns: 1,
+                total_prompt_tokens: self.prompt_tokens,
+                total_completion_tokens: self.completion_tokens,
+                duration: (ended_at - started_at)
+                    .to_std()
+                    .unwrap_or_default(),
+                error,
+                timestamp: ended_at,
+            })
+            .await;
+        self.tracer.on_flush().await;
+        self.run_id = None;
+    }
+}
 
 pub(crate) fn load_agent(source: &ChatLocalWasmSource) -> Result<Arc<WasmAgentWithHttp>, String> {
     let agent = match source {
@@ -61,12 +248,16 @@ pub(crate) async fn start_stream(
 
     let stream = agent.clone();
     let (tx, rx) = mpsc::channel(64);
+    let mut run_tracer = LocalWasmRunTracer::from_loop_input(&loop_input, config);
 
     tokio::spawn(async move {
         match stream.chat(loop_input).await {
             Ok(event_stream) => {
                 let mut event_stream = std::pin::pin!(event_stream);
                 while let Some(event) = event_stream.next().await {
+                    if let Some(tracer) = run_tracer.as_mut() {
+                        tracer.on_protocol_event(&event).await;
+                    }
                     tracing::debug!(
                         event_type = protocol_event_type_name(&event),
                         "[local_wasm] received guest protocol event"
@@ -382,6 +573,8 @@ fn build_start_metadata(
         .as_object_mut()
         .ok_or_else(|| "Chat start metadata must be a JSON object".to_string())?;
 
+    normalize_metadata_object_to_string_values(metadata_obj);
+
     metadata_obj
         .entry("session_id".to_string())
         .or_insert_with(|| JsonValue::String(session_id.to_string()));
@@ -393,6 +586,9 @@ fn build_start_metadata(
             .entry("device_id".to_string())
             .or_insert_with(|| JsonValue::String(config.device_id.clone()));
     }
+    metadata_obj
+        .entry("reporting_consent".to_string())
+		.or_insert_with(|| JsonValue::String(config.tracing.reporting_enabled.to_string()));
 
     if let ChatRuntimeBackend::LocalWasm(local) = &config.backend {
         if !local.api_key.trim().is_empty() {
@@ -417,6 +613,39 @@ fn build_start_metadata(
             metadata_obj
                 .entry("model".to_string())
                 .or_insert_with(|| JsonValue::String(model.clone()));
+        }
+    }
+
+    if config.tracing.reporting_enabled {
+        if let Some(api_key) = config
+            .tracing
+            .langsmith_api_key
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            metadata_obj
+                .entry("langsmith_api_key".to_string())
+                .or_insert_with(|| JsonValue::String(api_key.clone()));
+        }
+        if let Some(project) = config
+            .tracing
+            .langsmith_project
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            metadata_obj
+                .entry("langsmith_project".to_string())
+                .or_insert_with(|| JsonValue::String(project.clone()));
+        }
+        if let Some(api_url) = config
+            .tracing
+            .langsmith_api_url
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            metadata_obj
+                .entry("langsmith_api_url".to_string())
+                .or_insert_with(|| JsonValue::String(api_url.clone()));
         }
     }
 
@@ -815,6 +1044,27 @@ fn prost_struct_to_json(value: &ProstStruct) -> JsonValue {
     JsonValue::Object(map)
 }
 
+fn normalize_metadata_object_to_string_values(metadata_obj: &mut serde_json::Map<String, JsonValue>) {
+    metadata_obj.retain(|_, value| {
+        match value {
+            JsonValue::Null => false,
+            JsonValue::String(_) => true,
+            JsonValue::Bool(inner) => {
+                *value = JsonValue::String(inner.to_string());
+                true
+            }
+            JsonValue::Number(inner) => {
+                *value = JsonValue::String(inner.to_string());
+                true
+            }
+            JsonValue::Array(_) | JsonValue::Object(_) => {
+                *value = JsonValue::String(value.to_string());
+                true
+            }
+        }
+    });
+}
+
 fn prost_value_to_json(value: &ProstValue) -> JsonValue {
     use prost_types::value::Kind;
 
@@ -872,6 +1122,12 @@ mod tests {
                 base_url: Some("https://example.com/v1".to_string()),
                 model: Some("gpt-test".to_string()),
             }),
+            tracing: crate::chat_types::ChatTracingConfig {
+                reporting_enabled: true,
+                langsmith_api_key: Some("ls-test".to_string()),
+                langsmith_project: Some("remi-local".to_string()),
+                langsmith_api_url: Some("https://smith.example.com".to_string()),
+            },
             ..Default::default()
         };
 
@@ -904,6 +1160,74 @@ mod tests {
                 .get("traffic_mark")
                 .and_then(|value| value.as_str()),
             Some("local_wasm")
+        );
+        assert_eq!(
+            metadata
+                .get("reporting_consent")
+                .and_then(|value| value.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            metadata.get("langsmith_api_key").and_then(|value| value.as_str()),
+            Some("ls-test")
+        );
+    }
+
+    #[test]
+    fn start_metadata_normalizes_existing_non_string_values() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "share_entry".to_string(),
+            ProstValue {
+                kind: Some(prost_types::value::Kind::BoolValue(true)),
+            },
+        );
+        fields.insert(
+            "retry_count".to_string(),
+            ProstValue {
+                kind: Some(prost_types::value::Kind::NumberValue(2.0)),
+            },
+        );
+        fields.insert(
+            "nested".to_string(),
+            ProstValue {
+                kind: Some(prost_types::value::Kind::StructValue(ProstStruct {
+                    fields: std::collections::BTreeMap::from([(
+                        "flag".to_string(),
+                        ProstValue {
+                            kind: Some(prost_types::value::Kind::BoolValue(false)),
+                        },
+                    )]),
+                })),
+            },
+        );
+
+        let existing = ProstStruct { fields };
+        let config = ChatRuntimeConfig {
+            backend: ChatRuntimeBackend::LocalWasm(ChatLocalWasmConfig {
+                source: ChatLocalWasmSource::Bytes(Arc::new(vec![])),
+                api_key: String::new(),
+                base_url: None,
+                model: None,
+            }),
+            ..Default::default()
+        };
+
+        let metadata = build_start_metadata(Some(&existing), &config, "session-123")
+            .expect("metadata")
+            .expect("metadata object");
+
+        assert_eq!(
+            metadata.get("share_entry").and_then(|value| value.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            metadata.get("retry_count").and_then(|value| value.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            metadata.get("nested").and_then(|value| value.as_str()),
+            Some("{\"flag\":false}")
         );
     }
 

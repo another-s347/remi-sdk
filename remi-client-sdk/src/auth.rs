@@ -217,6 +217,7 @@ impl AuthClient {
 
     async fn clear_credentials(&self) {
         *self.credentials.write().await = None;
+        crate::profile::profile_clear_cache().await;
     }
 
     async fn logout_with_access_token(&self, access_token: String) -> Result<LogoutResponse> {

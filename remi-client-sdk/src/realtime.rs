@@ -322,6 +322,14 @@ async fn run_single_connection(
                     Message::Text(text) => {
                         let envelope: PhoenixEnvelope = serde_json::from_str(text.as_ref())
                             .map_err(|error| format!("invalid realtime frame: {error}"))?;
+                        if envelope.topic == topic || matches!(envelope.event.as_str(), "broadcast" | "phx_reply" | "phx_error" | "phx_close") {
+                            tracing::info!(
+                                user_id = %session.user_id,
+                                envelope_topic = %envelope.topic,
+                                envelope_event = %envelope.event,
+                                "Supabase Realtime frame received"
+                            );
+                        }
                         if envelope.topic == topic && envelope.event == "phx_reply" && envelope.ref_id.as_deref() == Some(join_ref.as_str()) {
                             let status = envelope.payload.get("status").and_then(Value::as_str).unwrap_or_default();
                             if status != "ok" {
@@ -347,12 +355,23 @@ async fn run_single_connection(
                             if broadcast.event == "remi_event" {
                                 match serde_json::from_value::<RemiRealtimeEvent>(broadcast.payload) {
                                     Ok(event) => {
+                                        tracing::info!(
+                                            user_id = %session.user_id,
+                                            event = %describe_realtime_event(&event),
+                                            "Supabase Realtime remi_event received"
+                                        );
                                         let _ = event_tx.send(event);
                                     }
                                     Err(error) => {
                                         tracing::warn!(%error, "Discarding invalid remi_event payload");
                                     }
                                 }
+                            } else {
+                                tracing::info!(
+                                    user_id = %session.user_id,
+                                    broadcast_event = %broadcast.event,
+                                    "Ignoring non-remi_event realtime broadcast"
+                                );
                             }
                         }
                     }
@@ -409,6 +428,15 @@ fn next_ref_string(next_ref: &mut u64) -> String {
     let current = *next_ref;
     *next_ref += 1;
     current.to_string()
+}
+
+fn describe_realtime_event(event: &RemiRealtimeEvent) -> &'static str {
+    match event {
+        RemiRealtimeEvent::ThingsDocChanged { .. } => "things_doc_changed",
+        RemiRealtimeEvent::TriggerFired { .. } => "trigger_fired",
+        RemiRealtimeEvent::ChatReply { .. } => "chat_reply",
+        RemiRealtimeEvent::SyncRequest => "sync_request",
+    }
 }
 
 #[cfg(test)]

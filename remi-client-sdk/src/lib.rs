@@ -45,6 +45,7 @@ pub use chat_client::{
 pub use chat_runtime::ChatRuntime;
 pub use chat_types::{
     CachedMessage, ChatLocalWasmConfig, ChatLocalWasmSource, ChatRunState, ChatRunStatus,
+    ChatTracingConfig,
     ChatRuntimeBackend, ChatRuntimeConfig, ChatRuntimeEvent, InterruptAction, PendingInterrupt,
 };
 pub use external_tools::ExternalToolExecutor;

@@ -5,7 +5,7 @@ edition = "2024"
 resolver = "2"
 
 [dependencies]
-remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "e05632ba99e887f2e293fb23a19db0dff137610c", default-features = false }
+remi-agentloop = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "e05632ba99e887f2e293fb23a19db0dff137610c", default-features = false, features = ["native", "tracing-langsmith"] }
 remi-agentloop-wasm = { git = "https://github.com/another-s347/remi-agentloop.git", rev = "e05632ba99e887f2e293fb23a19db0dff137610c", default-features = false, features = ["http-host"] }
 remi-things-crdt = { path = "../remi-things-crdt" }
 rule-trigger-engine = { path = "../rule-trigger-engine" }

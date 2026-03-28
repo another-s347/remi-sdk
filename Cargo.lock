@@ -2984,6 +2984,7 @@ dependencies = [
  "remi-agentloop-transport",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-stream",
 ]
 
@@ -2998,6 +2999,7 @@ dependencies = [
  "futures",
  "pin-project-lite",
  "remi-agentloop-macros",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3062,8 +3064,10 @@ dependencies = [
  "async-stream",
  "futures",
  "remi-agentloop-core",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-stream",
  "tokio-util",
 ]

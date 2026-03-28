@@ -21,8 +21,14 @@ use proto::public_api::v1::{
     UpdateProfileRequest, UpdateProfileResponse, public_service_client::PublicServiceClient,
 };
 
-use crate::auth::auth_get_bearer_token;
+use crate::auth::{auth_get_bearer_token, auth_get_user_id};
 use crate::transport::{SharedTransport, configure_shared_transport};
+
+#[derive(Debug, Clone)]
+struct CachedProfileEntry {
+    user_id: String,
+    profile: ProfileInfo,
+}
 
 /// Profile client for managing user profile (display_name, avatar)
 #[derive(Clone)]
@@ -194,9 +200,69 @@ impl ProfileClient {
 // ========== Global singleton + FRB-exposed functions ==========
 
 static PROFILE_CLIENT: OnceCell<Arc<RwLock<Option<Arc<ProfileClient>>>>> = OnceCell::new();
+static PROFILE_CACHE: OnceCell<Arc<RwLock<Option<CachedProfileEntry>>>> = OnceCell::new();
 
 fn profile_client_store() -> &'static Arc<RwLock<Option<Arc<ProfileClient>>>> {
     PROFILE_CLIENT.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+fn profile_cache_store() -> &'static Arc<RwLock<Option<CachedProfileEntry>>> {
+    PROFILE_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+fn profile_info_from_response(resp: ProfileResponse) -> ProfileInfo {
+    ProfileInfo {
+        user_id: resp.user_id,
+        display_name: resp.display_name,
+        avatar_url: resp.avatar_url,
+        email: resp.email,
+    }
+}
+
+fn profile_info_from_update_response(resp: UpdateProfileResponse) -> Result<ProfileInfo, String> {
+    let profile = resp.profile.ok_or_else(|| "No profile in response".to_string())?;
+    Ok(ProfileInfo {
+        user_id: profile.user_id,
+        display_name: profile.display_name,
+        avatar_url: profile.avatar_url,
+        email: profile.email,
+    })
+}
+
+async fn profile_cache_get_for_current_user() -> Option<ProfileInfo> {
+    let current_user_id = auth_get_user_id().await?;
+    let guard = profile_cache_store().read().await;
+    match guard.as_ref() {
+        Some(entry) if entry.user_id == current_user_id => Some(entry.profile.clone()),
+        _ => None,
+    }
+}
+
+async fn profile_cache_set(profile: &ProfileInfo) {
+    let mut guard = profile_cache_store().write().await;
+    guard.replace(CachedProfileEntry {
+        user_id: profile.user_id.clone(),
+        profile: profile.clone(),
+    });
+}
+
+async fn profile_cache_update_avatar_for_current_user(avatar_url: &str) {
+    let Some(current_user_id) = auth_get_user_id().await else {
+        return;
+    };
+
+    let mut guard = profile_cache_store().write().await;
+    let Some(entry) = guard.as_mut() else {
+        return;
+    };
+
+    if entry.user_id == current_user_id {
+        entry.profile.avatar_url = avatar_url.to_string();
+    }
+}
+
+pub async fn profile_clear_cache() {
+    *profile_cache_store().write().await = None;
 }
 
 async fn get_profile_client() -> Result<Arc<ProfileClient>, String> {
@@ -215,16 +281,21 @@ pub async fn configure_profile_client(config_json: String) -> Result<(), String>
     Ok(())
 }
 
-/// FRB: Get user profile
-pub async fn profile_get() -> Result<ProfileInfo, String> {
+pub async fn profile_refresh() -> Result<ProfileInfo, String> {
     let client = get_profile_client().await?;
     let resp = client.get_profile().await.map_err(|e| e.to_string())?;
-    Ok(ProfileInfo {
-        user_id: resp.user_id,
-        display_name: resp.display_name,
-        avatar_url: resp.avatar_url,
-        email: resp.email,
-    })
+    let profile = profile_info_from_response(resp);
+    profile_cache_set(&profile).await;
+    Ok(profile)
+}
+
+/// FRB: Get user profile
+pub async fn profile_get() -> Result<ProfileInfo, String> {
+    if let Some(profile) = profile_cache_get_for_current_user().await {
+        return Ok(profile);
+    }
+
+    profile_refresh().await
 }
 
 /// FRB: Update user profile
@@ -237,13 +308,9 @@ pub async fn profile_update(
         .update_profile(display_name, avatar_url)
         .await
         .map_err(|e| e.to_string())?;
-    let profile = resp.profile.ok_or_else(|| "No profile in response".to_string())?;
-    Ok(ProfileInfo {
-        user_id: profile.user_id,
-        display_name: profile.display_name,
-        avatar_url: profile.avatar_url,
-        email: profile.email,
-    })
+    let profile = profile_info_from_update_response(resp)?;
+    profile_cache_set(&profile).await;
+    Ok(profile)
 }
 
 /// FRB: Upload avatar from bytes and return public URL
@@ -252,10 +319,12 @@ pub async fn profile_upload_avatar(
     file_extension: String,
 ) -> Result<String, String> {
     let client = get_profile_client().await?;
-    client
+    let avatar_url = client
         .upload_avatar(file_bytes, file_extension)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    profile_cache_update_avatar_for_current_user(&avatar_url).await;
+    Ok(avatar_url)
 }
 
 /// FRB: Upload media file (image, etc.) and return public URL

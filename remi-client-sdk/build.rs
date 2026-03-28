@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .unwrap()
         .join("proto");
-    
+
     let public_api_proto = proto_dir.join("public_api.proto");
 
     if !public_api_proto.exists() {
