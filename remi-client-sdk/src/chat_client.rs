@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
@@ -49,6 +50,7 @@ impl ChatStreamEvent {
 /// Client for chat interactions with the agent service.
 pub struct ChatClient {
     client: PublicServiceClient<Channel>,
+    shared_transport: Option<Arc<crate::transport::SharedTransport>>,
     bearer_token: String,
     request_timeout: Duration,
     device_id: String,
@@ -70,6 +72,7 @@ impl ChatClient {
 
         Ok(Self {
             client,
+            shared_transport: None,
             bearer_token: bearer_token.into(),
             request_timeout: Duration::from_secs(120),
             device_id: String::new(),
@@ -90,6 +93,7 @@ impl ChatClient {
 
         Ok(Self {
             client,
+            shared_transport: Some(transport),
             bearer_token: bearer_token.into(),
             request_timeout,
             device_id: String::new(),
@@ -109,13 +113,10 @@ impl ChatClient {
         start: Option<ChatStartInput>,
         resume: Option<ChatResumeInput>,
     ) -> Result<Vec<ChatStreamEvent>> {
-        let request = self.build_chat_request(session_id.into(), start, resume)?;
-        let request = self.add_auth_header(Request::new(request)).await?;
-
-        let response = timeout(self.request_timeout, self.client.chat(request))
-            .await
-            .context("Request timed out")?
-            .context("Failed to initiate chat stream")?;
+        let session_id = session_id.into();
+        let response = self
+            .start_chat_with_retry(session_id, start, resume)
+            .await?;
 
         let mut stream = response.into_inner();
         let mut items = Vec::new();
@@ -132,16 +133,45 @@ impl ChatClient {
 
     /// Interrupt a running chat conversation.
     pub async fn interrupt(&mut self, session_id: impl Into<String>) -> Result<bool> {
-        let request = Request::new(ChatInterruptRequest {
-            session_id: session_id.into(),
-        });
+        let session_id = session_id.into();
+        let mut retried_after_reconnect = false;
 
-        let request = self.add_auth_header(request).await?;
+        let response = loop {
+            let request = Request::new(ChatInterruptRequest {
+                session_id: session_id.clone(),
+            });
+            let request = self.add_auth_header(request).await?;
 
-        let response = timeout(self.request_timeout, self.client.chat_interrupt(request))
-            .await
-            .context("Interrupt request timed out")?
-            .context("Failed to interrupt chat")?;
+            match timeout(self.request_timeout, self.client.chat_interrupt(request)).await {
+                Ok(Ok(response)) => break response,
+                Ok(Err(status)) => {
+                    if !retried_after_reconnect
+                        && crate::transport::is_recoverable_transport_status(&status)
+                        && self.reconnect_shared_transport("chat_interrupt", status.to_string()).await?
+                    {
+                        retried_after_reconnect = true;
+                        continue;
+                    }
+
+                    return Err(anyhow::Error::new(status).context("Failed to interrupt chat"));
+                }
+                Err(_) => {
+                    if !retried_after_reconnect
+                        && self
+                            .reconnect_shared_transport(
+                                "chat_interrupt_timeout",
+                                "Interrupt request timed out".to_string(),
+                            )
+                            .await?
+                    {
+                        retried_after_reconnect = true;
+                        continue;
+                    }
+
+                    anyhow::bail!("Interrupt request timed out");
+                }
+            }
+        };
 
         Ok(response.into_inner().success)
     }
@@ -153,16 +183,14 @@ impl ChatClient {
         start: Option<ChatStartInput>,
         resume: Option<ChatResumeInput>,
     ) -> Result<impl Stream<Item = Result<ChatStreamEvent>> + Send + 'static> {
-        let request = self.build_chat_request(session_id.into(), start, resume)?;
-        let request = self.add_auth_header(Request::new(request)).await?;
-
-        let response = timeout(self.request_timeout, self.client.chat(request))
-            .await
-            .context("Request timed out")?
-            .context("Failed to initiate chat stream")?;
+        let session_id = session_id.into();
+        let response = self
+            .start_chat_with_retry(session_id, start, resume)
+            .await?;
 
         let mut grpc_stream = response.into_inner();
         let (tx, rx) = mpsc::channel::<Result<ChatStreamEvent>>(64);
+        let shared_transport = self.shared_transport.clone();
 
         tokio::spawn(async move {
             loop {
@@ -174,6 +202,11 @@ impl ChatClient {
                     }
                     Ok(None) => break,
                     Err(e) => {
+                        if crate::transport::is_recoverable_transport_status(&e) {
+                            if let Some(transport) = shared_transport.as_ref() {
+                                transport.invalidate_channel().await;
+                            }
+                        }
                         let _ = tx.send(Err(anyhow::anyhow!("Stream error: {}", e))).await;
                         break;
                     }
@@ -222,5 +255,61 @@ impl ChatClient {
         crate::auth::auth_insert_bearer_header(&mut request, &bearer_token)
             .map_err(|err| anyhow::anyhow!(err))?;
         Ok(request)
+    }
+
+    async fn start_chat_with_retry(
+        &mut self,
+        session_id: String,
+        start: Option<ChatStartInput>,
+        resume: Option<ChatResumeInput>,
+    ) -> Result<tonic::Response<tonic::codec::Streaming<ChatStreamEvent>>> {
+        let mut retried_after_reconnect = false;
+
+        loop {
+            let request = self.build_chat_request(session_id.clone(), start.clone(), resume.clone())?;
+            let request = self.add_auth_header(Request::new(request)).await?;
+
+            match timeout(self.request_timeout, self.client.chat(request)).await {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(status)) => {
+                    if !retried_after_reconnect
+                        && crate::transport::is_recoverable_transport_status(&status)
+                        && self.reconnect_shared_transport("chat", status.to_string()).await?
+                    {
+                        retried_after_reconnect = true;
+                        continue;
+                    }
+
+                    return Err(anyhow::Error::new(status).context("Failed to initiate chat stream"));
+                }
+                Err(_) => {
+                    if !retried_after_reconnect
+                        && self
+                            .reconnect_shared_transport("chat_timeout", "Request timed out".to_string())
+                            .await?
+                    {
+                        retried_after_reconnect = true;
+                        continue;
+                    }
+
+                    anyhow::bail!("Request timed out");
+                }
+            }
+        }
+    }
+
+    async fn reconnect_shared_transport(&mut self, operation: &str, reason: String) -> Result<bool> {
+        let Some(transport) = self.shared_transport.clone() else {
+            return Ok(false);
+        };
+
+        tracing::warn!(operation, reason = %reason, "[chat_client] invalidating shared transport after recoverable error");
+        transport.invalidate_channel().await;
+        let channel = transport
+            .get_channel()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
+        self.client = PublicServiceClient::new(channel);
+        Ok(true)
     }
 }

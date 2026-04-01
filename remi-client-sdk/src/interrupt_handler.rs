@@ -1,5 +1,6 @@
 //! Interrupt handler trait and registration.
 
+use async_trait::async_trait;
 use crate::chat_types::{InterruptAction, RichHandlerResult};
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -11,19 +12,22 @@ use std::sync::Arc;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Handler for a specific interrupt type
+#[async_trait]
 pub trait InterruptHandler: Send + Sync {
     /// Process the interrupt and return a plain JSON resume value.
     ///
     /// Returns `Ok(resume_value)` on success, which will be sent to continue the chat.
     /// Returns `Err(message)` if handling fails.
-    fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String>;
+    async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String>;
 
     /// Process the interrupt and return a rich result (text or multimodal).
     ///
     /// Override this method to return image or other multimodal content.
     /// The default implementation wraps the `handle` result in `RichHandlerResult::Json`.
-    fn handle_rich(&self, interrupt_id: &str, payload: &JsonValue) -> Result<RichHandlerResult, String> {
-        self.handle(interrupt_id, payload).map(RichHandlerResult::Json)
+    async fn handle_rich(&self, interrupt_id: &str, payload: &JsonValue) -> Result<RichHandlerResult, String> {
+        self.handle(interrupt_id, payload)
+            .await
+            .map(RichHandlerResult::Json)
     }
 }
 
@@ -32,7 +36,7 @@ pub trait InterruptHandler: Send + Sync {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Registry of interrupt handlers by type
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct InterruptHandlerRegistry {
     handlers: HashMap<String, Arc<dyn InterruptHandler>>,
 }
@@ -64,16 +68,16 @@ impl InterruptHandlerRegistry {
 
     /// Process an interrupt using registered handlers.
     /// Returns an InterruptAction with the interrupt_id -> resume_value mapping.
-    pub fn process(&self, interrupt_id: &str, payload: &JsonValue) -> InterruptAction {
+    pub async fn process(&self, interrupt_id: &str, payload: &JsonValue) -> InterruptAction {
         use crate::chat_types::PendingInterruptInfo;
 
         // Extract interrupt type from payload
         let interrupt_type = extract_interrupt_type(payload);
         tracing::info!(interrupt_id = %interrupt_id, interrupt_type = %interrupt_type, "[InterruptHandlerRegistry] Processing interrupt");
 
-        if let Some(handler) = self.handlers.get(&interrupt_type) {
+        if let Some(handler) = self.handlers.get(&interrupt_type).cloned() {
             tracing::info!(interrupt_type = %interrupt_type, "[InterruptHandlerRegistry] Found handler, invoking");
-            match handler.handle_rich(interrupt_id, payload) {
+            match handler.handle_rich(interrupt_id, payload).await {
                 Ok(rich_result) => {
                     tracing::info!(interrupt_type = %interrupt_type, "[InterruptHandlerRegistry] Handler succeeded, AutoResume");
                     let mut map = HashMap::new();

@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use base64::Engine as _;
 use futures::{Stream, StreamExt as FuturesStreamExt};
@@ -8,10 +9,15 @@ use remi_agentloop::agent::Agent;
 use remi_agentloop::prelude::ToolDefinition;
 use remi_agentloop::protocol::ProtocolEvent;
 use remi_agentloop::state::AgentState;
-use remi_agentloop::tracing::{InterruptTrace, LangSmithTracer, RunEndTrace, RunStartTrace, RunStatus, Tracer};
+use remi_agentloop::tracing::{
+    ExternalToolResultTrace, InterruptTrace, LangSmithTracer, ModelEndTrace,
+    ModelStartTrace, ResumeTrace, RunEndTrace, RunStartTrace, RunStatus, ToolCallTrace,
+    ToolEndTrace, ToolExecutionHandoffTrace, ToolOutcomeTrace, ToolStartTrace, Tracer,
+    TurnStartTrace,
+};
 use remi_agentloop::types::{
-    Content, ContentPart, FunctionCall, ImageUrlDetail, LoopInput, Message, MessageId, Role,
-    ToolCallMessage, ToolCallOutcome,
+    Content, ContentPart, FunctionCall, ImageUrlDetail, LoopInput, Message, MessageId,
+    ParsedToolCall, Role, RunId, ThreadId, ToolCallMessage, ToolCallOutcome,
 };
 use remi_agentloop_wasm::WasmAgentWithHttp;
 use serde_json::{Value as JsonValue, json};
@@ -26,17 +32,43 @@ use crate::remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 pub(crate) type ChatEventStream =
     Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, String>> + Send>>;
 
+#[derive(Clone)]
+struct PendingToolCallTrace {
+    id: String,
+    name: String,
+    arguments_json: String,
+    local_tool_started: bool,
+    local_tool_started_at: Option<Instant>,
+}
+
+struct PendingModelTrace {
+    turn: usize,
+    call_index: usize,
+    started_at: Instant,
+    response_text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
 struct LocalWasmRunTracer {
     tracer: LangSmithTracer,
     model: String,
     input_messages: Vec<Message>,
-    run_id: Option<remi_agentloop::types::RunId>,
-    thread_id: Option<remi_agentloop::types::ThreadId>,
+    run_id: Option<RunId>,
+    thread_id: Option<ThreadId>,
     run_started_at: Option<chrono::DateTime<chrono::Utc>>,
     metadata: Option<JsonValue>,
     assistant_output: String,
     prompt_tokens: u32,
     completion_tokens: u32,
+    current_turn: usize,
+    next_model_call_index: usize,
+    current_tool_names: Vec<String>,
+    pending_model: Option<PendingModelTrace>,
+    pending_tool_calls: Vec<PendingToolCallTrace>,
+    pending_resume_outcomes: Option<Vec<ToolOutcomeTrace>>,
+    pending_resume_payload_count: usize,
+    pending_start_custom_events: Vec<(String, JsonValue)>,
 }
 
 impl LocalWasmRunTracer {
@@ -76,6 +108,7 @@ impl LocalWasmRunTracer {
                 history,
                 model,
                 metadata,
+                extra_tools,
                 ..
             } => {
                 let mut input_messages = history.clone();
@@ -90,6 +123,11 @@ impl LocalWasmRunTracer {
                     metadata: None,
                 });
 
+                let current_tool_names = extra_tools
+                    .iter()
+                    .map(|definition| definition.function.name.clone())
+                    .collect::<Vec<_>>();
+
                 Some(Self {
                     tracer,
                     model: model.clone().unwrap_or_else(|| "local-wasm".to_string()),
@@ -101,10 +139,274 @@ impl LocalWasmRunTracer {
                     assistant_output: String::new(),
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    current_turn: 0,
+                    next_model_call_index: 0,
+                    current_tool_names,
+                    pending_model: None,
+                    pending_tool_calls: Vec::new(),
+                    pending_resume_outcomes: None,
+                    pending_resume_payload_count: 0,
+                    pending_start_custom_events: Self::pending_start_custom_events(loop_input),
                 })
             }
-            LoopInput::Resume { .. } | LoopInput::Cancel { .. } => None,
+            LoopInput::Resume { state, results } => Some(Self {
+                tracer: tracer.attach_to_existing_run(),
+                model: state.config.model.clone(),
+                input_messages: state.messages.clone(),
+                run_id: Some(state.run_id.clone()),
+                thread_id: Some(state.thread_id.clone()),
+                run_started_at: None,
+                metadata: state.config.metadata.clone(),
+                assistant_output: String::new(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                current_turn: state.turn,
+                next_model_call_index: state.model_call_seq,
+                current_tool_names: state
+                    .tool_definitions
+                    .iter()
+                    .map(|definition| definition.function.name.clone())
+                    .collect(),
+                pending_model: None,
+                pending_tool_calls: Vec::new(),
+                pending_resume_outcomes: Some(results.iter().map(Self::outcome_trace).collect()),
+                pending_resume_payload_count: results.len(),
+                pending_start_custom_events: Vec::new(),
+            }),
+            LoopInput::Cancel { .. } => None,
         }
+    }
+
+    fn pending_start_custom_events(loop_input: &LoopInput) -> Vec<(String, JsonValue)> {
+        match loop_input {
+            LoopInput::Start { extra_tools, .. } if !extra_tools.is_empty() => {
+                vec![(
+                    "tool_definitions".to_string(),
+                    serde_json::json!({
+                        "tool_definition_count": extra_tools.len(),
+                        "tool_definition_names": extra_tools.iter().map(|definition| definition.function.name.clone()).collect::<Vec<_>>(),
+                        "tool_definitions": extra_tools,
+                    }),
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn outcome_trace(outcome: &ToolCallOutcome) -> ToolOutcomeTrace {
+        match outcome {
+            ToolCallOutcome::Result {
+                tool_call_id,
+                tool_name,
+                content,
+            } => ToolOutcomeTrace {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                result: Some(content.text_content()),
+                error: None,
+            },
+            ToolCallOutcome::Error {
+                tool_call_id,
+                tool_name,
+                error,
+            } => ToolOutcomeTrace {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                result: None,
+                error: Some(error.clone()),
+            },
+        }
+    }
+
+    async fn emit_initial_resume_traces(&mut self) {
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+
+        let Some(outcomes) = self.pending_resume_outcomes.take() else {
+            return;
+        };
+
+        self.tracer
+            .on_resume(&ResumeTrace {
+                run_id: run_id.clone(),
+                payloads_count: self.pending_resume_payload_count,
+                outcomes: outcomes.clone(),
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
+
+        for outcome in outcomes {
+            self.tracer
+                .on_external_tool_result(&ExternalToolResultTrace {
+                    run_id: run_id.clone(),
+                    tool_call_id: outcome.tool_call_id,
+                    tool_name: outcome.tool_name,
+                    result: outcome.result,
+                    error: outcome.error,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await;
+        }
+    }
+
+    async fn emit_pending_start_custom_events(&mut self) {
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+
+        for (name, payload) in self.pending_start_custom_events.drain(..) {
+            let data = match payload {
+                JsonValue::Object(mut object) => {
+                    object.insert("run_id".to_string(), JsonValue::String(run_id.0.clone()));
+                    JsonValue::Object(object)
+                }
+                other => serde_json::json!({
+                    "run_id": run_id.0,
+                    "payload": other,
+                }),
+            };
+
+            self.tracer.on_custom(&name, &data).await;
+        }
+    }
+
+    fn upsert_pending_tool_call(&mut self, id: &str, name: &str) -> &mut PendingToolCallTrace {
+        if let Some(index) = self.pending_tool_calls.iter().position(|call| call.id == id) {
+            let call = &mut self.pending_tool_calls[index];
+            if call.name == "unknown" && !name.is_empty() {
+                call.name = name.to_string();
+            }
+            return call;
+        }
+
+        self.pending_tool_calls.push(PendingToolCallTrace {
+            id: id.to_string(),
+            name: if name.is_empty() {
+                "unknown".to_string()
+            } else {
+                name.to_string()
+            },
+            arguments_json: String::new(),
+            local_tool_started: false,
+            local_tool_started_at: None,
+        });
+        self.pending_tool_calls
+            .last_mut()
+            .expect("pending tool call should exist")
+    }
+
+    fn pending_tool_call_traces(&self) -> Vec<ToolCallTrace> {
+        self.pending_tool_calls
+            .iter()
+            .map(|call| ToolCallTrace {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: parse_tool_arguments_json(&call.arguments_json),
+                result: None,
+                interrupted: false,
+                duration: std::time::Duration::ZERO,
+            })
+            .collect()
+    }
+
+    async fn start_model_turn(&mut self, turn: usize) {
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+
+        let call_index = self.next_model_call_index;
+        self.next_model_call_index += 1;
+        self.current_turn = turn;
+        self.pending_model = Some(PendingModelTrace {
+            turn,
+            call_index,
+            started_at: Instant::now(),
+            response_text: String::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        });
+        self.pending_tool_calls.clear();
+
+        self.tracer
+            .on_turn_start(&TurnStartTrace {
+                run_id: run_id.clone(),
+                turn,
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
+
+        self.tracer
+            .on_model_start(&ModelStartTrace {
+                run_id,
+                turn,
+                call_index,
+                model: self.model.clone(),
+                messages: self.input_messages.clone(),
+                tools: self.current_tool_names.clone(),
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
+    }
+
+    async fn finish_pending_model(&mut self) {
+        let Some(run_id) = self.run_id.clone() else {
+            self.pending_model = None;
+            self.pending_tool_calls.clear();
+            return;
+        };
+
+        let Some(model) = self.pending_model.take() else {
+            return;
+        };
+
+        let tool_calls = self.pending_tool_call_traces();
+        self.tracer
+            .on_model_end(&ModelEndTrace {
+                run_id,
+                turn: model.turn,
+                call_index: model.call_index,
+                response_text: if model.response_text.is_empty() {
+                    None
+                } else {
+                    Some(model.response_text)
+                },
+                tool_calls,
+                prompt_tokens: model.prompt_tokens,
+                completion_tokens: model.completion_tokens,
+                duration: model.started_at.elapsed(),
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
+    }
+
+    async fn ensure_local_tool_started(&mut self, id: &str, name: &str) {
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+
+        let turn = self.current_turn;
+        let call = self.upsert_pending_tool_call(id, name);
+        if call.local_tool_started {
+            return;
+        }
+
+        call.local_tool_started = true;
+        call.local_tool_started_at = Some(Instant::now());
+        let tool_call_id = call.id.clone();
+        let tool_name = call.name.clone();
+        let arguments = parse_tool_arguments_json(&call.arguments_json);
+
+        self.tracer
+            .on_tool_start(&ToolStartTrace {
+                run_id,
+                turn,
+                tool_call_id,
+                tool_name,
+                arguments,
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
     }
 
     async fn on_protocol_event(&mut self, event: &ProtocolEvent) {
@@ -115,8 +417,8 @@ impl LocalWasmRunTracer {
                 metadata,
             } => {
                 let timestamp = chrono::Utc::now();
-                let run_id = remi_agentloop::types::RunId(run_id.clone());
-                let thread_id = remi_agentloop::types::ThreadId(thread_id.clone());
+                let run_id = RunId(run_id.clone());
+                let thread_id = ThreadId(thread_id.clone());
                 self.run_id = Some(run_id.clone());
                 self.thread_id = Some(thread_id.clone());
                 self.run_started_at = Some(timestamp);
@@ -134,9 +436,16 @@ impl LocalWasmRunTracer {
                         timestamp,
                     })
                     .await;
+                self.emit_pending_start_custom_events().await;
+            }
+            ProtocolEvent::TurnStart { turn } => {
+                self.start_model_turn(*turn).await;
             }
             ProtocolEvent::Delta { content, .. } => {
                 self.assistant_output.push_str(content);
+                if let Some(model) = self.pending_model.as_mut() {
+                    model.response_text.push_str(content);
+                }
             }
             ProtocolEvent::Usage {
                 prompt_tokens,
@@ -144,8 +453,79 @@ impl LocalWasmRunTracer {
             } => {
                 self.prompt_tokens = *prompt_tokens;
                 self.completion_tokens = *completion_tokens;
+                if let Some(model) = self.pending_model.as_mut() {
+                    model.prompt_tokens = *prompt_tokens;
+                    model.completion_tokens = *completion_tokens;
+                }
+            }
+            ProtocolEvent::ToolCallStart { id, name } => {
+                let _ = self.upsert_pending_tool_call(id, name);
+            }
+            ProtocolEvent::ToolCallDelta {
+                id,
+                arguments_delta,
+            } => {
+                let call = self.upsert_pending_tool_call(id, "unknown");
+                call.arguments_json.push_str(arguments_delta);
+            }
+            ProtocolEvent::ToolDelta { id, name, .. } => {
+                self.finish_pending_model().await;
+                self.ensure_local_tool_started(id, name).await;
+            }
+            ProtocolEvent::ToolResult { id, name, result } => {
+                self.finish_pending_model().await;
+                self.ensure_local_tool_started(id, name).await;
+
+                if let Some(run_id) = self.run_id.clone() {
+                    if let Some(call) = self.pending_tool_calls.iter_mut().find(|call| call.id == *id) {
+                        let duration = call
+                            .local_tool_started_at
+                            .map(|started_at| started_at.elapsed())
+                            .unwrap_or_default();
+                        self.tracer
+                            .on_tool_end(&ToolEndTrace {
+                                run_id,
+                                turn: self.current_turn,
+                                tool_call_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                result: Some(result.clone()),
+                                interrupted: false,
+                                error: None,
+                                duration,
+                                timestamp: chrono::Utc::now(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            ProtocolEvent::NeedToolExecution {
+                state,
+                tool_calls,
+                completed_results,
+            } => {
+                self.finish_pending_model().await;
+                self.input_messages = state.messages.clone();
+                self.current_tool_names = state
+                    .tool_definitions
+                    .iter()
+                    .map(|definition| definition.function.name.clone())
+                    .collect();
+
+                if let Some(run_id) = self.run_id.clone() {
+                    self.tracer
+                        .on_tool_execution_handoff(&ToolExecutionHandoffTrace {
+                            run_id,
+                            turn: state.turn,
+                            tool_calls: tool_calls.iter().map(Self::parsed_tool_call_trace).collect(),
+                            completed_results: completed_results.iter().map(Self::outcome_trace).collect(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                }
+                self.pending_tool_calls.clear();
             }
             ProtocolEvent::Interrupt { interrupts } => {
+                self.finish_pending_model().await;
                 if let Some(run_id) = &self.run_id {
                     self.tracer
                         .on_interrupt(&InterruptTrace {
@@ -155,17 +535,49 @@ impl LocalWasmRunTracer {
                         })
                         .await;
                 }
+                self.finish(RunStatus::Interrupted, None).await;
+            }
+            ProtocolEvent::Custom { event_type, extra } => {
+                let payload = match extra.clone() {
+                    JsonValue::Object(mut object) => {
+                        if let Some(run_id) = &self.run_id {
+                            object
+                                .entry("run_id".to_string())
+                                .or_insert_with(|| JsonValue::String(run_id.0.clone()));
+                        }
+                        JsonValue::Object(object)
+                    }
+                    other => serde_json::json!({
+                        "run_id": self.run_id.as_ref().map(|run_id| run_id.0.clone()),
+                        "payload": other,
+                    }),
+                };
+                self.tracer.on_custom(event_type, &payload).await;
             }
             ProtocolEvent::Done => {
+                self.finish_pending_model().await;
                 self.finish(RunStatus::Completed, None).await;
             }
             ProtocolEvent::Cancelled => {
+                self.finish_pending_model().await;
                 self.finish(RunStatus::Interrupted, None).await;
             }
             ProtocolEvent::Error { message, .. } => {
+                self.finish_pending_model().await;
                 self.finish(RunStatus::Error, Some(message.clone())).await;
             }
             _ => {}
+        }
+    }
+
+    fn parsed_tool_call_trace(tool_call: &ParsedToolCall) -> ToolCallTrace {
+        ToolCallTrace {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+            result: None,
+            interrupted: false,
+            duration: std::time::Duration::ZERO,
         }
     }
 
@@ -209,7 +621,18 @@ impl LocalWasmRunTracer {
             .await;
         self.tracer.on_flush().await;
         self.run_id = None;
+        self.pending_tool_calls.clear();
+        self.pending_model = None;
     }
+}
+
+fn parse_tool_arguments_json(arguments_json: &str) -> JsonValue {
+    if arguments_json.trim().is_empty() {
+        return json!({});
+    }
+
+    serde_json::from_str(arguments_json)
+        .unwrap_or_else(|_| JsonValue::String(arguments_json.to_string()))
 }
 
 pub(crate) fn load_agent(source: &ChatLocalWasmSource) -> Result<Arc<WasmAgentWithHttp>, String> {
@@ -251,6 +674,10 @@ pub(crate) async fn start_stream(
     let mut run_tracer = LocalWasmRunTracer::from_loop_input(&loop_input, config);
 
     tokio::spawn(async move {
+        if let Some(tracer) = run_tracer.as_mut() {
+            tracer.emit_initial_resume_traces().await;
+        }
+
         match stream.chat(loop_input).await {
             Ok(event_stream) => {
                 let mut event_stream = std::pin::pin!(event_stream);

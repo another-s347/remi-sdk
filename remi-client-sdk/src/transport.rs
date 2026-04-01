@@ -6,6 +6,8 @@ use decentralized_network::transport::{UnderlayAddr, udp_raw::UdpRaw};
 use once_cell::sync::{Lazy, OnceCell};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tonic::Code;
+use tonic::Status;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use tonic_conn::{NetConnector, NetConnectorOptions};
@@ -74,7 +76,7 @@ impl SharedTransport {
             return Ok(ch.clone());
         }
 
-        tracing::info!("[transport] get_channel: no cached channel, connecting...");
+        tracing::info!("[transport] get_channel: no cached channel, creating channel...");
         let channel = if let Some(connector) = self.state.connector.clone() {
             self.state
                 .endpoint
@@ -86,12 +88,11 @@ impl SharedTransport {
                     format!("Failed to connect shared transport (decenet): {err}")
                 })?
         } else {
-            self.state.endpoint.clone().connect().await.map_err(|err| {
-                tracing::error!("[transport] get_channel: TCP connect failed: {err}");
-                format!("Failed to connect shared transport (TCP): {err}")
-            })?
+            // For direct TCP server mode, keep a lazy channel so tonic can re-establish
+            // the underlying connection on the next request after transient network loss.
+            self.state.endpoint.clone().connect_lazy()
         };
-        tracing::info!("[transport] get_channel: connected successfully");
+        tracing::info!("[transport] get_channel: channel ready");
         guard.replace(channel.clone());
 
         Ok(channel)
@@ -105,6 +106,49 @@ impl SharedTransport {
                 "[transport] invalidate_channel: cached channel dropped, will reconnect on next use"
             );
         }
+    }
+}
+
+pub fn is_recoverable_transport_status(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Cancelled | Code::Unknown | Code::DeadlineExceeded
+    ) || is_recoverable_transport_message(status.message())
+}
+
+pub fn is_recoverable_transport_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "connection reset",
+        "broken pipe",
+        "connection refused",
+        "connection aborted",
+        "timed out",
+        "deadline has elapsed",
+        "transport error",
+        "tcp connect error",
+        "dns error",
+        "network unreachable",
+        "temporarily unavailable",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_recoverable_transport_message;
+
+    #[test]
+    fn detects_connection_reset_messages() {
+        assert!(is_recoverable_transport_message(
+            "transport error: connection reset by peer"
+        ));
+        assert!(is_recoverable_transport_message(
+            "deadline has elapsed while waiting for response"
+        ));
+        assert!(!is_recoverable_transport_message("permission denied"));
     }
 }
 

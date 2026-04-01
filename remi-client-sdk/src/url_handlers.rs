@@ -1,6 +1,6 @@
+use async_trait::async_trait;
 use std::time::Duration;
 
-use reqwest::blocking::Client;
 use serde_json::{Value as JsonValue, json};
 
 use crate::InterruptHandler;
@@ -10,19 +10,20 @@ use crate::interrupt_handler::InterruptHandlerRegistry;
 use crate::remi_uri::{RemiUri, RemiUriLocation};
 pub struct ResolveUriHandler;
 
+#[async_trait]
 impl InterruptHandler for ResolveUriHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let uri = extract_uri(payload)?;
-        fetch_metadata_json(uri)
+        fetch_metadata_json(uri).await
     }
 
-    fn handle_rich(
+    async fn handle_rich(
         &self,
         _interrupt_id: &str,
         payload: &JsonValue,
     ) -> Result<RichHandlerResult, String> {
         let uri = extract_uri(payload)?;
-        fetch_rich(uri)
+        fetch_rich(uri).await
     }
 }
 
@@ -81,24 +82,33 @@ fn extract_uri(payload: &JsonValue) -> Result<&str, String> {
         .ok_or_else(|| "resolve_uri requires a non-empty uri".to_string())
 }
 
-fn fetch_rich(url: &str) -> Result<RichHandlerResult, String> {
-    // Handle remi:// URIs by resolving to image bytes directly
-    if url.starts_with("remi://") {
-        return fetch_rich_remi_uri(url);
-    }
-
-    let client = Client::builder()
+fn build_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; RemiBot/1.0)")
         .redirect(reqwest::redirect::Policy::limited(5))
         .timeout(Duration::from_secs(10))
         .danger_accept_invalid_certs(false)
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
+
+async fn fetch_rich(url: &str) -> Result<RichHandlerResult, String> {
+    // Handle remi:// URIs by resolving to image bytes directly
+    if url.starts_with("remi://") {
+        return fetch_rich_remi_uri(url).await;
+    }
+
+    fetch_http_rich(url).await
+}
+
+async fn fetch_http_rich(url: &str) -> Result<RichHandlerResult, String> {
+    let client = build_http_client()?;
 
     let response = client
         .get(url)
         .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
         .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     let content_type = response
@@ -110,7 +120,7 @@ fn fetch_rich(url: &str) -> Result<RichHandlerResult, String> {
 
     if content_type.starts_with("image/") {
         const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-        let bytes = response.bytes().map_err(|e| e.to_string())?;
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
         if bytes.len() > MAX_IMAGE_BYTES {
             return Ok(RichHandlerResult::Json(json!({
                 "url": url,
@@ -131,15 +141,15 @@ fn fetch_rich(url: &str) -> Result<RichHandlerResult, String> {
     }
 
     // For HTML and other types, fall back to metadata extraction
-    fetch_metadata_json(url).map(RichHandlerResult::Json)
+    fetch_metadata_json(url).await.map(RichHandlerResult::Json)
 }
 
-fn fetch_rich_remi_uri(uri: &str) -> Result<RichHandlerResult, String> {
+async fn fetch_rich_remi_uri(uri: &str) -> Result<RichHandlerResult, String> {
     let parsed = RemiUri::parse(uri).map_err(|e| e.to_string())?;
     match parsed.location {
         RemiUriLocation::Remote => {
             // Remote is an HTTPS URL — delegate back to HTTP fetch
-            fetch_rich(&parsed.path)
+            fetch_http_rich(&parsed.path).await
         }
         RemiUriLocation::File => {
             // Absolute local path
@@ -148,7 +158,9 @@ fn fetch_rich_remi_uri(uri: &str) -> Result<RichHandlerResult, String> {
             } else {
                 format!("/{}", parsed.path)
             };
-            let bytes = std::fs::read(&path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("Cannot read {path}: {e}"))?;
             let media_type = parsed.mime_type.clone();
             Ok(RichHandlerResult::Image(ToolImagePart {
                 media_type,
@@ -167,23 +179,18 @@ fn fetch_rich_remi_uri(uri: &str) -> Result<RichHandlerResult, String> {
     }
 }
 
-fn fetch_metadata_json(url: &str) -> Result<JsonValue, String> {
-    fetch_metadata(url)
+async fn fetch_metadata_json(url: &str) -> Result<JsonValue, String> {
+    fetch_metadata(url).await
 }
 
-fn fetch_metadata(url: &str) -> Result<JsonValue, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; RemiBot/1.0)")
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .timeout(Duration::from_secs(10))
-        .danger_accept_invalid_certs(false)
-        .build()
-        .map_err(|e| e.to_string())?;
+async fn fetch_metadata(url: &str) -> Result<JsonValue, String> {
+    let client = build_http_client()?;
 
     let response = client
         .get(url)
         .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
         .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     let content_type = response
@@ -208,7 +215,7 @@ fn fetch_metadata(url: &str) -> Result<JsonValue, String> {
         }));
     }
 
-    let body = response.text().map_err(|e| e.to_string())?;
+    let body = response.text().await.map_err(|e| e.to_string())?;
     let meta = extract_meta(&body);
 
     let title = meta
@@ -383,11 +390,12 @@ mod tests {
         assert_eq!(url, "https://example.com/page");
     }
 
-    #[test]
-    fn resolve_uri_handler_requires_uri() {
+    #[tokio::test]
+    async fn resolve_uri_handler_requires_uri() {
         let handler = ResolveUriHandler;
         let error = handler
             .handle("call-1", &json!({ "type": "resolve_uri" }))
+            .await
             .expect_err("missing uri must fail");
         assert!(error.contains("non-empty uri"));
     }

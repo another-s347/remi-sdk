@@ -23,7 +23,7 @@ pub struct ExternalToolExecutionPlan {
     pub trigger_scheduler_sync_needed: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ExternalToolExecutor {
     registry: InterruptHandlerRegistry,
 }
@@ -58,7 +58,7 @@ impl ExternalToolExecutor {
         self.registry.has_handler(interrupt_type)
     }
 
-    pub fn resolve_calls(
+    pub async fn resolve_calls(
         &self,
         calls: impl IntoIterator<Item = ExternalToolCallRequest>,
     ) -> ExternalToolExecutionPlan {
@@ -73,7 +73,7 @@ impl ExternalToolExecutor {
                 display_data: display_data.clone(),
             };
 
-            match self.registry.process(&tool_call.tool_call_id, &display_data) {
+            match self.registry.process(&tool_call.tool_call_id, &display_data).await {
                 InterruptAction::AutoResume(values) => {
                     let resume_value = values
                         .get(&tool_call.tool_call_id)
@@ -264,6 +264,7 @@ fn raw_resume_value_to_outcome(
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use serde_json::{Value as JsonValue, json};
 
     use super::{
@@ -275,8 +276,9 @@ mod tests {
 
     struct EchoHandler;
 
+    #[async_trait]
     impl InterruptHandler for EchoHandler {
-        fn handle(
+        async fn handle(
             &self,
             _interrupt_id: &str,
             payload: &JsonValue,
@@ -285,8 +287,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_calls_auto_resumes_registered_tools() {
+    #[tokio::test]
+    async fn resolve_calls_auto_resumes_registered_tools() {
         let mut executor = ExternalToolExecutor::new();
         executor.register("resolve_uri", EchoHandler);
 
@@ -294,7 +296,7 @@ mod tests {
             tool_call_id: "resolve_uri:0".to_string(),
             tool_name: "resolve_uri".to_string(),
             arguments: json!({ "uri": "https://example.com" }),
-        }]);
+        }]).await;
 
         assert!(plan.pending_calls.is_empty());
         assert_eq!(plan.resolved_results.len(), 1);
@@ -334,8 +336,8 @@ mod tests {
         assert!(payload.get("arguments").is_none());
     }
 
-    #[test]
-    fn resolve_calls_auto_resumes_get_things_when_handler_registered() {
+    #[tokio::test]
+    async fn resolve_calls_auto_resumes_get_things_when_handler_registered() {
         let mut executor = ExternalToolExecutor::new();
         executor.register("things_get_thing_markdown_request", EchoHandler);
 
@@ -343,7 +345,7 @@ mod tests {
             tool_call_id: "get_things_tool:0".to_string(),
             tool_name: "get_things_tool".to_string(),
             arguments: json!({ "uuid": "thing-1" }),
-        }]);
+        }]).await;
 
         assert!(plan.pending_calls.is_empty());
         assert_eq!(plan.resolved_results.len(), 1);

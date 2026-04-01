@@ -1,5 +1,6 @@
 //! Built-in interrupt handlers for Things operations and Trigger publishing.
 
+use async_trait::async_trait;
 use crate::TriggerSdk;
 use crate::external_tools::ExternalToolExecutor;
 use crate::interrupt_handler::{InterruptHandler, extract_interrupt_data};
@@ -205,8 +206,9 @@ impl CollectionAddedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for CollectionAddedHandler {
-    fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::debug!(
             interrupt_id = %interrupt_id,
             payload = %payload,
@@ -266,8 +268,9 @@ impl CollectionEditedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for CollectionEditedHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_collection_edited");
         let info: ThingCollectionInfo = if data.get("collection").is_some() {
             let env: ThingsCollectionEnvelope = serde_json::from_value(data)
@@ -312,8 +315,9 @@ impl CollectionRemovedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for CollectionRemovedHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_collection_removed");
         let uuid = data
             .get("uuid")
@@ -343,8 +347,9 @@ impl ThingAddedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for ThingAddedHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_thing_added");
         let info = parse_thing_info(&data)?;
 
@@ -404,8 +409,9 @@ impl ThingEditedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for ThingEditedHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_thing_edited");
         let info = parse_thing_info(&data)?;
 
@@ -520,8 +526,9 @@ impl ThingRemovedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for ThingRemovedHandler {
-    fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::info!(interrupt_id = %interrupt_id, payload = %payload, "[ThingRemovedHandler] Received interrupt");
 
         let data = extract_interrupt_data(payload, "things_thing_removed");
@@ -558,8 +565,9 @@ impl ThingContentEditHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for ThingContentEditHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_thing_content_edit");
         let edit: ThingContentEdit = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse content edit: {}", e))?;
@@ -604,8 +612,9 @@ impl ThingMovedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for ThingMovedHandler {
-    fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::info!(interrupt_id = %interrupt_id, payload = %payload, "[ThingMovedHandler] Received interrupt");
 
         let data = extract_interrupt_data(payload, "things_thing_moved");
@@ -706,8 +715,9 @@ impl EventsRetrieveRequestHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for EventsRetrieveRequestHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "events_retrieve_request");
         let req: EventsRetrieveRequest = match serde_json::from_value(data) {
             Ok(v) => v,
@@ -750,8 +760,9 @@ impl EventsAbstractRequestHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for EventsAbstractRequestHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "events_abstract_request");
         let req: EventsAbstractRequest =
             serde_json::from_value(data).unwrap_or(EventsAbstractRequest { top_n: None });
@@ -808,8 +819,9 @@ impl ThingsListSnapshotHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for ThingsListSnapshotHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_list_snapshot_request");
         let req: ThingsListSnapshotRequest = serde_json::from_value(data).unwrap_or_default();
 
@@ -855,8 +867,9 @@ impl ThingsGetThingMarkdownHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for ThingsGetThingMarkdownHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "things_get_thing_markdown_request");
         let req: ThingsGetThingMarkdownRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse things_get_thing_markdown_request: {e}"))?;
@@ -919,8 +932,9 @@ impl TriggerRulePublishedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for TriggerRulePublishedHandler {
-    fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::debug!(
             interrupt_id = %interrupt_id,
             payload = %payload,
@@ -1192,8 +1206,9 @@ impl TriggerRuleDeletedHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for TriggerRuleDeletedHandler {
-    fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::debug!(
             interrupt_id = %interrupt_id,
             payload = %payload,
@@ -1302,8 +1317,9 @@ impl TriggersListHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for TriggersListHandler {
-    fn handle(&self, _interrupt_id: &str, _payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, _payload: &JsonValue) -> Result<JsonValue, String> {
         let json_str = self
             .sdk
             .list_triggers_json()
@@ -1345,8 +1361,9 @@ impl TriggerTestRequestHandler {
     }
 }
 
+#[async_trait]
 impl InterruptHandler for TriggerTestRequestHandler {
-    fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         let data = extract_interrupt_data(payload, "trigger_test_request");
         let req: TriggerTestRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse trigger_test_request: {e}"))?;

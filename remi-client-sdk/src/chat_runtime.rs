@@ -2238,11 +2238,20 @@ async fn process_stream_event(
             Ok(StreamControl::Continue)
         }
         Some(chat_stream_event::Event::Cancelled(_)) => Ok(StreamControl::Cancelled),
-        Some(chat_stream_event::Event::Error(err)) => Err(if err.message.trim().is_empty() {
-            "Agent error".to_string()
-        } else {
-            err.message.clone()
-        }),
+        Some(chat_stream_event::Event::Error(err)) => {
+            tracing::error!(
+                session_id = %session_id,
+                assistant_id = %assistant_id,
+                error_message = %err.message,
+                error_code = ?err.code,
+                "Chat stream returned error event"
+            );
+            Err(if err.message.trim().is_empty() {
+                "Agent error".to_string()
+            } else {
+                err.message.clone()
+            })
+        }
         Some(chat_stream_event::Event::RunStart(_))
         | Some(chat_stream_event::Event::TurnStart(_))
         | Some(chat_stream_event::Event::Usage(_))
@@ -2276,20 +2285,26 @@ async fn handle_need_tool_execution_event(
         turn_state.record_tool_result_message(outcome);
     }
 
-    let execution_plan = {
+    let tool_calls = event
+        .tool_calls
+        .iter()
+        .map(|tool_call| ExternalToolCallRequest {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.tool_name.clone(),
+            arguments: tool_call
+                .arguments
+                .as_ref()
+                .map(prost_struct_to_json)
+                .unwrap_or_else(|| json!({})),
+        })
+        .collect::<Vec<_>>();
+
+    let external_tool_executor = {
         let s = state.read().await;
-        s.external_tool_executor.resolve_calls(
-            event.tool_calls.iter().map(|tool_call| ExternalToolCallRequest {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.tool_name.clone(),
-                arguments: tool_call
-                    .arguments
-                    .as_ref()
-                    .map(prost_struct_to_json)
-                    .unwrap_or_else(|| json!({})),
-            }),
-        )
+        s.external_tool_executor.clone()
     };
+
+    let execution_plan = external_tool_executor.resolve_calls(tool_calls).await;
 
     for outcome in &execution_plan.resolved_results {
         turn_state.record_tool_result_message(outcome);
