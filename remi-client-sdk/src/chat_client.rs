@@ -2,9 +2,8 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tokio_stream::Stream;
 use tonic::Request;
 use tonic::transport::Channel;
 
@@ -15,6 +14,9 @@ pub mod proto {
 
 use proto::{
     ChatInterruptRequest, ChatRequest, ChatResumeInput, ChatStartInput,
+    GetChatSessionBundleUploadRequest, GetChatSessionBundleUploadResponse,
+    ListChatSessionBundleUploadsRequest, ListChatSessionBundleUploadsResponse,
+    UploadChatSessionBundleRequest, UploadChatSessionBundleResponse,
     public_service_client::PublicServiceClient,
 };
 
@@ -34,6 +36,7 @@ impl ChatStreamEvent {
             Some(chat_stream_event::Event::ToolCallDelta(_)) => "tool_call_delta",
             Some(chat_stream_event::Event::ToolDelta(_)) => "tool_delta",
             Some(chat_stream_event::Event::ToolResult(_)) => "tool_result",
+            Some(chat_stream_event::Event::SubSession(_)) => "sub_session",
             Some(chat_stream_event::Event::Interrupt(_)) => "interrupt",
             Some(chat_stream_event::Event::TurnStart(_)) => "turn_start",
             Some(chat_stream_event::Event::Usage(_)) => "usage",
@@ -176,6 +179,70 @@ impl ChatClient {
         Ok(response.into_inner().success)
     }
 
+    pub async fn upload_chat_session_bundle(
+        &mut self,
+        session_id: impl Into<String>,
+        title: Option<String>,
+        feedback_kind: impl Into<String>,
+        bundle_json: String,
+        metadata: Option<prost_types::Struct>,
+    ) -> Result<UploadChatSessionBundleResponse> {
+        let request = UploadChatSessionBundleRequest {
+            session_id: session_id.into(),
+            device_id: self.device_id.clone(),
+            title: title.unwrap_or_default(),
+            feedback_kind: feedback_kind.into(),
+            bundle_json,
+            metadata,
+        };
+
+        let request = self.add_auth_header(Request::new(request)).await?;
+        let response = timeout(
+            self.request_timeout,
+            self.client.upload_chat_session_bundle(request),
+        )
+        .await
+        .context("Upload chat session bundle timed out")??
+        .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn list_chat_session_bundle_uploads(
+        &mut self,
+        limit: i32,
+        offset: i32,
+    ) -> Result<ListChatSessionBundleUploadsResponse> {
+        let request = Request::new(ListChatSessionBundleUploadsRequest { limit, offset });
+        let request = self.add_auth_header(request).await?;
+        let response = timeout(
+            self.request_timeout,
+            self.client.list_chat_session_bundle_uploads(request),
+        )
+        .await
+        .context("List chat session bundle uploads timed out")??
+        .into_inner();
+        Ok(response)
+    }
+
+    pub async fn get_chat_session_bundle_upload(
+        &mut self,
+        upload_id: impl Into<String>,
+    ) -> Result<GetChatSessionBundleUploadResponse> {
+        let request = Request::new(GetChatSessionBundleUploadRequest {
+            upload_id: upload_id.into(),
+        });
+        let request = self.add_auth_header(request).await?;
+        let response = timeout(
+            self.request_timeout,
+            self.client.get_chat_session_bundle_upload(request),
+        )
+        .await
+        .context("Get chat session bundle upload timed out")??
+        .into_inner();
+        Ok(response)
+    }
+
     /// Stream typed chat events as they arrive.
     pub async fn chat_streaming(
         &mut self,
@@ -188,33 +255,32 @@ impl ChatClient {
             .start_chat_with_retry(session_id, start, resume)
             .await?;
 
-        let mut grpc_stream = response.into_inner();
-        let (tx, rx) = mpsc::channel::<Result<ChatStreamEvent>>(64);
+        let grpc_stream = response.into_inner();
         let shared_transport = self.shared_transport.clone();
+        Ok(futures::stream::unfold(
+            (grpc_stream, shared_transport, false),
+            |(mut grpc_stream, shared_transport, finished)| async move {
+                if finished {
+                    return None;
+                }
 
-        tokio::spawn(async move {
-            loop {
                 match grpc_stream.message().await {
-                    Ok(Some(item)) => {
-                        if tx.send(Ok(item)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        if crate::transport::is_recoverable_transport_status(&e) {
+                    Ok(Some(item)) => Some((Ok(item), (grpc_stream, shared_transport, false))),
+                    Ok(None) => None,
+                    Err(error) => {
+                        if crate::transport::is_recoverable_transport_status(&error) {
                             if let Some(transport) = shared_transport.as_ref() {
                                 transport.invalidate_channel().await;
                             }
                         }
-                        let _ = tx.send(Err(anyhow::anyhow!("Stream error: {}", e))).await;
-                        break;
+                        Some((
+                            Err(anyhow::anyhow!("Stream error: {}", error)),
+                            (grpc_stream, shared_transport, true),
+                        ))
                     }
                 }
-            }
-        });
-
-        Ok(ReceiverStream::new(rx))
+            },
+        ))
     }
 
     /// Backward-compatible name retained for the multimodal start path.

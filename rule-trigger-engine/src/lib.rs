@@ -1,5 +1,5 @@
 use cel::{Context, Program};
-use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -47,10 +47,10 @@ pub enum TriggerTiming {
     /// - `0 */2 * * *` - Every 2 hours
     /// - `0 9 1 * *` - First day of every month at 9:00 AM
     Cron { expression: String },
-    /// Location change trigger
-    Location,
-    /// Network state change trigger
-    NetworkChange,
+    /// One-shot timer trigger. The literal is resolved downstream against a registration anchor.
+    Timer { value: String },
+    /// Event-based reactive trigger.
+    Event { event_type: String },
     /// Repeat frequency trigger
     RepeatFrequency { frequency: RepeatFrequency },
 }
@@ -136,6 +136,7 @@ pub type TriggerRule = Rule;
 /// Context for rule evaluation
 pub struct EvaluationContext<'a> {
     pub events: &'a [MonitoringEvent],
+    pub current_event: Option<&'a MonitoringEvent>,
     pub current_time: i64, // Unix timestamp
     pub timezone_offset: &'a str,
 }
@@ -188,7 +189,7 @@ impl TriggerConfig {
 
     /// Evaluate preconditions + conditions and return a detailed report.
     ///
-    /// - Preconditions can include both timing rules (cron/location/repeat) and boolean gate rules.
+    /// - Preconditions can include both timing rules (cron/timer/event/repeat) and boolean gate rules.
     /// - Gate preconditions are only those that are *not* timing rules and must return boolean.
     /// - Conditions must return boolean and are evaluated with AND + short-circuit.
     pub fn evaluate_detailed(
@@ -499,21 +500,18 @@ impl TriggerConfig {
     /// Extract timing configurations by evaluating CEL expressions.
     ///
     /// Sources:
-    /// - `precondition`: cron/location_change/network_change
+    /// - `precondition`: cron/timer/event
     /// - `condition`: repeat frequency
     pub fn extract_timing(&self) -> Result<Vec<TriggerTiming>, String> {
         let context = create_precondition_context();
         let mut timings = Vec::new();
 
         // Timing sources:
-        // - Precondition: cron/location_change/network_change
+        // - Precondition: cron/timer/event
         // - Condition: repeat frequency
         for rule in self.precondition.iter() {
             let expr = rule.rule.replace(' ', "");
-            if !(expr.contains("cron(")
-                || expr.contains("location_change(")
-                || expr.contains("network_change("))
-            {
+            if !(expr.contains("cron(") || expr.contains("timer(") || expr.contains("event(")) {
                 continue;
             }
 
@@ -597,10 +595,42 @@ fn is_timing_precondition(expr: &str) -> bool {
     // Anything else is treated as a gate or non-timing precondition.
     let expr = expr.replace(' ', "");
     expr.contains("cron(")
-        || expr.contains("location_change(")
-        || expr.contains("network_change(")
+        || expr.contains("timer(")
+        || expr.contains("event(")
         || expr.contains("repeat_per_day(")
         || expr.contains("repeat_per_week(")
+}
+
+pub fn resolve_timer_literal(
+    timer_value: &str,
+    anchor: DateTime<Utc>,
+    timezone_offset: &str,
+) -> Result<DateTime<Utc>, String> {
+    if let Ok(at) = DateTime::parse_from_rfc3339(timer_value) {
+        return Ok(at.with_timezone(&Utc));
+    }
+
+    if let Ok(local) = parse_local_datetime_without_offset(timer_value) {
+        let offset = parse_offset(timezone_offset);
+        return offset
+            .from_local_datetime(&local)
+            .single()
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok_or_else(|| format!("Failed to resolve local timer literal '{timer_value}' with timezone {timezone_offset}"));
+    }
+
+    let duration = parse_duration_literal(timer_value)?;
+    anchor
+        .checked_add_signed(duration)
+        .ok_or_else(|| format!("Timer literal '{timer_value}' overflowed when applied to anchor {anchor}"))
+}
+
+pub fn normalize_timer_literal(
+    timer_value: &str,
+    anchor: DateTime<Utc>,
+    timezone_offset: &str,
+) -> Result<String, String> {
+    resolve_timer_literal(timer_value, anchor, timezone_offset).map(|dt| dt.to_rfc3339())
 }
 
 fn cel_value_to_json(value: &cel::Value) -> serde_json::Value {
@@ -614,6 +644,34 @@ fn cel_value_to_json(value: &cel::Value) -> serde_json::Value {
     }
 }
 
+fn current_event_to_json(event: Option<&MonitoringEvent>) -> serde_json::Value {
+    let Some(event) = event else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+
+    let metadata = serde_json::from_str::<serde_json::Value>(&event.metadata_json)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": event.metadata_json }));
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "event_type".to_string(),
+        serde_json::Value::String(event.event_type.clone()),
+    );
+    payload.insert(
+        "timestamp".to_string(),
+        serde_json::Value::String(event.timestamp.clone()),
+    );
+    payload.insert("metadata".to_string(), metadata.clone());
+
+    if let serde_json::Value::Object(metadata_object) = metadata {
+        for (key, value) in metadata_object {
+            payload.entry(key).or_insert(value);
+        }
+    }
+
+    serde_json::Value::Object(payload)
+}
+
 /// Create a CEL context with all helper functions
 fn create_cel_context<'a>(eval_ctx: &'a EvaluationContext<'a>) -> Context<'a> {
     let mut context = Context::default();
@@ -622,6 +680,10 @@ fn create_cel_context<'a>(eval_ctx: &'a EvaluationContext<'a>) -> Context<'a> {
     let events = eval_ctx.events.to_vec();
     let current_time = eval_ctx.current_time;
     let timezone_offset = eval_ctx.timezone_offset.to_string();
+    let current_event = current_event_to_json(eval_ctx.current_event);
+
+    let _ = context.add_variable("event", current_event.clone());
+    let _ = context.add_variable("current_event", current_event);
 
     // Add event_count function: event_count(minutes, event_type) -> int
     {
@@ -730,13 +792,14 @@ fn create_precondition_context<'a>() -> Context<'a> {
         format!(r#"{{"type":"cron","expression":"{}"}}"#, expr)
     });
 
-    // location_change() -> JSON string: {"type":"location"}
-    // Trigger precondition for location-based triggers
-    context.add_function("location_change", || r#"{"type":"location"}"#.to_string());
+    // timer(value) -> JSON string: {"type":"timer","value":"..."}
+    context.add_function("timer", |value: Arc<String>| {
+        format!(r#"{{"type":"timer","value":"{}"}}"#, value)
+    });
 
-    // network_change() -> JSON string: {"type":"network_change"}
-    context.add_function("network_change", || {
-        r#"{"type":"network_change"}"#.to_string()
+    // event(name) -> JSON string: {"type":"event","event_type":"..."}
+    context.add_function("event", |event_type: Arc<String>| {
+        format!(r#"{{"type":"event","event_type":"{}"}}"#, event_type)
     });
 
     // repeat_per_day(n) -> JSON string: {"type":"repeat_frequency","per_day":n}
@@ -821,8 +884,17 @@ fn parse_timing_value(value: &cel::Value) -> Option<TriggerTiming> {
                                 expression: expr.to_string(),
                             }
                         }),
-                        "location" => Some(TriggerTiming::Location),
-                        "network_change" => Some(TriggerTiming::NetworkChange),
+                        "timer" => json.get("value").and_then(|v| v.as_str()).map(|value| {
+                            TriggerTiming::Timer {
+                                value: value.to_string(),
+                            }
+                        }),
+                        "event" => json
+                            .get("event_type")
+                            .and_then(|v| v.as_str())
+                            .map(|event_type| TriggerTiming::Event {
+                                event_type: event_type.to_string(),
+                            }),
                         "repeat_frequency" => {
                             if let Some(n) = json.get("per_day").and_then(|v| v.as_i64()) {
                                 Some(TriggerTiming::RepeatFrequency {
@@ -977,6 +1049,55 @@ fn parse_offset(tz_offset: &str) -> FixedOffset {
     })
 }
 
+fn parse_local_datetime_without_offset(value: &str) -> Result<NaiveDateTime, String> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
+        .map_err(|_| format!("Unsupported timer literal '{value}'"))
+}
+
+fn parse_duration_literal(value: &str) -> Result<chrono::Duration, String> {
+    let mut remaining = value.trim();
+    if remaining.is_empty() {
+        return Err("Timer literal must not be empty".to_string());
+    }
+
+    let mut total_millis: i64 = 0;
+    while !remaining.is_empty() {
+        let digits_end = remaining
+            .find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("Timer literal '{value}' is missing a unit after number"))?;
+        if digits_end == 0 {
+            return Err(format!("Timer literal '{value}' must start each segment with digits"));
+        }
+
+        let amount: i64 = remaining[..digits_end]
+            .parse()
+            .map_err(|_| format!("Invalid number in timer literal '{value}'"))?;
+        let unit_rest = &remaining[digits_end..];
+        let unit_end = unit_rest
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(unit_rest.len());
+        let unit = unit_rest[..unit_end].trim().to_ascii_lowercase();
+        let millis_per_unit = match unit.as_str() {
+            "ms" | "msec" | "millisecond" | "milliseconds" => 1,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+            "d" | "day" | "days" => 86_400_000,
+            _ => return Err(format!("Unsupported timer unit '{unit}' in literal '{value}'")),
+        };
+        total_millis = total_millis
+            .checked_add(amount.checked_mul(millis_per_unit).ok_or_else(|| {
+                format!("Timer literal '{value}' overflowed while parsing duration")
+            })?)
+            .ok_or_else(|| format!("Timer literal '{value}' overflowed while summing duration"))?;
+
+        remaining = unit_rest[unit_end..].trim_start();
+    }
+
+    Ok(chrono::Duration::milliseconds(total_millis))
+}
+
 fn parse_time_to_minutes(time_str: &str) -> u32 {
     let parts: Vec<&str> = time_str.split(':').collect();
     if parts.len() != 2 {
@@ -1016,6 +1137,7 @@ mod tests {
 
         let ctx = EvaluationContext {
             events: &events,
+            current_event: None,
             current_time: 2000,
             timezone_offset: "+08:00",
         };
@@ -1041,6 +1163,7 @@ mod tests {
 
         let ctx = EvaluationContext {
             events: &events,
+            current_event: None,
             current_time: 2000,
             timezone_offset: "+08:00",
         };
@@ -1069,6 +1192,7 @@ mod tests {
 
         let ctx = EvaluationContext {
             events: &events,
+            current_event: None,
             current_time: 2000,
             timezone_offset: "+08:00",
         };
@@ -1093,6 +1217,7 @@ mod tests {
         // Test at 10:00 local time for +08:00 (02:00 UTC)
         let ctx = EvaluationContext {
             events: &[],
+            current_event: None,
             current_time: 7200,
             timezone_offset: "+08:00",
         };
@@ -1121,6 +1246,7 @@ mod tests {
 
         let ctx = EvaluationContext {
             events: &events,
+            current_event: None,
             current_time: 2000,
             timezone_offset: "+08:00",
         };
@@ -1149,6 +1275,7 @@ mod tests {
 
         let ctx = EvaluationContext {
             events: &events,
+            current_event: None,
             current_time: 2000,
             timezone_offset: "+08:00",
         };
@@ -1219,37 +1346,43 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_timing_location_change() {
+    fn test_extract_timing_timer() {
         let config = TriggerConfig {
             name: "Test".to_string(),
             version: "v1".to_string(),
             precondition: vec![Rule {
-                rule: "location_change()".to_string(),
-                description: "Location change".to_string(),
+                rule: "timer('1min1s')".to_string(),
+                description: "One minute and one second later".to_string(),
             }],
             condition: vec![],
         };
 
         let timings = config.extract_timing().expect("should parse timing");
         assert_eq!(timings.len(), 1);
-        assert!(matches!(timings[0], TriggerTiming::Location));
+        assert!(matches!(
+            &timings[0],
+            TriggerTiming::Timer { value } if value == "1min1s"
+        ));
     }
 
     #[test]
-    fn test_extract_timing_network_change() {
+    fn test_extract_timing_event() {
         let config = TriggerConfig {
             name: "Test".to_string(),
             version: "v1".to_string(),
             precondition: vec![Rule {
-                rule: "network_change()".to_string(),
-                description: "Network change".to_string(),
+                rule: "event('Connectivity')".to_string(),
+                description: "Connectivity event".to_string(),
             }],
             condition: vec![],
         };
 
         let timings = config.extract_timing().expect("should parse timing");
         assert_eq!(timings.len(), 1);
-        assert!(matches!(timings[0], TriggerTiming::NetworkChange));
+        assert!(matches!(
+            &timings[0],
+            TriggerTiming::Event { event_type } if event_type == "Connectivity"
+        ));
     }
 
     #[test]
@@ -1311,8 +1444,8 @@ mod tests {
                     description: "Weekdays at 9 AM".to_string(),
                 },
                 Rule {
-                    rule: "location_change()".to_string(),
-                    description: "At work location".to_string(),
+                    rule: "event('Location')".to_string(),
+                    description: "Location event".to_string(),
                 },
             ],
             condition: vec![],
@@ -1323,7 +1456,25 @@ mod tests {
         assert!(
             matches!(&timings[0], TriggerTiming::Cron { expression } if expression == "0 9 * * 1-5")
         );
-        assert!(matches!(timings[1], TriggerTiming::Location));
+        assert!(matches!(
+            &timings[1],
+            TriggerTiming::Event { event_type } if event_type == "Location"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_timer_literal_duration() {
+        let anchor = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap();
+        let resolved = resolve_timer_literal("1min1s", anchor, "+08:00").expect("resolve timer");
+        assert_eq!(resolved.timestamp(), anchor.timestamp() + 61);
+    }
+
+    #[test]
+    fn test_resolve_timer_literal_local_datetime() {
+        let anchor = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap();
+        let resolved = resolve_timer_literal("2026-04-01T09:30:00", anchor, "+08:00")
+            .expect("resolve timer local datetime");
+        assert_eq!(resolved.to_rfc3339(), "2026-04-01T01:30:00+00:00");
     }
 
     #[test]
@@ -1355,6 +1506,7 @@ mod tests {
     fn test_evaluate_detailed_gate_blocks_conditions_when_enforced() {
         let ctx = EvaluationContext {
             events: &[],
+            current_event: None,
             current_time: 36000,
             timezone_offset: "+08:00",
         };
@@ -1380,5 +1532,39 @@ mod tests {
             report.conditions[0].outcome,
             RuleEvalOutcome::Skipped
         ));
+    }
+
+    #[test]
+    fn test_current_event_metadata_is_available_in_conditions() {
+        let events = vec![MonitoringEvent {
+            event_type: "app_foreground".to_string(),
+            timestamp: "2026-04-02T00:39:13+00:00".to_string(),
+            metadata_json: serde_json::json!({
+                "app": "VSCode",
+                "window": "editor"
+            })
+            .to_string(),
+        }];
+
+        let ctx = EvaluationContext {
+            events: &events,
+            current_event: events.first(),
+            current_time: 1_743_557_953,
+            timezone_offset: "+00:00",
+        };
+
+        let config = TriggerConfig {
+            name: "Current event metadata".to_string(),
+            version: "v1".to_string(),
+            precondition: vec![],
+            condition: vec![Rule {
+                rule: "event.app == 'VSCode' && event.event_type == 'app_foreground'".to_string(),
+                description: "Current event metadata is exposed".to_string(),
+            }],
+        };
+
+        let result = config.evaluate(&ctx);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
     }
 }

@@ -159,12 +159,15 @@ pub fn manual_resume_outcomes(
 
 fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValue {
     match tool_name {
-        "list_things_tool" => merge_tool_payload("things_list_snapshot_request", arguments),
-        "get_things_tool" => merge_tool_payload("things_get_thing_markdown_request", arguments),
+        "ls_tool" => merge_tool_payload("virtual_fs_ls_request", arguments),
+        "cat_tool" => merge_tool_payload("virtual_fs_cat_request", arguments),
+        "create_tool" => merge_tool_payload("virtual_fs_create_request", arguments),
+        "tree_tool" => merge_tool_payload("virtual_fs_tree_request", arguments),
+        "read_path_tool" => merge_tool_payload("virtual_fs_cat_request", arguments),
         "add_things_tool" => merge_tool_payload("things_thing_added", arguments),
-        "edit_things_tool" => merge_tool_payload("things_thing_edited", arguments),
-        "remove_things_tool" => merge_tool_payload("things_thing_removed", arguments),
-        "move_things_tool" => merge_tool_payload("things_thing_moved", arguments),
+        "edit_path_tool" => merge_tool_payload("virtual_fs_edit_request", arguments),
+        "delete_path_tool" => merge_tool_payload("virtual_fs_delete_request", arguments),
+        "move_path_tool" => merge_tool_payload("virtual_fs_move_request", arguments),
         "create_trigger" | "create_trigger_simple" => {
             let mut payload = merge_tool_payload("trigger_rule_published", arguments);
             payload["version"] = json!(if arguments.get("trigger_uuid").is_some() { 2 } else { 1 });
@@ -182,9 +185,6 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
             "start_iso": JsonValue::Null,
             "end_iso": JsonValue::Null,
             "manual": false,
-        }),
-        "list_triggers_tool" => json!({
-            "type": "triggers_list_request",
         }),
         "retrieve_events" => json!({
             "type": "events_retrieve_request",
@@ -212,7 +212,17 @@ fn merge_tool_payload(interrupt_type: &str, arguments: &JsonValue) -> JsonValue 
     payload.insert("type".to_string(), JsonValue::String(interrupt_type.to_string()));
 
     if let Some(object) = arguments.as_object() {
-        payload.extend(object.clone());
+        let mut object = object.clone();
+        if interrupt_type == "virtual_fs_create_request" {
+            if !object.contains_key("type_name") {
+                if let Some(kind) = object.remove("type") {
+                    object.insert("type_name".to_string(), kind);
+                }
+            } else {
+                object.remove("type");
+            }
+        }
+        payload.extend(object);
     } else {
         payload.insert("arguments".to_string(), arguments.clone());
     }
@@ -328,30 +338,97 @@ mod tests {
     }
 
     #[test]
-    fn get_things_tool_payload_matches_registered_handler_shape() {
-        let payload = tool_call_display_payload("get_things_tool", &json!({ "uuid": "thing-1" }));
+    fn read_path_tool_payload_is_aliased_to_cat_handler_shape() {
+        let payload = tool_call_display_payload("read_path_tool", &json!({ "path": "/collection/c1/things/t1/content.md" }));
 
-        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("things_get_thing_markdown_request"));
-        assert_eq!(payload.get("uuid").and_then(JsonValue::as_str), Some("thing-1"));
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("virtual_fs_cat_request"));
+        assert_eq!(payload.get("path").and_then(JsonValue::as_str), Some("/collection/c1/things/t1/content.md"));
         assert!(payload.get("arguments").is_none());
     }
 
+    #[test]
+    fn cat_tool_payload_matches_registered_handler_shape() {
+        let payload = tool_call_display_payload("cat_tool", &json!({ "path": "/collection/c1/things/t1/entries.1" }));
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("virtual_fs_cat_request"));
+        assert_eq!(payload.get("path").and_then(JsonValue::as_str), Some("/collection/c1/things/t1/entries.1"));
+        assert!(payload.get("arguments").is_none());
+    }
+
+    #[test]
+    fn create_tool_payload_matches_registered_handler_shape() {
+        let payload = tool_call_display_payload(
+            "create_tool",
+            &json!({ "parent_path": "/collection/c1/things", "type_name": "thing" }),
+        );
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("virtual_fs_create_request"));
+        assert_eq!(payload.get("parent_path").and_then(JsonValue::as_str), Some("/collection/c1/things"));
+        assert_eq!(payload.get("type_name").and_then(JsonValue::as_str), Some("thing"));
+    }
+
+    #[test]
+    fn create_tool_payload_drops_legacy_type_when_type_name_is_present() {
+        let payload = tool_call_display_payload(
+            "create_tool",
+            &json!({
+                "parent_path": "/trigger",
+                "type_name": "trigger",
+                "type": "trigger"
+            }),
+        );
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("virtual_fs_create_request"));
+        assert_eq!(payload.get("type_name").and_then(JsonValue::as_str), Some("trigger"));
+        assert!(payload.get("type").and_then(JsonValue::as_str) != Some("trigger"));
+    }
+
+    #[test]
+    fn create_tool_payload_renames_legacy_type_argument() {
+        let payload = tool_call_display_payload(
+            "create_tool",
+            &json!({ "parent_path": "/collection/c1/things", "type": "thing" }),
+        );
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("virtual_fs_create_request"));
+        assert_eq!(payload.get("type_name").and_then(JsonValue::as_str), Some("thing"));
+    }
+
     #[tokio::test]
-    async fn resolve_calls_auto_resumes_get_things_when_handler_registered() {
+    async fn resolve_calls_auto_resumes_read_path_via_cat_handler() {
         let mut executor = ExternalToolExecutor::new();
-        executor.register("things_get_thing_markdown_request", EchoHandler);
+        executor.register("virtual_fs_cat_request", EchoHandler);
 
         let plan = executor.resolve_calls([ExternalToolCallRequest {
-            tool_call_id: "get_things_tool:0".to_string(),
-            tool_name: "get_things_tool".to_string(),
-            arguments: json!({ "uuid": "thing-1" }),
+            tool_call_id: "read_path_tool:0".to_string(),
+            tool_name: "read_path_tool".to_string(),
+            arguments: json!({ "path": "/trigger/t1/rule.json" }),
         }]).await;
 
         assert!(plan.pending_calls.is_empty());
         assert_eq!(plan.resolved_results.len(), 1);
         assert_eq!(
             plan.resolved_results[0].result.as_deref(),
-            Some("{\"type\":\"things_get_thing_markdown_request\",\"uuid\":\"thing-1\"}")
+            Some("{\"path\":\"/trigger/t1/rule.json\",\"type\":\"virtual_fs_cat_request\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_calls_auto_resumes_ls_when_handler_registered() {
+        let mut executor = ExternalToolExecutor::new();
+        executor.register("virtual_fs_ls_request", EchoHandler);
+
+        let plan = executor.resolve_calls([ExternalToolCallRequest {
+            tool_call_id: "ls_tool:0".to_string(),
+            tool_name: "ls_tool".to_string(),
+            arguments: json!({ "path": "/collection/c1" }),
+        }]).await;
+
+        assert!(plan.pending_calls.is_empty());
+        assert_eq!(plan.resolved_results.len(), 1);
+        assert_eq!(
+            plan.resolved_results[0].result.as_deref(),
+            Some("{\"path\":\"/collection/c1\",\"type\":\"virtual_fs_ls_request\"}")
         );
     }
 }

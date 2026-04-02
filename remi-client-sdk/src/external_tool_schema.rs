@@ -1,23 +1,33 @@
 use prost_types::{Struct as ProstStruct, Value as ProstValue};
 use serde_json::{Value as JsonValue, json};
 
-const LOCAL_TOOL_NAMES: &[&str] = &["describe_skill", "handoff_to_deep_agent"];
-const MANAGED_EXTERNAL_TOOL_NAMES: &[&str] = &[
+const SUPPRESSED_TOOL_NAMES: &[&str] = &[
+    "describe_skill",
+    "handoff_to_deep_agent",
     "create_trigger_simple",
+    "create_trigger",
     "delete_trigger",
+];
+const MANAGED_EXTERNAL_TOOL_NAMES: &[&str] = &[
     "test_trigger",
-    "list_triggers_tool",
-    "list_things_tool",
-    "get_things_tool",
+    "ls_tool",
+    "cat_tool",
+    "create_tool",
+    "tree_tool",
     "add_things_tool",
-    "edit_things_tool",
-    "remove_things_tool",
-    "move_things_tool",
+    "edit_path_tool",
+    "delete_path_tool",
+    "move_path_tool",
     "resolve_uri",
     "retrieve_events",
     "abstract_events",
-    "create_trigger",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatAgentMode {
+    Ask,
+    Manager,
+}
 
 pub(crate) fn chat_start_extra_tools(user_state: Option<&JsonValue>) -> Vec<ProstStruct> {
     tool_definitions_for_user_state(user_state)
@@ -39,7 +49,8 @@ pub(crate) fn normalize_resume_state_tool_definitions(mut state: JsonValue) -> J
         .flatten()
         .filter(|definition| {
             tool_name(definition).is_none_or(|name| {
-                !LOCAL_TOOL_NAMES.contains(&name) && !MANAGED_EXTERNAL_TOOL_NAMES.contains(&name)
+                !SUPPRESSED_TOOL_NAMES.contains(&name)
+                    && !MANAGED_EXTERNAL_TOOL_NAMES.contains(&name)
             })
         })
         .cloned()
@@ -54,18 +65,27 @@ pub(crate) fn normalize_resume_state_tool_definitions(mut state: JsonValue) -> J
     state
 }
 
-fn deep_mode(user_state: Option<&JsonValue>) -> bool {
+fn mode_for_user_state(user_state: Option<&JsonValue>) -> ChatAgentMode {
     user_state
-        .and_then(|value| value.get("agent_mode"))
+        .and_then(|value| {
+            value
+                .get("remi_handoff")
+                .and_then(|handoff| handoff.get("current_agent"))
+                .or_else(|| value.get("agent_mode"))
+        })
         .and_then(JsonValue::as_str)
-        .is_some_and(|mode| mode == "deep")
+        .map(|mode| match mode {
+            "ask" | "light" => ChatAgentMode::Ask,
+            "manager" | "deep" => ChatAgentMode::Manager,
+            _ => ChatAgentMode::Manager,
+        })
+        .unwrap_or(ChatAgentMode::Manager)
 }
 
 fn tool_definitions_for_user_state(user_state: Option<&JsonValue>) -> Vec<JsonValue> {
-    if deep_mode(user_state) {
-        deep_tool_definitions()
-    } else {
-        light_tool_definitions()
+    match mode_for_user_state(user_state) {
+        ChatAgentMode::Ask => ask_tool_definitions(),
+        ChatAgentMode::Manager => manager_tool_definitions(),
     }
 }
 
@@ -146,10 +166,6 @@ fn str_prop(description: &str) -> JsonValue {
     json!({ "type": "string", "description": description })
 }
 
-fn bool_prop(description: &str) -> JsonValue {
-    json!({ "type": "boolean", "description": description })
-}
-
 fn int_prop(description: &str) -> JsonValue {
     json!({ "type": "integer", "description": description })
 }
@@ -171,131 +187,64 @@ fn resolve_uri() -> JsonValue {
     )
 }
 
-fn list_things_tool() -> JsonValue {
+fn tree_tool() -> JsonValue {
     tool(
-        "list_things_tool",
-        "List Things and collections stored on the device.",
+        "tree_tool",
+        "Render the virtual Remi filesystem as a Unix tree. The root is '/', with /trigger and /collection subtrees.",
         obj(
             json!({
-                "entity_type": {
-                    "type": ["string", "null"],
-                    "description": "Filter: 'all', 'thing', or 'collection'. Defaults to 'all'.",
-                    "enum": ["all", "thing", "collection", null]
-                },
-                "include_content": bool_prop("Whether to include full markdown content. Defaults to false.")
+                "path": nullable_str("Directory path to render. Defaults to '/'. Examples: '/', '/trigger', '/collection/<uuid>', '/collection/<uuid>/things/<thing_uuid>'.")
             }),
             &[],
         ),
     )
 }
 
-fn get_things_tool() -> JsonValue {
+fn edit_path_tool() -> JsonValue {
     tool(
-        "get_things_tool",
-        "Fetch the full details of a single Thing by UUID.",
-        obj(
-            json!({ "uuid": str_prop("UUID of the Thing to fetch.") }),
-            &["uuid"],
-        ),
-    )
-}
-
-fn add_things_tool() -> JsonValue {
-    tool(
-        "add_things_tool",
-        "Create a new Thing inside a collection.",
+        "edit_path_tool",
+        "Edit a file node in the virtual Remi filesystem. For metadata files such as name, trigger, status, and rule.json, omit operation and the tool defaults to overwrite. When editing status, use one of: none, in-progress, stalled, done. content.md supports overwrite, append, str_replace, and insert_at_line.",
         obj(
             json!({
-                "title": str_prop("Title of the new Thing."),
-                "collection_uuid": str_prop("UUID of the parent collection."),
-                "content": str_prop("Initial markdown content."),
-                "parent_uuid": nullable_str("UUID of a parent Thing for nesting."),
-                "uuid": nullable_str("Optional client-generated UUID.")
-            }),
-            &["title", "collection_uuid"],
-        ),
-    )
-}
-
-fn edit_things_tool() -> JsonValue {
-    tool(
-        "edit_things_tool",
-        "Edit an existing Thing.",
-        obj(
-            json!({
-                "uuid": str_prop("UUID of the Thing to edit."),
-                "edit": {
-                    "type": "object",
-                    "description": "Edit operation.",
-                    "properties": {
-                        "operation": {
-                            "type": "string",
-                            "enum": ["overwrite", "set_title", "str_replace", "insert_at_line", "append"]
-                        }
-                    },
-                    "required": ["operation"]
-                }
-            }),
-            &["uuid", "edit"],
-        ),
-    )
-}
-
-fn remove_things_tool() -> JsonValue {
-    tool(
-        "remove_things_tool",
-        "Permanently delete a Thing or collection by UUID.",
-        obj(
-            json!({ "uuid": str_prop("UUID of the entity to delete.") }),
-            &["uuid"],
-        ),
-    )
-}
-
-fn move_things_tool() -> JsonValue {
-    tool(
-        "move_things_tool",
-        "Move a Thing to a different collection.",
-        obj(
-            json!({
-                "uuid": str_prop("UUID of the Thing to move."),
-                "new_collection_uuid": str_prop("Target collection UUID."),
-                "new_parent_uuid": nullable_str("New parent Thing UUID, or null.")
-            }),
-            &["uuid", "new_collection_uuid"],
-        ),
-    )
-}
-
-fn create_trigger_simple() -> JsonValue {
-    tool(
-        "create_trigger_simple",
-        "Create a simple cron-based trigger for a Thing or collection.",
-        obj(
-            json!({
-                "name": str_prop("Display name for the trigger."),
-                "cron": str_prop("POSIX 5-field cron expression in +08:00."),
-                "condition": nullable_str("Optional CEL boolean condition expression."),
-                "bind_uuid": str_prop("UUID of the Thing or collection to bind this trigger to."),
-                "bind_type": {
-                    "type": "string",
-                    "description": "Type of binding entity.",
-                    "enum": ["thing", "collection"]
+                "path": str_prop("Absolute file path to edit, such as '/trigger/<uuid>/name' or '/collection/<collection_uuid>/things/<thing_uuid>/entries.0'."),
+                "operation": {
+                    "type": ["string", "null"],
+                    "description": "Optional edit operation. Omit it for metadata files such as name, trigger, status, and rule.json; they default to 'overwrite'. content.md also supports append, str_replace, and insert_at_line.",
+                    "enum": ["overwrite", "append", "str_replace", "insert_at_line", null]
                 },
-                "user_request": nullable_str("The original user request, for reference.")
+                "value": {
+                    "description": "Replacement or inserted value. Use a string for name, status, and content.md. Status accepts: none, in-progress, stalled, done. Use an object for rule.json and entries.{idx}."
+                },
+                "old_str": nullable_str("Required for str_replace on content.md."),
+                "new_str": nullable_str("Replacement text for str_replace on content.md."),
+                "line_number": int_prop("Required for insert_at_line on content.md. Uses the existing 1-based editor semantics, with 0 meaning prepend.")
             }),
-            &["name", "cron", "bind_uuid", "bind_type"],
+            &["path"],
         ),
     )
 }
 
-fn delete_trigger() -> JsonValue {
+fn delete_path_tool() -> JsonValue {
     tool(
-        "delete_trigger",
-        "Delete a trigger by UUID.",
+        "delete_path_tool",
+        "Delete an entity directory or entry file from the virtual Remi filesystem. Supports trigger directories, collection directories, thing directories, and entries.{idx}.",
         obj(
-            json!({ "trigger_uuid": str_prop("UUID of the trigger to delete.") }),
-            &["trigger_uuid"],
+            json!({ "path": str_prop("Absolute path to delete. Examples: '/trigger/<uuid>', '/collection/<uuid>', '/collection/<collection_uuid>/things/<thing_uuid>', '/collection/<collection_uuid>/things/<thing_uuid>/entries.0'.") }),
+            &["path"],
+        ),
+    )
+}
+
+fn move_path_tool() -> JsonValue {
+    tool(
+        "move_path_tool",
+        "Move a thing directory to another things directory in the virtual Remi filesystem.",
+        obj(
+            json!({
+                "from_path": str_prop("Source thing directory path, such as '/collection/<collection_uuid>/things/<thing_uuid>'."),
+                "to_path": str_prop("Destination things directory path, such as '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things'.")
+            }),
+            &["from_path", "to_path"],
         ),
     )
 }
@@ -309,21 +258,6 @@ fn test_trigger() -> JsonValue {
                 "trigger": str_prop("Complete trigger configuration as JSON string.")
             }),
             &["trigger"],
-        ),
-    )
-}
-
-fn list_triggers_tool() -> JsonValue {
-    tool(
-        "list_triggers_tool",
-        "List all triggers registered on the device.",
-        obj(
-            json!({
-                "search_query": nullable_str("Optional filter substring on trigger name."),
-                "limit": int_prop("Max results (default 50)."),
-                "offset": int_prop("Pagination offset (default 0).")
-            }),
-            &[],
         ),
     )
 }
@@ -342,6 +276,19 @@ fn retrieve_events() -> JsonValue {
     )
 }
 
+fn ls_tool() -> JsonValue {
+    tool(
+        "ls_tool",
+        "List a directory in the virtual Remi filesystem using the same tree-style output as tree_tool. Supports '/', '/trigger', '/collection', and nested things directories.",
+        obj(
+            json!({
+                "path": nullable_str("Directory path to list. Defaults to '/'.")
+            }),
+            &[],
+        ),
+    )
+}
+
 fn abstract_events() -> JsonValue {
     tool(
         "abstract_events",
@@ -355,60 +302,64 @@ fn abstract_events() -> JsonValue {
     )
 }
 
-fn create_trigger_full() -> JsonValue {
+fn cat_tool() -> JsonValue {
     tool(
-        "create_trigger",
-        "Create or update a rule-based trigger using JSON configuration with CEL expressions.",
+        "cat_tool",
+        "Read a virtual filesystem file. For image entries, cat_tool returns the image directly instead of JSON text. Valid file nodes include trigger name/rule.json and collection or thing name/trigger/status/content.md/entries.{idx}.",
         obj(
-            json!({
-                "trigger": str_prop("Complete trigger config as JSON string."),
-                "bind_uuid": str_prop("UUID of the Thing or collection to bind to."),
-                "bind_type": {
-                    "type": "string",
-                    "enum": ["thing", "collection"],
-                    "description": "Type of binding entity."
-                },
-                "user_request": nullable_str("The original user request."),
-                "event_analysis": nullable_str("Analysis of user's recent events."),
-                "trigger_uuid": nullable_str("Existing trigger UUID to update, omit for create.")
-            }),
-            &["trigger", "bind_uuid", "bind_type"],
+            json!({ "path": str_prop("Absolute file path to read, such as '/trigger/<uuid>/rule.json', '/collection/<collection_uuid>/trigger', or '/collection/<collection_uuid>/things/<thing_uuid>/entries.1'.") }),
+            &["path"],
         ),
     )
 }
 
-fn light_tool_definitions() -> Vec<JsonValue> {
-    vec![
-        create_trigger_simple(),
-        delete_trigger(),
-        test_trigger(),
-        list_triggers_tool(),
-        list_things_tool(),
-        get_things_tool(),
-        add_things_tool(),
-        edit_things_tool(),
-        remove_things_tool(),
-        move_things_tool(),
-        resolve_uri(),
-    ]
+fn create_tool() -> JsonValue {
+    tool(
+        "create_tool",
+        "Create a new trigger, collection, thing, or image entry from a parent path. The tool generates a new UUID automatically and returns the created UUID and path.",
+        obj(
+            json!({
+                "parent_path": str_prop("Parent path. Use '/' or '/trigger' for triggers. Use '/' or '/collection' for collections. Use '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things' for things. Use '/collection/<collection_uuid>/things/<thing_uuid>' for image entries."),
+                "type_name": {
+                    "type": "string",
+                    "description": "Entity type to create.",
+                    "enum": ["trigger", "collection", "thing", "image"]
+                },
+                "title": nullable_str("Optional initial title. Defaults to 'New Trigger', 'New Collection', or 'New Thing'. For image entries this becomes the entry title."),
+                "content": nullable_str("Optional initial markdown content for things. Ignored for triggers, collections, and images."),
+                "source_uri": nullable_str("Required for type='image'. Must be a remi:// URI, typically one of the current chat input image attachments."),
+                "bind_path": nullable_str("Optional bind target path for triggers only. Supported targets are a collection or thing path, or their trigger file path. Examples: '/collection/<collection_uuid>', '/collection/<collection_uuid>/trigger', '/collection/<collection_uuid>/things/<thing_uuid>', '/collection/<collection_uuid>/things/<thing_uuid>/trigger'.")
+            }),
+            &["parent_path", "type_name"],
+        ),
+    )
 }
 
-fn deep_tool_definitions() -> Vec<JsonValue> {
+fn ask_tool_definitions() -> Vec<JsonValue> {
     vec![
-        create_trigger_simple(),
-        delete_trigger(),
         test_trigger(),
-        list_triggers_tool(),
-        list_things_tool(),
-        get_things_tool(),
-        add_things_tool(),
-        edit_things_tool(),
-        remove_things_tool(),
-        move_things_tool(),
+        ls_tool(),
+        cat_tool(),
+        tree_tool(),
         resolve_uri(),
         retrieve_events(),
         abstract_events(),
-        create_trigger_full(),
+    ]
+}
+
+fn manager_tool_definitions() -> Vec<JsonValue> {
+    vec![
+        test_trigger(),
+        ls_tool(),
+        cat_tool(),
+        create_tool(),
+        tree_tool(),
+        edit_path_tool(),
+        delete_path_tool(),
+        move_path_tool(),
+        resolve_uri(),
+        retrieve_events(),
+        abstract_events(),
     ]
 }
 
@@ -425,18 +376,60 @@ mod tests {
     }
 
     #[test]
-    fn light_mode_omits_deep_only_tools() {
-        let names = tool_names(&light_tool_definitions());
-        assert!(names.iter().any(|name| name == "create_trigger_simple"));
-        assert!(!names.iter().any(|name| name == "retrieve_events"));
+    fn ask_mode_exposes_only_read_only_tools() {
+        let names = tool_names(&ask_tool_definitions());
+
+        assert!(names.iter().any(|name| name == "ls_tool"));
+        assert!(names.iter().any(|name| name == "cat_tool"));
+        assert!(names.iter().any(|name| name == "retrieve_events"));
+        assert!(names.iter().any(|name| name == "abstract_events"));
+        assert!(!names.iter().any(|name| name == "create_tool"));
+        assert!(!names.iter().any(|name| name == "create_trigger"));
+        assert!(!names.iter().any(|name| name == "create_trigger_simple"));
+        assert!(!names.iter().any(|name| name == "delete_trigger"));
+    }
+
+    #[test]
+    fn manager_mode_exposes_full_tool_set() {
+        let names = tool_names(&manager_tool_definitions());
+
+        assert!(names.iter().any(|name| name == "ls_tool"));
+        assert!(names.iter().any(|name| name == "cat_tool"));
+        assert!(names.iter().any(|name| name == "retrieve_events"));
+        assert!(names.iter().any(|name| name == "create_tool"));
+        assert!(!names.iter().any(|name| name == "create_trigger"));
+        assert!(!names.iter().any(|name| name == "delete_trigger"));
+        assert!(!names.iter().any(|name| name == "add_things_tool"));
+        assert!(!names.iter().any(|name| name == "create_trigger_simple"));
+    }
+
+    #[test]
+    fn namespaced_handoff_state_selects_manager_tool_set() {
+        let names = tool_names(&tool_definitions_for_user_state(Some(&json!({
+            "remi_handoff": { "current_agent": "manager" }
+        }))));
+
+        assert!(names.iter().any(|name| name == "ls_tool"));
+        assert!(names.iter().any(|name| name == "retrieve_events"));
+        assert!(!names.iter().any(|name| name == "create_trigger"));
+    }
+
+    #[test]
+    fn legacy_agent_mode_still_selects_manager_tool_set() {
+        let names = tool_names(&tool_definitions_for_user_state(Some(&json!({
+            "agent_mode": "deep"
+        }))));
+
+        assert!(names.iter().any(|name| name == "ls_tool"));
+        assert!(names.iter().any(|name| name == "retrieve_events"));
         assert!(!names.iter().any(|name| name == "create_trigger"));
     }
 
     #[test]
     fn normalize_resume_state_swaps_managed_tool_set_by_mode() {
         let mut state = json!({
-            "user_state": { "agent_mode": "deep" },
-            "tool_definitions": light_tool_definitions(),
+            "user_state": { "agent_mode": "manager" },
+            "tool_definitions": ask_tool_definitions(),
         });
         state["tool_definitions"]
             .as_array_mut()
@@ -458,11 +451,55 @@ mod tests {
         );
 
         assert!(names.iter().any(|name| name == "retrieve_events"));
-        assert!(names.iter().any(|name| name == "create_trigger"));
+        assert!(!names.iter().any(|name| name == "create_trigger"));
         assert!(names.iter().any(|name| name == "custom_external_tool"));
-        assert_eq!(
-            names.iter().filter(|name| name.as_str() == "create_trigger_simple").count(),
-            1
+        assert!(!names.iter().any(|name| name == "create_trigger_simple"));
+    }
+
+    #[test]
+    fn normalize_resume_state_uses_namespaced_handoff_mode() {
+        let state = json!({
+            "user_state": {
+                "remi_handoff": { "current_agent": "manager" }
+            },
+            "tool_definitions": ask_tool_definitions(),
+        });
+
+        let normalized = normalize_resume_state_tool_definitions(state);
+        let names = tool_names(
+            normalized["tool_definitions"]
+                .as_array()
+                .expect("normalized tool_definitions should be an array"),
         );
+
+        assert!(names.iter().any(|name| name == "ls_tool"));
+        assert!(names.iter().any(|name| name == "retrieve_events"));
+        assert!(!names.iter().any(|name| name == "create_trigger"));
+    }
+
+    #[test]
+    fn light_alias_selects_ask_tool_set() {
+        let names = tool_names(&tool_definitions_for_user_state(Some(&json!({
+            "agent_mode": "light"
+        }))));
+
+        assert!(names.iter().any(|name| name == "retrieve_events"));
+        assert!(!names.iter().any(|name| name == "create_tool"));
+        assert!(!names.iter().any(|name| name == "create_trigger"));
+    }
+
+    #[test]
+    fn edit_path_tool_only_requires_path_and_keeps_operation_optional() {
+        let schema = edit_path_tool();
+        let parameters = &schema["function"]["parameters"];
+        let required = parameters["required"]
+            .as_array()
+            .expect("required should be an array");
+
+        assert_eq!(required, &vec![json!("path")]);
+        assert!(parameters["properties"]["operation"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Omit it for metadata files"));
     }
 }

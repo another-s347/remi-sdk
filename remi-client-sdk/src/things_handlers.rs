@@ -2,8 +2,10 @@
 
 use async_trait::async_trait;
 use crate::TriggerSdk;
+use crate::chat_types::{RichHandlerResult, ToolImagePart};
 use crate::external_tools::ExternalToolExecutor;
 use crate::interrupt_handler::{InterruptHandler, extract_interrupt_data};
+use crate::remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert, ThingsSnapshot};
 use crate::types::{TriggerRegistration, TriggerRule};
 use serde::{Deserialize, Serialize};
@@ -188,6 +190,66 @@ pub struct EventsRetrieveRequest {
 pub struct EventsAbstractRequest {
     #[serde(default)]
     pub top_n: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VirtualFsTreeRequest {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VirtualFsLsRequest {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualFsCatRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VirtualFsEditRequest {
+    pub path: String,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default)]
+    pub value: Option<JsonValue>,
+    #[serde(default)]
+    pub old_str: Option<String>,
+    #[serde(default)]
+    pub new_str: Option<String>,
+    #[serde(default)]
+    pub line_number: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualFsDeleteRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualFsMoveRequest {
+    pub from_path: String,
+    pub to_path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VirtualFsCreateRequest {
+    pub parent_path: String,
+    #[serde(default)]
+    pub type_name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub source_uri: Option<String>,
+    #[serde(default)]
+    pub bind_path: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════�?
@@ -449,6 +511,7 @@ impl InterruptHandler for ThingEditedHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use serde_json::json;
 
     #[test]
@@ -511,6 +574,140 @@ mod tests {
         assert_eq!(envelope.thing.data_json, "");
         assert_eq!(envelope.thing.collection_uuid, "collection-1");
         assert_eq!(envelope.thing.parent_uuid, None);
+    }
+
+    #[tokio::test]
+    async fn virtual_fs_cat_handler_returns_image_parts_for_image_entries() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let image_path = dir.path().join("sample.png");
+        std::fs::write(&image_path, [137u8, 80, 78, 71]).expect("write image");
+
+        let sdk = Arc::new(TriggerSdk::initialize(&db_path).expect("sdk"));
+        let device_id = "device-test";
+        sdk.things_upsert_collection(
+            device_id,
+            ThingCollectionUpsert {
+                uuid: "c1".to_string(),
+                title: "Inbox".to_string(),
+                trigger_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .expect("collection");
+        sdk.things_upsert_thing(
+            device_id,
+            ThingUpsert {
+                uuid: "t1".to_string(),
+                title: "Photo".to_string(),
+                datatype: ThingDatatype::Markdown,
+                data: Some(json!({"markdown": ""})),
+                collection_uuid: "c1".to_string(),
+                trigger_uuid: None,
+                parent_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .expect("thing");
+        let image_uri = RemiUri::from_local_file(&image_path.to_string_lossy(), "image/png", device_id).to_uri_string();
+        sdk.things_add_content_entry(
+            device_id,
+            "t1",
+            crate::things_crdt::ContentEntry {
+                id: "entry-1".to_string(),
+                title: Some("Image".to_string()),
+                order: 0.0,
+                payload: crate::things_crdt::ContentEntryPayload::Image(crate::things_crdt::ImageField::new(image_uri)),
+            },
+        )
+        .expect("entry");
+
+        let handler = VirtualFsCatHandler::new(sdk, device_id.to_string());
+        let result = handler
+            .handle_rich(
+                "call-1",
+                &json!({
+                    "type": "virtual_fs_cat_request",
+                    "path": "/collection/c1/things/t1/entries.0"
+                }),
+            )
+            .await
+            .expect("cat rich result");
+
+        match result {
+            RichHandlerResult::Image(part) => {
+                assert_eq!(part.media_type, "image/png");
+                assert_eq!(part.data, vec![137u8, 80, 78, 71]);
+            }
+            RichHandlerResult::Json(other) => panic!("expected image result, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn virtual_fs_edit_handler_accepts_object_value_for_trigger_rule() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+
+        let sdk = Arc::new(TriggerSdk::initialize(&db_path).expect("sdk"));
+        let device_id = "device-test";
+        sdk.create_virtual_path(device_id, "/trigger", "trigger", Some("Watch VSCode"), None, None, None, Some("t1"))
+            .expect("create trigger");
+
+        let handler = VirtualFsEditHandler::new(sdk.clone(), device_id.to_string());
+        let result = handler
+            .handle(
+                "call-1",
+                &json!({
+                    "type": "virtual_fs_edit_request",
+                    "path": "/trigger/t1/rule.json",
+                    "value": {
+                        "precondition": [{ "description": "watch app", "rule": "event('App')" }],
+                        "condition": [{ "description": "open vscode", "rule": "event_exists_with_message(1, '', 'VSCode')" }]
+                    }
+                }),
+            )
+            .await
+            .expect("edit trigger rule");
+
+        assert_eq!(result.get("ok").and_then(JsonValue::as_bool), Some(true));
+        assert_eq!(result.get("path").and_then(JsonValue::as_str), Some("/trigger/t1/rule.json"));
+    }
+
+    #[tokio::test]
+    async fn virtual_fs_create_handler_returns_trigger_next_edit_hint() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+
+        let sdk = Arc::new(TriggerSdk::initialize(&db_path).expect("sdk"));
+        let device_id = "device-test";
+        let handler = VirtualFsCreateHandler::new(sdk, device_id.to_string());
+
+        let result = handler
+            .handle(
+                "call-1",
+                &json!({
+                    "type": "virtual_fs_create_request",
+                    "parent_path": "/trigger",
+                    "type_name": "trigger",
+                    "title": "Watch VSCode",
+                    "uuid": "trigger-1"
+                }),
+            )
+            .await
+            .expect("create trigger");
+
+        assert_eq!(result.get("path").and_then(JsonValue::as_str), Some("/trigger/trigger-1"));
+        assert_eq!(
+            result.get("next_edit_path").and_then(JsonValue::as_str),
+            Some("/trigger/trigger-1/rule.json")
+        );
+        assert!(result
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .contains("/trigger/trigger-1/rule.json"));
     }
 }
 
@@ -893,6 +1090,209 @@ impl InterruptHandler for ThingsGetThingMarkdownHandler {
                 "content_entries": content_entries,
             }
         }))
+    }
+}
+
+pub struct VirtualFsTreeHandler {
+    sdk: Arc<TriggerSdk>,
+    device_id: String,
+}
+
+impl VirtualFsTreeHandler {
+    pub fn new(sdk: Arc<TriggerSdk>, device_id: String) -> Self {
+        Self { sdk, device_id }
+    }
+}
+
+#[async_trait]
+impl InterruptHandler for VirtualFsTreeHandler {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_tree_request");
+        let req: VirtualFsTreeRequest = serde_json::from_value(data).unwrap_or_default();
+
+        self.sdk
+            .tree_virtual_path(&self.device_id, req.path.as_deref())
+            .map(JsonValue::String)
+            .map_err(handler_error_json)
+    }
+}
+
+pub struct VirtualFsLsHandler {
+    sdk: Arc<TriggerSdk>,
+    device_id: String,
+}
+
+impl VirtualFsLsHandler {
+    pub fn new(sdk: Arc<TriggerSdk>, device_id: String) -> Self {
+        Self { sdk, device_id }
+    }
+}
+
+#[async_trait]
+impl InterruptHandler for VirtualFsLsHandler {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_ls_request");
+        let req: VirtualFsLsRequest = serde_json::from_value(data).unwrap_or_default();
+
+        self.sdk
+            .ls_virtual_path(&self.device_id, req.path.as_deref())
+            .map(JsonValue::String)
+            .map_err(handler_error_json)
+    }
+}
+
+pub struct VirtualFsCatHandler {
+    sdk: Arc<TriggerSdk>,
+    device_id: String,
+}
+
+impl VirtualFsCatHandler {
+    pub fn new(sdk: Arc<TriggerSdk>, device_id: String) -> Self {
+        Self { sdk, device_id }
+    }
+}
+
+#[async_trait]
+impl InterruptHandler for VirtualFsCatHandler {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_cat_request");
+        let req: VirtualFsCatRequest = serde_json::from_value(data)
+            .map_err(|e| format!("Failed to parse virtual_fs_cat_request: {e}"))?;
+
+        self.sdk
+            .read_virtual_path(&self.device_id, &req.path)
+            .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from))
+            .map_err(handler_error_json)
+    }
+
+    async fn handle_rich(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<RichHandlerResult, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_cat_request");
+        let req: VirtualFsCatRequest = serde_json::from_value(data)
+            .map_err(|e| format!("Failed to parse virtual_fs_cat_request: {e}"))?;
+
+        match self.sdk.cat_virtual_path(&self.device_id, &req.path).map_err(handler_error_json)? {
+            crate::runtime::VirtualFsCatResult::Text(result) => {
+                serde_json::to_value(result)
+                    .map(RichHandlerResult::Json)
+                    .map_err(|e| format!("Failed to serialize cat result: {e}"))
+            }
+            crate::runtime::VirtualFsCatResult::Image { uri, .. } => {
+                load_image_part(&uri).await.map(RichHandlerResult::Image)
+            }
+        }
+    }
+}
+
+pub struct VirtualFsEditHandler {
+    sdk: Arc<TriggerSdk>,
+    device_id: String,
+}
+
+impl VirtualFsEditHandler {
+    pub fn new(sdk: Arc<TriggerSdk>, device_id: String) -> Self {
+        Self { sdk, device_id }
+    }
+}
+
+#[async_trait]
+impl InterruptHandler for VirtualFsEditHandler {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_edit_request");
+        let req: VirtualFsEditRequest = serde_json::from_value(data)
+            .map_err(|e| format!("Failed to parse virtual_fs_edit_request: {e}"))?;
+
+        self.sdk
+            .edit_virtual_path(
+                &self.device_id,
+                &req.path,
+                req.operation.as_deref().unwrap_or("overwrite"),
+                req.value.as_ref(),
+                req.old_str.as_deref(),
+                req.new_str.as_deref(),
+                req.line_number.map(|value| value.max(0) as usize),
+            )
+            .map_err(handler_error_json)
+    }
+}
+
+pub struct VirtualFsDeleteHandler {
+    sdk: Arc<TriggerSdk>,
+    device_id: String,
+}
+
+impl VirtualFsDeleteHandler {
+    pub fn new(sdk: Arc<TriggerSdk>, device_id: String) -> Self {
+        Self { sdk, device_id }
+    }
+}
+
+#[async_trait]
+impl InterruptHandler for VirtualFsDeleteHandler {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_delete_request");
+        let req: VirtualFsDeleteRequest = serde_json::from_value(data)
+            .map_err(|e| format!("Failed to parse virtual_fs_delete_request: {e}"))?;
+
+        self.sdk
+            .delete_virtual_path(&self.device_id, &req.path)
+            .map_err(handler_error_json)
+    }
+}
+
+pub struct VirtualFsMoveHandler {
+    sdk: Arc<TriggerSdk>,
+    device_id: String,
+}
+
+impl VirtualFsMoveHandler {
+    pub fn new(sdk: Arc<TriggerSdk>, device_id: String) -> Self {
+        Self { sdk, device_id }
+    }
+}
+
+#[async_trait]
+impl InterruptHandler for VirtualFsMoveHandler {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_move_request");
+        let req: VirtualFsMoveRequest = serde_json::from_value(data)
+            .map_err(|e| format!("Failed to parse virtual_fs_move_request: {e}"))?;
+
+        self.sdk
+            .move_virtual_path(&self.device_id, &req.from_path, &req.to_path)
+            .map_err(handler_error_json)
+    }
+}
+
+pub struct VirtualFsCreateHandler {
+    sdk: Arc<TriggerSdk>,
+    device_id: String,
+}
+
+impl VirtualFsCreateHandler {
+    pub fn new(sdk: Arc<TriggerSdk>, device_id: String) -> Self {
+        Self { sdk, device_id }
+    }
+}
+
+#[async_trait]
+impl InterruptHandler for VirtualFsCreateHandler {
+    async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
+        let data = extract_interrupt_data(payload, "virtual_fs_create_request");
+        let req: VirtualFsCreateRequest = serde_json::from_value(data)
+            .map_err(|e| format!("Failed to parse virtual_fs_create_request: {e}"))?;
+
+        self.sdk
+            .create_virtual_path(
+                &self.device_id,
+                &req.parent_path,
+                &req.type_name,
+                req.title.as_deref(),
+                req.content.as_deref(),
+                req.source_uri.as_deref(),
+                req.bind_path.as_deref(),
+                req.uuid.as_deref(),
+            )
+            .map_err(handler_error_json)
     }
 }
 
@@ -1452,6 +1852,34 @@ fn register_things_handlers_inner<R: ThingsHandlerRegistrar>(
         ThingsGetThingMarkdownHandler::new(sdk.clone(), device_id.clone()),
     );
     registry.register_handler(
+        "virtual_fs_ls_request",
+        VirtualFsLsHandler::new(sdk.clone(), device_id.clone()),
+    );
+    registry.register_handler(
+        "virtual_fs_tree_request",
+        VirtualFsTreeHandler::new(sdk.clone(), device_id.clone()),
+    );
+    registry.register_handler(
+        "virtual_fs_cat_request",
+        VirtualFsCatHandler::new(sdk.clone(), device_id.clone()),
+    );
+    registry.register_handler(
+        "virtual_fs_edit_request",
+        VirtualFsEditHandler::new(sdk.clone(), device_id.clone()),
+    );
+    registry.register_handler(
+        "virtual_fs_delete_request",
+        VirtualFsDeleteHandler::new(sdk.clone(), device_id.clone()),
+    );
+    registry.register_handler(
+        "virtual_fs_move_request",
+        VirtualFsMoveHandler::new(sdk.clone(), device_id.clone()),
+    );
+    registry.register_handler(
+        "virtual_fs_create_request",
+        VirtualFsCreateHandler::new(sdk.clone(), device_id.clone()),
+    );
+    registry.register_handler(
         "events_retrieve_request",
         EventsRetrieveRequestHandler::new(sdk.clone()),
     );
@@ -1475,4 +1903,75 @@ fn register_things_handlers_inner<R: ThingsHandlerRegistrar>(
         "trigger_test_request",
         TriggerTestRequestHandler::new(sdk.clone()),
     );
+}
+
+fn handler_error_json(error: anyhow::Error) -> String {
+    serde_json::from_str::<JsonValue>(&error.to_string())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| {
+            json!({
+                "error": "handler_failed",
+                "message": error.to_string(),
+            })
+            .to_string()
+        })
+}
+
+async fn load_image_part(uri: &str) -> Result<ToolImagePart, String> {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return fetch_http_image(uri).await;
+    }
+
+    if uri.starts_with("remi://") {
+        let parsed = RemiUri::parse(uri).map_err(|error| error.to_string())?;
+        return match parsed.location {
+            RemiUriLocation::Remote => fetch_http_image(&parsed.path).await,
+            RemiUriLocation::File => {
+                let path = if parsed.path.len() > 2 && parsed.path.chars().nth(1) == Some(':') {
+                    parsed.path.clone()
+                } else {
+                    format!("/{}", parsed.path)
+                };
+                let bytes = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| format!("Cannot read {path}: {e}"))?;
+                Ok(ToolImagePart {
+                    media_type: parsed.mime_type,
+                    data: bytes,
+                })
+            }
+            RemiUriLocation::Local => Err(format!(
+                "remi://local URIs require app data dir context and cannot be resolved by the generic SDK handler: {uri}"
+            )),
+            RemiUriLocation::Inline => Err(format!(
+                "remi://inline URIs are not supported by cat_tool yet: {uri}"
+            )),
+        };
+    }
+
+    let media_type = mime_from_extension(uri.rsplit('.').next().unwrap_or("jpg")).to_string();
+    let bytes = tokio::fs::read(uri)
+        .await
+        .map_err(|error| format!("Failed to read local image {uri}: {error}"))?;
+    Ok(ToolImagePart { media_type, data: bytes })
+}
+
+async fn fetch_http_image(url: &str) -> Result<ToolImagePart, String> {
+    let response = reqwest::get(url)
+        .await
+        .map_err(|error| format!("Failed to fetch image {url}: {error}"))?;
+    let media_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_else(|| mime_from_extension(url.rsplit('.').next().unwrap_or("jpg")))
+        .to_string();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read image response {url}: {error}"))?;
+    Ok(ToolImagePart {
+        media_type,
+        data: bytes.to_vec(),
+    })
 }

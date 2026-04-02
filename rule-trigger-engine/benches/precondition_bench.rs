@@ -165,9 +165,8 @@ fn generate_sample_events(count: usize) -> Vec<MonitoringEvent> {
                 3 => "notification".to_string(),
                 _ => "system".to_string(),
             },
-            message: format!("Event message {}", i),
             timestamp: (1700000000 + i as i64 * 60).to_string(), // Events 1 minute apart
-            metadata_json: format!(r#"{{"index": {}}}"#, i),
+            metadata_json: format!(r#"{{"index": {}, "message": "Event message {}"}}"#, i, i),
         })
         .collect()
 }
@@ -215,6 +214,7 @@ fn bench_condition_evaluation(c: &mut Criterion) {
             b.iter(|| {
                 let ctx = EvaluationContext {
                     events: &events,
+                    current_event: None,
                     current_time,
                     timezone_offset: "+08:00",
                 };
@@ -244,6 +244,7 @@ fn bench_condition_with_varying_events(c: &mut Criterion) {
                 b.iter(|| {
                     let ctx = EvaluationContext {
                         events,
+                        current_event: None,
                         current_time,
                         timezone_offset: "+08:00",
                     };
@@ -288,6 +289,7 @@ fn bench_single_complex_condition(c: &mut Criterion) {
             b.iter(|| {
                 let ctx = EvaluationContext {
                     events: &events,
+                    current_event: None,
                     current_time,
                     timezone_offset: "+08:00",
                 };

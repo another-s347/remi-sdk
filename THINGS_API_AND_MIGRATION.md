@@ -28,7 +28,7 @@
 这意味着：
 
 - 应用内部应该尽量直接使用 typed struct
-- JSON 只保留在边界层，例如 CLI 输出、Tauri command 返回值、UniFFI / FRB wrapper
+- JSON 只保留在边界层，例如 CLI 输出、Tauri command 返回值、UniFFI / JNI bridge wrapper
 
 ## 当前推荐 API 地图
 
@@ -429,7 +429,7 @@ let payload = ContentTypeRegistry::new()
 
 - CLI 输出 JSON：在 action handler 最后 `serde_json::to_string_pretty(&snapshot)`
 - Tauri command 返回 JSON：在 command 层 `serde_json::to_value(snapshot)`
-- UniFFI / FRB 兼容 wrapper：内部 typed，外层只做临时 JSON 兼容
+- UniFFI / JNI 兼容 wrapper：内部 typed，外层只做临时 JSON 兼容
 
 ## 未来扩展时 API 应该怎么演进
 
@@ -441,7 +441,7 @@ let payload = ContentTypeRegistry::new()
 
 1. 先在 typed domain struct 中加字段，例如 `ThingCollectionUpsert`、`ThingUpsert`、`ThingCollectionEntry`、`ThingEntry`
 2. 再让 `TriggerSdk` 暴露这些字段
-3. 最后才更新 Tauri / CLI / UniFFI / FRB 的边界映射
+3. 最后才更新 Tauri / CLI / UniFFI / JNI 的边界映射
 
 这样能保证：
 

@@ -45,7 +45,7 @@ pub use chat_client::{
 pub use chat_runtime::ChatRuntime;
 pub use chat_types::{
     CachedMessage, ChatLocalWasmConfig, ChatLocalWasmSource, ChatRunState, ChatRunStatus,
-    ChatTracingConfig,
+    ChatSessionExportBundle, ChatTracingConfig,
     ChatRuntimeBackend, ChatRuntimeConfig, ChatRuntimeEvent, InterruptAction, PendingInterrupt,
 };
 pub use external_tools::ExternalToolExecutor;
@@ -66,7 +66,7 @@ pub use types::{
     ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict, ThingsUndoConflictType,
     ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption, TriggerExecutionSummary,
     TriggerLogEntry, TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule,
-    TriggerRunType,
+    TriggerRunType, VirtualFsNodeKind, VirtualFsReadResult,
 };
 pub use url_handlers::{register_url_external_tools, register_url_handlers};
 

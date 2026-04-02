@@ -127,7 +127,7 @@ API 使用与旧 JSON API 迁移细节已拆到 `THINGS_API_AND_MIGRATION.md`。
 主要是这些消费者：
 
 - desktop Tauri commands
-- mobile Rust bridge / UniFFI / FRB wrappers
+- mobile Rust bridge / UniFFI / JNI wrappers
 - CLI
 - 测试和场景脚本
 
@@ -1077,7 +1077,7 @@ for thing in snapshot.things {
 如果你维护的是：
 
 - UniFFI
-- FRB
+- JNI bridge wrapper
 - Tauri command
 - CLI JSON 输出
 

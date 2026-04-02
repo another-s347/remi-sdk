@@ -198,8 +198,14 @@ pub fn extract_interrupt_data(payload: &JsonValue, interrupt_type: &str) -> Json
         return inner.clone();
     }
 
-    // Try value.* wrappers used by some transports/event adapters
-    if let Some(value_obj) = payload.get("value") {
+    // Try value.* wrappers used by some transports/event adapters.
+    // Only unwrap object-shaped wrappers so request bodies with a scalar
+    // `value` field (for example virtual_fs_edit_request) stay intact.
+    if let Some(value_obj) = payload
+        .get("value")
+        .filter(|value| value.is_object())
+        .filter(|value| looks_like_interrupt_wrapper(value, interrupt_type))
+    {
         if let Some(inner) = value_obj.get("payload").and_then(|p| p.get(interrupt_type)) {
             return inner.clone();
         }
@@ -212,7 +218,11 @@ pub fn extract_interrupt_data(payload: &JsonValue, interrupt_type: &str) -> Json
         return value_obj.clone();
     }
 
-    if let Some(display_obj) = payload.get("display_data") {
+    if let Some(display_obj) = payload
+        .get("display_data")
+        .filter(|value| value.is_object())
+        .filter(|value| looks_like_interrupt_wrapper(value, interrupt_type))
+    {
         if let Some(inner) = display_obj.get("payload").and_then(|p| p.get(interrupt_type)) {
             return inner.clone();
         }
@@ -226,6 +236,21 @@ pub fn extract_interrupt_data(payload: &JsonValue, interrupt_type: &str) -> Json
     }
 
     payload.clone()
+}
+
+fn looks_like_interrupt_wrapper(payload: &JsonValue, interrupt_type: &str) -> bool {
+    let Some(object) = payload.as_object() else {
+        return false;
+    };
+
+    object.contains_key("payload")
+        || object.contains_key("display_data")
+        || object.contains_key(interrupt_type)
+        || object
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .map(|value| value == interrupt_type)
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -262,5 +287,38 @@ mod tests {
     fn test_extract_type_trigger_rule_published() {
         let payload = json!({"id": "interrupt-xyz", "payload": {"trigger_rule_published": {"trigger_uuid": "t1"}}});
         assert_eq!(extract_interrupt_type(&payload), "trigger_rule_published");
+    }
+
+    #[test]
+    fn test_extract_data_keeps_scalar_value_fields_in_request_body() {
+        let payload = json!({
+            "type": "virtual_fs_edit_request",
+            "path": "/collection/c1/name",
+            "operation": "overwrite",
+            "value": "✨ 健康生活"
+        });
+
+        assert_eq!(
+            extract_interrupt_data(&payload, "virtual_fs_edit_request"),
+            payload
+        );
+    }
+
+    #[test]
+    fn test_extract_data_keeps_object_value_fields_in_request_body() {
+        let payload = json!({
+            "type": "virtual_fs_edit_request",
+            "path": "/trigger/t1/rule.json",
+            "operation": "overwrite",
+            "value": {
+                "precondition": [{ "description": "watch app", "rule": "true" }],
+                "condition": [{ "description": "open vscode", "rule": "event_exists(1, '', 'VSCode')" }]
+            }
+        });
+
+        assert_eq!(
+            extract_interrupt_data(&payload, "virtual_fs_edit_request"),
+            payload
+        );
     }
 }

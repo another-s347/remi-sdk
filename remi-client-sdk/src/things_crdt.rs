@@ -2355,6 +2355,22 @@ impl ThingsDocumentSet {
         let had_content = before.content.is_some();
         let existed = self.thing_markdown_document_exists(thing_uuid);
 
+        let missing_primary_block = block_id == "main"
+            && before
+                .content
+                .as_ref()
+                .and_then(|content| content.blocks.as_ref())
+                .map(|blocks| !blocks.iter().any(|block| block.id == "main"))
+                .unwrap_or(true);
+
+        if missing_primary_block {
+            if index == 0 && (delete == 0 || delete == usize::MAX) {
+                return Ok(Some(self.replace_thing_markdown_text(thing_uuid, insert)?));
+            }
+
+            return Ok(None);
+        }
+
         self.domain_writer()
             .splice_thing_text(thing_uuid, block_id, index, delete, insert)?;
 
@@ -2380,18 +2396,7 @@ impl ThingsDocumentSet {
         thing_uuid: &str,
         text: &str,
     ) -> Result<Vec<ThingsDocumentEvent>> {
-        let existed = self.thing_markdown_document_exists(thing_uuid);
-        self.domain_writer()
-            .splice_thing_text(thing_uuid, "main", 0, usize::MAX, text)?;
-        Ok(vec![ThingsDocumentEvent::thing_markdown(
-            if existed {
-                ThingsDocumentChangeKind::Updated
-            } else {
-                ThingsDocumentChangeKind::Created
-            },
-            self.find_thing_collection_uuid(thing_uuid).as_deref(),
-            thing_uuid,
-        )])
+        self.set_thing_markdown_text(thing_uuid, text)
     }
 
     /// Get plain markdown text from the primary markdown block, if present.
@@ -2611,6 +2616,80 @@ mod tests_v3 {
                 ThingsDocumentEvent::collection(ThingsDocumentChangeKind::Deleted, "coll-1"),
                 ThingsDocumentEvent::root(ThingsDocumentChangeKind::Updated),
             ]
+        );
+    }
+
+    #[test]
+    fn first_splice_creates_main_markdown_block() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+
+        let thing_events = docs
+            .upsert_thing_meta(
+                "coll-1",
+                "thing-empty",
+                Some(ThingDatatype::Markdown),
+                Some("none".to_string()),
+                Some("Empty".to_string()),
+                None,
+                TriggerUpdate::Noop,
+            )
+            .unwrap();
+        assert_eq!(
+            thing_events,
+            vec![ThingsDocumentEvent::thing(
+                ThingsDocumentChangeKind::Created,
+                "coll-1",
+                "thing-empty",
+            )]
+        );
+
+        let markdown_create = docs
+            .try_splice_thing_text("thing-empty", "main", 0, 0, "hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            markdown_create,
+            vec![ThingsDocumentEvent::thing_markdown(
+                ThingsDocumentChangeKind::Created,
+                Some("coll-1"),
+                "thing-empty",
+            )]
+        );
+        assert_eq!(
+            docs.get_thing_markdown_text("thing-empty").unwrap(),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn replace_markdown_text_creates_main_block_when_missing() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+
+        docs.upsert_thing_meta(
+            "coll-1",
+            "thing-overwrite",
+            Some(ThingDatatype::Markdown),
+            Some("none".to_string()),
+            Some("Overwrite".to_string()),
+            None,
+            TriggerUpdate::Noop,
+        )
+        .unwrap();
+
+        let markdown_create = docs
+            .replace_thing_markdown_text("thing-overwrite", "seed")
+            .unwrap();
+        assert_eq!(
+            markdown_create,
+            vec![ThingsDocumentEvent::thing_markdown(
+                ThingsDocumentChangeKind::Created,
+                Some("coll-1"),
+                "thing-overwrite",
+            )]
+        );
+        assert_eq!(
+            docs.get_thing_markdown_text("thing-overwrite").unwrap(),
+            Some("seed".to_string())
         );
     }
 

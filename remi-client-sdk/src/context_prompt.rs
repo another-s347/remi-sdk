@@ -2,7 +2,7 @@ use crate::things_crdt::{ThingEntry, ThingsSnapshot};
 use crate::types::TriggerInfo;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy)]
@@ -274,7 +274,70 @@ fn build_user_data_overview(snapshot: &ThingsSnapshot, triggers: &[TriggerInfo])
     out
 }
 
-fn build_active_context_section(active_context_json: Option<&str>) -> Result<Option<String>> {
+fn resolve_active_context_virtual_fs_paths(
+    snapshot: &ThingsSnapshot,
+    entry_type: &str,
+    uuid: &str,
+) -> Option<Value> {
+    match entry_type {
+        "collection" => Some(json!({
+            "dir": format!("/collection/{uuid}"),
+            "name": format!("/collection/{uuid}/name"),
+            "trigger": format!("/collection/{uuid}/trigger"),
+            "things": format!("/collection/{uuid}/things"),
+        })),
+        "trigger" => Some(json!({
+            "dir": format!("/trigger/{uuid}"),
+            "name": format!("/trigger/{uuid}/name"),
+            "rule": format!("/trigger/{uuid}/rule.json"),
+        })),
+        "thing" => snapshot
+            .things
+            .iter()
+            .find(|thing| thing.uuid == uuid)
+            .map(|thing| {
+                let dir = format!("/collection/{}/things/{}", thing.collection_uuid, thing.uuid);
+                json!({
+                    "dir": dir,
+                    "name": format!("{dir}/name"),
+                    "trigger": format!("{dir}/trigger"),
+                    "status": format!("{dir}/status"),
+                    "content": format!("{dir}/content.md"),
+                    "things": format!("{dir}/things"),
+                })
+            }),
+        _ => None,
+    }
+}
+
+fn enrich_active_context_entry(snapshot: &ThingsSnapshot, entry: &mut Value) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+
+    let Some(entry_type) = object.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(uuid) = object.get("uuid").and_then(Value::as_str) else {
+        return;
+    };
+
+    let Some(virtual_fs) = resolve_active_context_virtual_fs_paths(snapshot, entry_type, uuid) else {
+        return;
+    };
+
+    if object.get("path").is_none() {
+        if let Some(dir) = virtual_fs.get("dir").cloned() {
+            object.insert("path".to_string(), dir);
+        }
+    }
+    object.insert("virtual_fs".to_string(), virtual_fs);
+}
+
+pub(crate) fn normalize_active_context_json(
+    snapshot: &ThingsSnapshot,
+    active_context_json: Option<&str>,
+) -> Result<Option<Value>> {
     let Some(raw) = active_context_json else {
         return Ok(None);
     };
@@ -282,10 +345,38 @@ fn build_active_context_section(active_context_json: Option<&str>) -> Result<Opt
         return Ok(None);
     }
 
-    let value: Value = serde_json::from_str(raw).context("Invalid active_context_json")?;
+    let mut value: Value = serde_json::from_str(raw).context("Invalid active_context_json")?;
     if value.is_null() {
         return Ok(None);
     }
+
+    if let Some(entries) = value.as_array_mut() {
+        for entry in entries.iter_mut() {
+            enrich_active_context_entry(snapshot, entry);
+        }
+        return Ok(Some(json!({ "viewing": value })));
+    }
+
+    if let Some(modes) = value.as_object_mut() {
+        for entries in modes.values_mut() {
+            if let Some(entries) = entries.as_array_mut() {
+                for entry in entries.iter_mut() {
+                    enrich_active_context_entry(snapshot, entry);
+                }
+            }
+        }
+    }
+
+    Ok(Some(value))
+}
+
+pub(crate) fn build_active_context_section(
+    snapshot: &ThingsSnapshot,
+    active_context_json: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(value) = normalize_active_context_json(snapshot, active_context_json)? else {
+        return Ok(None);
+    };
 
     let rendered = yaml_from_json_value(&value, 0);
     if rendered.trim().is_empty() {
@@ -293,7 +384,7 @@ fn build_active_context_section(active_context_json: Option<&str>) -> Result<Opt
     }
 
     Ok(Some(format!(
-        "## Active Context\n\n```yaml\n{}\n```",
+        "## Active Context\n\nUse the virtual filesystem paths below when calling ls_tool, tree_tool, cat_tool, edit_path_tool, create_tool, move_path_tool, or delete_path_tool against the currently active entities.\n\n```yaml\n{}\n```",
         rendered
     )))
 }
@@ -306,7 +397,7 @@ pub fn build_context_prompt_markdown(
 ) -> Result<String> {
     let enabled_events = build_enabled_events_section(granted_permissions);
     let user_data = build_user_data_overview(snapshot, triggers);
-    let active_context = build_active_context_section(active_context_json)?;
+    let active_context = build_active_context_section(snapshot, active_context_json)?;
 
     let mut sections = vec![enabled_events, user_data];
     if let Some(section) = active_context {
@@ -328,5 +419,50 @@ mod tests {
         let out = build_context_prompt_markdown(&[], &snapshot, &[], None).unwrap();
         assert!(out.contains("## Enabled Events"));
         assert!(out.contains("目前仅可依赖时间与其他api判断"));
+    }
+
+    #[test]
+    fn active_context_section_enriches_virtual_fs_paths() {
+        let snapshot = ThingsSnapshot {
+            collections: vec![crate::things_crdt::ThingCollectionEntry {
+                uuid: "c1".to_string(),
+                title: "Inbox".to_string(),
+                trigger_uuid: Some("tr-1".to_string()),
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
+                actor_type: None,
+                actor_app_id: None,
+                actor_display_name: None,
+            }],
+            things: vec![crate::things_crdt::ThingEntry {
+                uuid: "t1".to_string(),
+                title: "Buy milk".to_string(),
+                datatype: crate::things_crdt::ThingDatatype::Markdown,
+                data: json!({}),
+                collection_uuid: "c1".to_string(),
+                parent_uuid: None,
+                trigger_uuid: Some("tr-2".to_string()),
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
+                status: "none".to_string(),
+                status_timestamp_ms: None,
+                actor_type: None,
+                actor_app_id: None,
+                actor_display_name: None,
+            }],
+        };
+
+        let section = build_active_context_section(
+            &snapshot,
+            Some(r#"{"viewing":[{"type":"thing","uuid":"t1","title":"Buy milk"},{"type":"collection","uuid":"c1","title":"Inbox"},{"type":"trigger","uuid":"tr-9","title":"Wake Up"}]}"#),
+        )
+        .expect("section should build")
+        .expect("section should exist");
+
+        assert!(section.contains("Use the virtual filesystem paths below"));
+        assert!(section.contains("/collection/c1/things/t1"));
+        assert!(section.contains("/collection/c1/things/t1/content.md"));
+        assert!(section.contains("/collection/c1/name"));
+        assert!(section.contains("/trigger/tr-9/rule.json"));
     }
 }

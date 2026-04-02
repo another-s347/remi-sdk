@@ -565,6 +565,21 @@ pub struct TriggerInfo {
     pub bind_uuid: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualFsNodeKind {
+    Tree,
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualFsReadResult {
+    pub path: String,
+    pub kind: VirtualFsNodeKind,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
     pub session_id: String,

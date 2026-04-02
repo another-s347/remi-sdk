@@ -83,7 +83,7 @@ remi-sdk/
 
 - 事件类：`event_count(minutes, event_type)`、`event_exists(minutes, event_type)`、`event_exists_with_message(minutes, event_type, substring)`。
 - 时间类：`in_time_range(start, end)`、`is_weekday([...])`、`current_hour()`。
-- precondition 时序类：`cron(expr)`、`location_change()`、`network_change()`、`repeat_per_day(n)`、`repeat_per_week(n)`。
+- precondition 时序类：`cron(expr)`、`timer(value)`、`event(name)`、`repeat_per_day(n)`、`repeat_per_week(n)`。
 
 ## 安装与依赖方式
 
@@ -264,7 +264,7 @@ let _collections = things.list_collections(50, 0, None).await?;
 let _server_triggers = triggers.list_triggers("device-1", None, 50, 0).await?;
 ```
 
-如果你是通过 Flutter Rust Bridge 或类似桥接层接入，也可以使用 `auth` 模块里的全局辅助函数，例如：
+如果你是通过移动端桥接层接入，例如 UniFFI、JNI 或类似封装，也可以使用 `auth` 模块里的全局辅助函数，例如：
 
 - `configure_auth_client`
 - `auth_login`
@@ -397,8 +397,7 @@ let _ = sdk.run_due_triggers(&NotificationCallback)?;
 实际宿主层通常还会配合：
 
 - 定时器 / scheduler tick 中调用 `next_deadline(...)` 和 `run_due_triggers(...)`
-- 网络变化时调用 `schedule_network_change_triggers(...)`
-- 位置变化时调用 `schedule_location_change_triggers(...)`
+- 写入事件时通过 `record_event(...)` 自动命中 `event('...')` precondition
 
 这也是为什么 `TriggerSdk` 不只是 trigger registry，它本质上是本地规则执行运行时。
 
@@ -435,10 +434,10 @@ sdk.record_event(EventPayload {
 
 几个重要约定：
 
-- 本地 trigger 调度默认按 `+08:00` 时区计算。
+- 本地 trigger 调度默认按宿主本地时区计算；缺少可用时区来源时回退到 `+08:00`。
 - `cron(...)` 使用 POSIX 5 字段格式：`minute hour day-of-month month day-of-week`。
 - day-of-week 取值是 `0-6`，其中 `0 = Sunday`。
-- `schedule_network_change_triggers(...)` 和 `schedule_location_change_triggers(...)` 用于把宿主层观察到的网络 / 位置变化映射成 trigger due 事件。
+- `event('Connectivity')`、`event('Location')` 这类 precondition 会在相应事件通过 `record_event(...)` 写入后自动变成 due。
 - `run_due_triggers(...)` 会执行当前到期的 trigger，并更新 `next_fire`。
 - `run_trigger_now(...)` 适合调试、手动执行或测试场景。
 
@@ -500,7 +499,7 @@ let _thing = client
 
 1. 创建定义：通过 `TriggerSdk::register_trigger(...)` 在本地保存 trigger 定义。
 2. 绑定实体：把 `trigger_uuid` 绑定到 collection 或 thing。
-3. 本地调度：scheduler 依据 `cron(...)`、`network_change()`、`location_change()` 等 precondition 决定何时到期。
+3. 本地调度：scheduler 依据 `cron(...)`、`timer(...)`、`event(...)` 等 precondition 决定何时到期。
 4. 本地执行：`run_due_triggers(...)` 或 `run_trigger_now(...)` 评估条件并产出 `TriggerExecutionSummary`。
 5. 跨设备同步：通过 `TriggerClient` 上传 trigger 定义、同步 Things CRDT 文档、向服务端报告 trigger fired 事件。
 
@@ -511,12 +510,12 @@ let _thing = client
 
 常见写法：
 
-- `precondition` 放 `cron(...)`、`network_change()`、`location_change()`、`repeat_per_day(...)`
+- `precondition` 放 `cron(...)`、`timer(...)`、`event(...)`、`repeat_per_day(...)`
 - `condition` 放 `event_exists(...)`、`event_exists_with_message(...)`、`in_time_range(...)` 等布尔表达式
 
 如果你把它和 collection / things 放在一起理解，会更自然：
 
-- collection 级 trigger：更适合“这个列表每天要回顾一次”“这个项目在网络变化时检查一次”
+- collection 级 trigger：更适合“这个列表每天要回顾一次”“这个项目在 Connectivity / Location 事件发生时检查一次”
 - thing 级 trigger：更适合“这个条目在某个条件下提醒我”“这个任务完成前按固定频率催办”
 
 如果你正在做本地优先同步，常见模式是把 `TriggerSdk` 和 `TriggerClient` 组合起来：

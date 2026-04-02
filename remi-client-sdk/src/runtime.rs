@@ -2,6 +2,7 @@ use crate::context_prompt;
 use crate::events_events::EventsEvent;
 use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
 use crate::storage::Storage;
+use crate::chat_types::{CachedMessage, ChatProtocolSessionState, ChatSessionExportBundle};
 use crate::things_crdt::{
     ContentEntry, ContentEntryUpdate, ThingCollectionEntry, ThingCollectionUpsert, ThingEntry,
     ThingUpsert, ThingsSnapshot, ThingsSnapshotState,
@@ -15,7 +16,7 @@ use crate::types::{
     TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, Timelike, Utc};
 use croner::Cron;
 use rule_trigger_engine::{
     EvaluationContext, MonitoringEvent, PreconditionPolicy, Rule as EngineRule, TriggerConfig,
@@ -28,6 +29,9 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+mod path_tools;
+pub(crate) use path_tools::VirtualFsCatResult;
+
 const DEFAULT_TIMEZONE_OFFSET: &str = "+08:00";
 
 fn default_timezone() -> FixedOffset {
@@ -35,6 +39,20 @@ fn default_timezone() -> FixedOffset {
         FixedOffset::east_opt(8 * 3600).expect("UTC+08:00 offset must be valid")
     })
 }
+
+fn local_timezone_offset_string() -> String {
+    let seconds = Local::now().offset().local_minus_utc();
+    format_offset_seconds(seconds)
+}
+
+fn format_offset_seconds(total_seconds: i32) -> String {
+    let sign = if total_seconds < 0 { '-' } else { '+' };
+    let abs = total_seconds.abs();
+    let hours = abs / 3600;
+    let minutes = (abs % 3600) / 60;
+    format!("{sign}{hours:02}:{minutes:02}")
+}
+
 pub trait TriggerCallback: Send + Sync {
     fn on_trigger(&self, summary: &TriggerExecutionSummary) -> Result<()>;
 }
@@ -171,31 +189,17 @@ impl TriggerSdk {
             anyhow::bail!("Trigger UUID is required but not provided.");
         }
 
-        // Extract timing from preconditions/conditions for scheduling.
-        // Cron triggers store a computed `next_fire`; event-driven triggers (e.g. network_change)
-        // default to `next_fire = None` and will be marked due by listeners.
-        let timings = extract_timings_from_rules(&params.precondition, &params.condition)?;
-        let cron = timings.iter().find_map(|t| match t {
-            rule_trigger_engine::TriggerTiming::Cron { expression } => Some(expression.clone()),
-            _ => None,
-        });
-
-        let next_fire = if let Some(cron) = cron {
-            let now = Utc::now();
-            compute_next_fire(&cron, now, Some(now))?
-        } else if timings.iter().any(|t| {
-            matches!(
-                t,
-                rule_trigger_engine::TriggerTiming::NetworkChange
-                    | rule_trigger_engine::TriggerTiming::Location
-            )
-        }) {
-            None
-        } else {
-            anyhow::bail!(
-                "No supported timing found in trigger rules (expected cron(...) or network_change()/location())."
-            );
+        let now = Utc::now();
+        let local_timezone_offset = local_timezone_offset_string();
+        let normalized_precondition =
+            normalize_timer_preconditions(&params.precondition, now, &local_timezone_offset)?;
+        let params = TriggerRegistration {
+            precondition: normalized_precondition,
+            ..params
         };
+
+        let timings = extract_timings_from_rules(&params.precondition, &params.condition)?;
+        let next_fire = resolve_registration_next_fire(&timings, now, &local_timezone_offset)?;
 
         let trigger_uuid = params.trigger_uuid.clone();
         let inserted_uuid = self.storage.insert_trigger(params, next_fire)?;
@@ -207,6 +211,7 @@ impl TriggerSdk {
         let event_type = event.event_type.clone();
         let event_ts = event.timestamp;
         self.storage.insert_event(&event)?;
+        self.schedule_event_triggers(&event_type, event_ts)?;
 
         // Emit event notification to subscribers (e.g. UI).
         self.emit_events_event(EventsEvent::EventRecorded {
@@ -217,34 +222,33 @@ impl TriggerSdk {
         Ok(())
     }
 
-    /// Schedule triggers that have `network_change()` in their precondition.
-    /// This API is exposed for the application layer to call when a Connectivity event
-    /// is recorded - the SDK no longer has hardcoded event type handling.
+    /// Schedule triggers that react to Connectivity events.
+    /// Prefer recording a Connectivity event via `record_event`; this shim exists for callers
+    /// that still separate event persistence from trigger scheduling.
     pub fn schedule_network_change_triggers(&self, due_at: DateTime<Utc>) -> Result<()> {
-        self.schedule_triggers_by_precondition_keyword("network_change(", due_at)
+        self.schedule_event_triggers("Connectivity", due_at)
     }
 
-    /// Schedule triggers that have `location_change()` in their precondition.
-    /// This API is exposed for the application layer to call when a Location event
-    /// is recorded.
+    /// Schedule triggers that react to Location events.
+    /// Prefer recording a Location event via `record_event`; this shim exists for callers
+    /// that still separate event persistence from trigger scheduling.
     pub fn schedule_location_change_triggers(&self, due_at: DateTime<Utc>) -> Result<()> {
-        self.schedule_triggers_by_precondition_keyword("location_change(", due_at)
+        self.schedule_event_triggers("Location", due_at)
     }
 
-    /// Generic trigger scheduling by precondition keyword.
-    /// Scans all triggers and marks those containing the keyword in precondition as due.
-    fn schedule_triggers_by_precondition_keyword(
-        &self,
-        keyword: &str,
-        due_at: DateTime<Utc>,
-    ) -> Result<()> {
+    fn schedule_event_triggers(&self, event_type: &str, due_at: DateTime<Utc>) -> Result<()> {
         let triggers = self.storage.list_triggers()?;
         for trigger in triggers {
-            let has_keyword = trigger.precondition.iter().any(|rule| {
-                let expr = rule.rule.replace(' ', "");
-                expr.contains(keyword)
+            let timings = extract_timings_from_rules(&trigger.precondition, &trigger.condition)
+                .with_context(|| format!("Failed to inspect trigger {} timings", trigger.trigger_id))?;
+            let matches_event = timings.iter().any(|timing| {
+                matches!(
+                    timing,
+                    rule_trigger_engine::TriggerTiming::Event { event_type: configured }
+                        if configured == event_type
+                )
             });
-            if !has_keyword {
+            if !matches_event {
                 continue;
             }
 
@@ -577,6 +581,32 @@ impl TriggerSdk {
         );
 
         Ok(out)
+    }
+
+    pub(crate) fn normalize_active_context_json(
+        &self,
+        device_id: &str,
+        active_context_json: Option<&str>,
+    ) -> Result<Option<serde_json::Value>> {
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let snapshot =
+            doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+                include_content: false,
+            })?;
+        context_prompt::normalize_active_context_json(&snapshot, active_context_json)
+    }
+
+    pub(crate) fn build_active_context_prompt(
+        &self,
+        device_id: &str,
+        active_context_json: Option<&str>,
+    ) -> Result<Option<String>> {
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let snapshot =
+            doc_set.extract_snapshot_with_options(crate::things_crdt::SnapshotOptions {
+                include_content: false,
+            })?;
+        context_prompt::build_active_context_section(&snapshot, active_context_json)
     }
 
     // ===== Things V3 (Multi-document CRDT) =====
@@ -2982,16 +3012,12 @@ impl TriggerSdk {
             let timings = extract_timings_from_rules(&precondition, &condition)?;
 
             // Ensure the computed next fire is strictly after "now" even if this run is late.
-            let next_fire = if let Some(cron) = timings.iter().find_map(|t| match t {
-                rule_trigger_engine::TriggerTiming::Cron { expression } => {
-                    Some(expression.as_str())
-                }
-                _ => None,
-            }) {
-                compute_next_fire(cron, fire_time, Some(now))?
-            } else {
-                None
-            };
+            let next_fire = resolve_post_run_next_fire(
+                &timings,
+                fire_time,
+                now,
+                DEFAULT_TIMEZONE_OFFSET,
+            )?;
 
             self.storage.update_next_fire(
                 &trigger.trigger_uuid,
@@ -3058,14 +3084,12 @@ impl TriggerSdk {
         let condition: Vec<TriggerRule> = serde_json::from_str(&trigger.condition_json)
             .context("Failed to parse condition JSON")?;
         let timings = extract_timings_from_rules(&precondition, &condition)?;
-        let next_fire = if let Some(cron) = timings.iter().find_map(|t| match t {
-            rule_trigger_engine::TriggerTiming::Cron { expression } => Some(expression.as_str()),
-            _ => None,
-        }) {
-            compute_next_fire(cron, fire_time, Some(fire_time))?
-        } else {
-            None
-        };
+        let next_fire = resolve_post_run_next_fire(
+            &timings,
+            fire_time,
+            fire_time,
+            DEFAULT_TIMEZONE_OFFSET,
+        )?;
 
         self.storage.update_next_fire(
             &trigger.trigger_uuid,
@@ -3109,16 +3133,12 @@ impl TriggerSdk {
                 .context("Failed to parse condition JSON")?;
             let timings = extract_timings_from_rules(&precondition, &condition)?;
 
-            let next_fire = if let Some(cron) = timings.iter().find_map(|t| match t {
-                rule_trigger_engine::TriggerTiming::Cron { expression } => {
-                    Some(expression.as_str())
-                }
-                _ => None,
-            }) {
-                compute_next_fire(cron, fire_time, Some(target_time))?
-            } else {
-                None
-            };
+            let next_fire = resolve_post_run_next_fire(
+                &timings,
+                fire_time,
+                target_time,
+                DEFAULT_TIMEZONE_OFFSET,
+            )?;
             self.storage.update_next_fire(
                 &trigger.trigger_uuid,
                 summary.fired_at,
@@ -3172,29 +3192,39 @@ impl TriggerSdk {
             return Err(anyhow!("Replay window must be positive"));
         }
 
-        // Parse rules to extract cron + optional repeat frequency.
+        // Parse rules to extract schedule metadata + optional repeat frequency.
         let precondition: Vec<TriggerRule> = serde_json::from_str(&trigger.precondition_json)
             .context("Failed to parse precondition JSON")?;
         let condition: Vec<TriggerRule> = serde_json::from_str(&trigger.condition_json)
             .context("Failed to parse condition JSON")?;
-        let cron = extract_cron_from_preconditions(&precondition)
-            .ok_or_else(|| anyhow!("No cron expression found in preconditions"))?;
-        // Repeat frequency rules live in `condition` only.
+        let timings = extract_timings_from_rules(&precondition, &condition)?;
         let repeat_freq = extract_repeat_frequency_from_conditions(&condition);
-        let schedule = Cron::from_str(&cron).context("Invalid cron expression")?;
-        let tz = default_timezone();
+        let events: Vec<MonitoringEvent> = self
+            .storage
+            .list_events_between_utc(start.timestamp(), end.timestamp())?
+            .into_iter()
+            .map(|ev| MonitoringEvent {
+                event_type: ev.event_type,
+                timestamp: ev.timestamp.to_rfc3339(),
+                metadata_json: serde_json::to_string(&ev.metadata)
+                    .unwrap_or_else(|_| "{}".to_string()),
+            })
+            .collect();
+        let occurrences = build_trigger_occurrences(
+            &timings,
+            &events,
+            start,
+            end,
+            start,
+            DEFAULT_TIMEZONE_OFFSET,
+        )?;
 
         let mut runs_considered = 0;
         let mut runs_executed = 0;
         let mut runs_succeeded = 0;
         let mut last_success: Option<DateTime<Utc>> = None;
 
-        let mut next_local = schedule
-            .find_next_occurrence(&start.with_timezone(&tz), false)
-            .context("Invalid cron expression")?;
-
-        while next_local.with_timezone(&Utc) <= end {
-            let fire_time = next_local.with_timezone(&Utc);
+        for fire_time in occurrences {
             runs_considered += 1;
 
             if let Some(last) = last_success {
@@ -3213,10 +3243,6 @@ impl TriggerSdk {
                 runs_succeeded += 1;
                 last_success = Some(summary.fired_at);
             }
-
-            next_local = schedule
-                .find_next_occurrence(&next_local, false)
-                .context("Invalid cron expression")?;
         }
 
         Ok(TriggerReplaySummary {
@@ -3260,13 +3286,7 @@ impl TriggerSdk {
             .extract_timing()
             .map_err(|e| anyhow!("Failed to extract timing: {e}"))?;
 
-        let cron_str = timings
-            .iter()
-            .find_map(|t| match t {
-                rule_trigger_engine::TriggerTiming::Cron { expression } => Some(expression.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| anyhow!("No cron expression found in preconditions"))?;
+        let timing_summary = describe_timing_sources(&timings);
 
         let repeat_freq = timings.iter().find_map(|t| match t {
             rule_trigger_engine::TriggerTiming::RepeatFrequency { frequency } => {
@@ -3318,7 +3338,7 @@ impl TriggerSdk {
         #[derive(serde::Serialize)]
         struct TriggerTestResult {
             trigger_name: String,
-            cron_schedule: String,
+            timing_summary: String,
             repeat_frequency: Option<String>,
             start_time: String,
             end_time: String,
@@ -3353,6 +3373,7 @@ impl TriggerSdk {
             let visible_events = filter_events_at_time(&all_events, end_utc, 120);
             let eval_ctx = EvaluationContext {
                 events: &visible_events,
+                current_event: select_current_event(&visible_events, &timings, end_utc),
                 current_time: end_utc.timestamp(),
                 timezone_offset: DEFAULT_TIMEZONE_OFFSET,
             };
@@ -3368,7 +3389,7 @@ impl TriggerSdk {
 
             let result = TriggerTestResult {
                 trigger_name: config.name,
-                cron_schedule: cron_str,
+                timing_summary,
                 repeat_frequency: freq_str,
                 start_time: start_utc.to_rfc3339(),
                 end_time: end_utc.to_rfc3339(),
@@ -3385,10 +3406,14 @@ impl TriggerSdk {
             return serde_json::to_string(&result).context("Failed to serialize result");
         }
 
-        // Automatic mode: iterate through cron schedule
-        let schedule = Cron::from_str(&cron_str).context("Invalid cron expression")?;
-        let start_local = start_utc.with_timezone(&tz);
-        let end_local = end_utc.with_timezone(&tz);
+        let occurrences = build_trigger_occurrences(
+            &timings,
+            &all_events,
+            start_utc,
+            end_utc,
+            start_utc,
+            DEFAULT_TIMEZONE_OFFSET,
+        )?;
 
         let mut runs = Vec::new();
         let mut runs_considered = 0u32;
@@ -3396,12 +3421,7 @@ impl TriggerSdk {
         let mut runs_succeeded = 0u32;
         let mut last_success: Option<DateTime<Utc>> = None;
 
-        let mut trigger_time_local = schedule
-            .find_next_occurrence(&start_local, false)
-            .context("Failed to find next cron occurrence")?;
-
-        while trigger_time_local <= end_local {
-            let trigger_time_utc = trigger_time_local.with_timezone(&Utc);
+        for trigger_time_utc in occurrences {
             runs_considered += 1;
 
             // Check repeat frequency gating
@@ -3409,14 +3429,11 @@ impl TriggerSdk {
                 if let Some(min_gap) = repeat_min_gap(freq) {
                     if trigger_time_utc - last < min_gap {
                         runs.push(TriggerTestRun {
-                            trigger_time: trigger_time_local.to_rfc3339(),
+                            trigger_time: trigger_time_utc.with_timezone(&tz).to_rfc3339(),
                             result: false,
                             status: "skipped_repeat_frequency".to_string(),
                             report: None,
                         });
-                        trigger_time_local = schedule
-                            .find_next_occurrence(&trigger_time_local, false)
-                            .context("Failed to find next cron occurrence")?;
                         continue;
                     }
                 }
@@ -3425,6 +3442,7 @@ impl TriggerSdk {
             let visible_events = filter_events_at_time(&all_events, trigger_time_utc, 120);
             let eval_ctx = EvaluationContext {
                 events: &visible_events,
+                current_event: select_current_event(&visible_events, &timings, trigger_time_utc),
                 current_time: trigger_time_utc.timestamp(),
                 timezone_offset: DEFAULT_TIMEZONE_OFFSET,
             };
@@ -3445,7 +3463,7 @@ impl TriggerSdk {
             }
 
             runs.push(TriggerTestRun {
-                trigger_time: trigger_time_local.to_rfc3339(),
+                trigger_time: trigger_time_utc.with_timezone(&tz).to_rfc3339(),
                 result: fired,
                 status: if has_error {
                     "error".to_string()
@@ -3456,15 +3474,11 @@ impl TriggerSdk {
                 },
                 report: Some(report),
             });
-
-            trigger_time_local = schedule
-                .find_next_occurrence(&trigger_time_local, false)
-                .context("Failed to find next cron occurrence")?;
         }
 
         let result = TriggerTestResult {
             trigger_name: config.name,
-            cron_schedule: cron_str,
+            timing_summary,
             repeat_frequency: freq_str,
             start_time: start_utc.to_rfc3339(),
             end_time: end_utc.to_rfc3339(),
@@ -3567,6 +3581,7 @@ impl TriggerSdk {
             precondition: precondition_rules,
             condition: condition_rules,
         };
+        let timings = config.extract_timing().unwrap_or_default();
 
         // Fetch recent events and map to engine event type
         let recent = self
@@ -3584,6 +3599,7 @@ impl TriggerSdk {
 
         let eval_ctx = EvaluationContext {
             events: &events,
+            current_event: select_current_event(&events, &timings, fire_time),
             current_time: fire_time.timestamp(),
             timezone_offset: DEFAULT_TIMEZONE_OFFSET,
         };
@@ -3749,6 +3765,34 @@ impl TriggerSdk {
     ) -> Result<Vec<String>> {
         self.storage
             .list_chat_messages_json(session_id, limit, offset)
+    }
+
+    /// Export a persisted chat session bundle containing history and protocol state.
+    pub fn export_chat_session_bundle(&self, session_id: &str) -> Result<ChatSessionExportBundle> {
+        let session = self
+            .get_chat_session(session_id)?
+            .ok_or_else(|| anyhow!("Chat session not found: {session_id}"))?;
+
+        let messages = self
+            .list_chat_messages_json(session_id, None, 0)?
+            .into_iter()
+            .map(|json| parse_cached_message_storage_json(&json))
+            .collect::<Result<Vec<_>>>()?;
+
+        let protocol_state = self
+            .get_chat_runtime_state_json(session_id)?
+            .map(|json| serde_json::from_str::<ChatProtocolSessionState>(&json))
+            .transpose()
+            .context("Failed to parse chat runtime state JSON")?
+            .unwrap_or_default();
+
+        Ok(ChatSessionExportBundle::new(session, messages, protocol_state))
+    }
+
+    /// Export a persisted chat session bundle as a JSON document.
+    pub fn export_chat_session_bundle_json(&self, session_id: &str) -> Result<String> {
+        let bundle = self.export_chat_session_bundle(session_id)?;
+        serde_json::to_string_pretty(&bundle).context("Failed to serialize chat session bundle")
     }
 
     /// Delete chat messages for a session (keeps the session record).
@@ -3962,6 +4006,13 @@ mod db_observability_tests {
     }
 }
 
+fn parse_cached_message_storage_json(message_json: &str) -> Result<CachedMessage> {
+    let mut message = serde_json::from_str::<CachedMessage>(message_json)
+        .context("Failed to parse cached chat message JSON")?;
+    message.refresh_ui_elements();
+    Ok(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4015,7 +4066,7 @@ mod tests {
             name: "Network change trigger".to_string(),
             version: "v1".to_string(),
             precondition: vec![TriggerRule {
-                rule: "network_change()".to_string(),
+                rule: "event('Connectivity')".to_string(),
                 description: "On connectivity change".to_string(),
             }],
             condition: vec![TriggerRule {
@@ -4032,7 +4083,7 @@ mod tests {
             .expect("fetch due triggers");
         assert!(
             before.iter().all(|t| t.trigger_uuid != trigger_uuid),
-            "network-change trigger must not be due immediately after registration"
+            "event trigger must not be due immediately after registration"
         );
 
         let event_ts = Utc::now();
@@ -4052,8 +4103,130 @@ mod tests {
             .expect("fetch due triggers after event");
         assert!(
             after.iter().any(|t| t.trigger_uuid == trigger_uuid),
-            "network-change trigger must be marked due after Connectivity event"
+            "event trigger must be marked due after Connectivity event"
         );
+    }
+
+    #[test]
+    fn test_timer_trigger_is_due_after_registration_anchor() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+
+        let trigger_uuid = "trg-timer".to_string();
+        sdk.register_trigger(TriggerRegistration {
+            trigger_uuid: trigger_uuid.clone(),
+            name: "Timer trigger".to_string(),
+            version: "v1".to_string(),
+            precondition: vec![TriggerRule {
+                rule: "timer('1s')".to_string(),
+                description: "One second after registration".to_string(),
+            }],
+            condition: vec![TriggerRule {
+                rule: "true".to_string(),
+                description: "Always true".to_string(),
+            }],
+        })
+        .expect("register trigger");
+
+        let stored = sdk
+            .storage
+            .fetch_trigger(&trigger_uuid)
+            .expect("fetch trigger")
+            .expect("trigger exists");
+        assert!(stored.next_fire.is_some(), "timer trigger should have next_fire");
+        let stored_preconditions: Vec<TriggerRule> =
+            serde_json::from_str(&stored.precondition_json).expect("decode preconditions");
+        assert_eq!(stored_preconditions.len(), 1);
+        assert!(
+            stored_preconditions[0].rule.starts_with("timer(\"")
+                && stored_preconditions[0].rule.contains('T')
+                && !stored_preconditions[0].rule.contains("1s"),
+            "timer precondition should be normalized to an absolute RFC3339 timestamp: {}",
+            stored_preconditions[0].rule
+        );
+    }
+
+    #[test]
+    fn test_export_chat_session_bundle_round_trips_messages_and_protocol_state() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+
+        let session_id = "session-export".to_string();
+        sdk.upsert_chat_session(session_id.clone(), Some("Debug session".to_string()), 2)
+            .expect("upsert session");
+
+        let mut user_message = CachedMessage::user(
+            "user-1".to_string(),
+            "Hello".to_string(),
+            Utc::now().timestamp_millis(),
+        );
+        user_message.refresh_ui_elements();
+        sdk.upsert_chat_message_json(
+            session_id.clone(),
+            user_message.id.clone(),
+            user_message.timestamp_ms,
+            serde_json::to_string(&user_message).expect("serialize user message"),
+        )
+        .expect("upsert user message");
+
+        let mut assistant_message = CachedMessage::assistant(
+            "assistant-1".to_string(),
+            Utc::now().timestamp_millis(),
+        );
+        assistant_message.content = "Hi there".to_string();
+        assistant_message.refresh_ui_elements();
+        sdk.upsert_chat_message_json(
+            session_id.clone(),
+            assistant_message.id.clone(),
+            assistant_message.timestamp_ms,
+            serde_json::to_string(&assistant_message).expect("serialize assistant message"),
+        )
+        .expect("upsert assistant message");
+
+        let protocol_state = ChatProtocolSessionState {
+            history: vec![crate::chat_types::ProtocolHistoryMessage {
+                id: "assistant-1".to_string(),
+                role: "assistant".to_string(),
+                content: json!("Hi there"),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            latest_state: Some(json!({"foo": "bar"})),
+            pending_tool_execution: None,
+        };
+        sdk.upsert_chat_runtime_state_json(
+            session_id.clone(),
+            serde_json::to_string(&protocol_state).expect("serialize protocol state"),
+        )
+        .expect("upsert protocol state");
+
+        let bundle = sdk
+            .export_chat_session_bundle(&session_id)
+            .expect("export bundle");
+
+        assert_eq!(bundle.version, ChatSessionExportBundle::VERSION);
+        assert_eq!(bundle.session.session_id, session_id);
+        assert_eq!(bundle.messages.len(), 2);
+        assert_eq!(bundle.messages[0].content, "Hello");
+        assert_eq!(bundle.messages[1].content, "Hi there");
+        assert_eq!(
+            bundle
+                .protocol_state
+                .latest_state
+                .as_ref()
+                .and_then(|value| value.get("foo"))
+                .and_then(|value| value.as_str()),
+            Some("bar")
+        );
+
+        let json = sdk
+            .export_chat_session_bundle_json(&bundle.session.session_id)
+            .expect("serialize bundle");
+        assert!(json.contains("Debug session"));
+        assert!(json.contains("Hi there"));
     }
 }
 
@@ -4097,6 +4270,44 @@ fn filter_events_at_time(
         .collect()
 }
 
+fn select_current_event<'a>(
+    events: &'a [MonitoringEvent],
+    timings: &[rule_trigger_engine::TriggerTiming],
+    fire_time: DateTime<Utc>,
+) -> Option<&'a MonitoringEvent> {
+    let event_types: Vec<&str> = timings
+        .iter()
+        .filter_map(|timing| match timing {
+            rule_trigger_engine::TriggerTiming::Event { event_type } => Some(event_type.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    events
+        .iter()
+        .filter_map(|event| {
+            let matches_type = event_types.is_empty()
+                || event_types
+                    .iter()
+                    .any(|event_type| *event_type == event.event_type);
+            if !matches_type {
+                return None;
+            }
+
+            let timestamp = DateTime::parse_from_rfc3339(&event.timestamp)
+                .ok()?
+                .with_timezone(&Utc);
+            if timestamp > fire_time {
+                return None;
+            }
+
+            Some((timestamp, event))
+        })
+        .max_by_key(|(timestamp, _)| *timestamp)
+        .map(|(_, event)| event)
+}
+
+#[cfg(test)]
 fn extract_cron_from_preconditions(preconditions: &[TriggerRule]) -> Option<String> {
     for rule in preconditions {
         // Look for cron() function calls in the rule
@@ -4193,6 +4404,198 @@ fn repeat_min_gap(freq: &rule_trigger_engine::RepeatFrequency) -> Option<Duratio
         }
         _ => None,
     }
+}
+
+fn normalize_timer_preconditions(
+    preconditions: &[TriggerRule],
+    anchor: DateTime<Utc>,
+    timezone_offset: &str,
+) -> Result<Vec<TriggerRule>> {
+    preconditions
+        .iter()
+        .cloned()
+        .map(|mut rule| {
+            let timings = extract_timings_from_rules(&[rule.clone()], &[])?;
+            if let Some(rule_trigger_engine::TriggerTiming::Timer { value }) = timings.first() {
+                let normalized = rule_trigger_engine::normalize_timer_literal(
+                    value,
+                    anchor,
+                    timezone_offset,
+                )
+                .map_err(|err| anyhow!("Failed to normalize timer precondition '{}': {err}", rule.description))?;
+                rule.rule = format!("timer(\"{}\")", normalized);
+            }
+            Ok(rule)
+        })
+        .collect()
+}
+
+fn resolve_registration_next_fire(
+    timings: &[rule_trigger_engine::TriggerTiming],
+    anchor: DateTime<Utc>,
+    timezone_offset: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let mut earliest: Option<DateTime<Utc>> = None;
+    let mut has_supported = false;
+    let mut has_event = false;
+
+    for timing in timings {
+        match timing {
+            rule_trigger_engine::TriggerTiming::Cron { expression } => {
+                has_supported = true;
+                if let Some(next) = compute_next_fire(expression, anchor, Some(anchor))? {
+                    earliest = Some(match earliest {
+                        Some(current) => current.min(next),
+                        None => next,
+                    });
+                }
+            }
+            rule_trigger_engine::TriggerTiming::Timer { value } => {
+                has_supported = true;
+                let resolved = rule_trigger_engine::resolve_timer_literal(value, anchor, timezone_offset)
+                    .map_err(|err| anyhow!("Failed to resolve timer precondition '{value}': {err}"))?;
+                let due_at = if resolved <= anchor { anchor } else { resolved };
+                earliest = Some(match earliest {
+                    Some(current) => current.min(due_at),
+                    None => due_at,
+                });
+            }
+            rule_trigger_engine::TriggerTiming::Event { .. } => {
+                has_supported = true;
+                has_event = true;
+            }
+            rule_trigger_engine::TriggerTiming::RepeatFrequency { .. } => {}
+        }
+    }
+
+    if let Some(next) = earliest {
+        Ok(Some(next))
+    } else if has_event {
+        Ok(None)
+    } else if has_supported {
+        Ok(None)
+    } else {
+        Err(anyhow!(
+            "No supported timing found in trigger rules (expected cron(...), timer(...), or event(...))."
+        ))
+    }
+}
+
+fn resolve_post_run_next_fire(
+    timings: &[rule_trigger_engine::TriggerTiming],
+    fire_time: DateTime<Utc>,
+    lower_bound: DateTime<Utc>,
+    timezone_offset: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let mut earliest: Option<DateTime<Utc>> = None;
+
+    for timing in timings {
+        match timing {
+            rule_trigger_engine::TriggerTiming::Cron { expression } => {
+                if let Some(next) = compute_next_fire(expression, fire_time, Some(lower_bound))? {
+                    earliest = Some(match earliest {
+                        Some(current) => current.min(next),
+                        None => next,
+                    });
+                }
+            }
+            rule_trigger_engine::TriggerTiming::Timer { value } => {
+                let resolved = rule_trigger_engine::resolve_timer_literal(value, fire_time, timezone_offset)
+                    .map_err(|err| anyhow!("Failed to resolve timer precondition '{value}': {err}"))?;
+                if resolved > lower_bound {
+                    earliest = Some(match earliest {
+                        Some(current) => current.min(resolved),
+                        None => resolved,
+                    });
+                }
+            }
+            rule_trigger_engine::TriggerTiming::Event { .. }
+            | rule_trigger_engine::TriggerTiming::RepeatFrequency { .. } => {}
+        }
+    }
+
+    Ok(earliest)
+}
+
+fn build_trigger_occurrences(
+    timings: &[rule_trigger_engine::TriggerTiming],
+    all_events: &[MonitoringEvent],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    registration_anchor: DateTime<Utc>,
+    timezone_offset: &str,
+) -> Result<Vec<DateTime<Utc>>> {
+    use std::collections::BTreeSet;
+
+    let mut occurrences = BTreeSet::new();
+    let tz = FixedOffset::from_str(timezone_offset).unwrap_or_else(|_| default_timezone());
+
+    for timing in timings {
+        match timing {
+            rule_trigger_engine::TriggerTiming::Cron { expression } => {
+                let schedule = Cron::from_str(expression)
+                    .with_context(|| format!("Invalid cron expression: {expression}"))?;
+                let mut next_local = schedule
+                    .find_next_occurrence(&start.with_timezone(&tz), false)
+                    .with_context(|| format!("Failed to find next occurrence for cron: {expression}"))?;
+                while next_local.with_timezone(&Utc) <= end {
+                    occurrences.insert(next_local.with_timezone(&Utc));
+                    next_local = schedule
+                        .find_next_occurrence(&next_local, false)
+                        .with_context(|| format!("Failed to find next occurrence for cron: {expression}"))?;
+                }
+            }
+            rule_trigger_engine::TriggerTiming::Timer { value } => {
+                let at = rule_trigger_engine::resolve_timer_literal(value, registration_anchor, timezone_offset)
+                    .map_err(|err| anyhow!("Failed to resolve timer precondition '{value}': {err}"))?;
+                if at >= start && at <= end {
+                    occurrences.insert(at);
+                }
+            }
+            rule_trigger_engine::TriggerTiming::Event { event_type } => {
+                for event in all_events {
+                    if event.event_type != *event_type {
+                        continue;
+                    }
+                    if let Ok(at) = DateTime::parse_from_rfc3339(&event.timestamp) {
+                        let at = at.with_timezone(&Utc);
+                        if at >= start && at <= end {
+                            occurrences.insert(at);
+                        }
+                    }
+                }
+            }
+            rule_trigger_engine::TriggerTiming::RepeatFrequency { .. } => {}
+        }
+    }
+
+    Ok(occurrences.into_iter().collect())
+}
+
+fn describe_timing_sources(timings: &[rule_trigger_engine::TriggerTiming]) -> String {
+    if timings.is_empty() {
+        return "none".to_string();
+    }
+
+    timings
+        .iter()
+        .map(|timing| match timing {
+            rule_trigger_engine::TriggerTiming::Cron { expression } => {
+                format!("cron({expression})")
+            }
+            rule_trigger_engine::TriggerTiming::Timer { value } => format!("timer({value})"),
+            rule_trigger_engine::TriggerTiming::Event { event_type } => {
+                format!("event({event_type})")
+            }
+            rule_trigger_engine::TriggerTiming::RepeatFrequency { frequency } => match frequency {
+                rule_trigger_engine::RepeatFrequency::PerDay(n) => format!("repeat_per_day({n})"),
+                rule_trigger_engine::RepeatFrequency::PerWeek(n) => {
+                    format!("repeat_per_week({n})")
+                }
+            },
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn replay_stashed_thing_into_document_set(

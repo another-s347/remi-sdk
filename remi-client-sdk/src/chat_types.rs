@@ -1,5 +1,7 @@
 //! Chat runtime types shared across SDK, mobile, and CLI.
 
+use crate::types::ChatSession;
+use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,6 +39,51 @@ pub struct ChatRunStatus {
     pub pending_interrupt: Option<PendingInterrupt>,
 }
 
+/// Versioned export of a persisted chat session for debugging or replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSessionExportBundle {
+    pub version: u32,
+    pub exported_at: DateTime<Utc>,
+    pub session: ChatSession,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<CachedMessage>,
+    pub protocol_state: ChatProtocolSessionState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_status: Option<ChatRunStatus>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub metadata: serde_json::Map<String, JsonValue>,
+}
+
+impl ChatSessionExportBundle {
+    pub const VERSION: u32 = 1;
+
+    pub fn new(
+        session: ChatSession,
+        messages: Vec<CachedMessage>,
+        protocol_state: ChatProtocolSessionState,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            exported_at: Utc::now(),
+            session,
+            messages,
+            protocol_state,
+            run_status: None,
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    pub fn with_run_status(mut self, run_status: ChatRunStatus) -> Self {
+        self.run_status = Some(run_status);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: serde_json::Map<String, JsonValue>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Cached Messages
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -66,6 +113,53 @@ pub enum CachedUiElement {
         tool_name: String,
         result: String,
     },
+    SubSession {
+        data: CachedSubSession,
+    },
+    Error {
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedSubSession {
+    pub parent_tool_call_id: String,
+    pub sub_session_id: String,
+    pub sub_run_id: String,
+    pub agent_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<CachedSubSessionItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CachedSubSessionItem {
+    Markdown {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    ToolCall {
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments_json: Option<String>,
+    },
+    ToolResult {
+        tool_name: String,
+        result: String,
+    },
+    TurnStart {
+        turn: u32,
+    },
     Error {
         text: String,
     },
@@ -90,6 +184,8 @@ pub struct CachedMessage {
     pub references: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_session: Option<CachedSubSession>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui_elements: Vec<CachedUiElement>,
 }
@@ -107,6 +203,7 @@ impl CachedMessage {
             tool_result: None,
             references: None,
             attachments: None,
+            sub_session: None,
             ui_elements: Vec::new(),
         }
     }
@@ -123,6 +220,7 @@ impl CachedMessage {
             tool_result: None,
             references: None,
             attachments: None,
+            sub_session: None,
             ui_elements: Vec::new(),
         }
     }
@@ -139,6 +237,7 @@ impl CachedMessage {
             tool_result: Some(result),
             references: None,
             attachments: None,
+            sub_session: None,
             ui_elements: Vec::new(),
         }
     }
@@ -212,6 +311,9 @@ fn derive_ui_elements(message: &CachedMessage) -> Vec<CachedUiElement> {
             tool_name: tool_name.clone(),
             arguments_json: parse_tool_call_arguments(&message.content),
         });
+        if let Some(sub_session) = message.sub_session.clone() {
+            elements.push(CachedUiElement::SubSession { data: sub_session });
+        }
         append_references(&mut elements, message.references.as_ref());
         append_images(&mut elements, image_uris);
         return elements;
@@ -338,6 +440,8 @@ fn parse_tool_call_arguments(content: &str) -> Option<String> {
 pub struct ChatProtocolSessionState {
     #[serde(default)]
     pub history: Vec<ProtocolHistoryMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_state: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_tool_execution: Option<PendingToolExecutionState>,
 }

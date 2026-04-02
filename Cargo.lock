@@ -3094,6 +3094,7 @@ name = "remi-client-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "automerge",
  "base64",

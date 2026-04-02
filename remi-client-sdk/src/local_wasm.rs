@@ -21,8 +21,6 @@ use remi_agentloop::types::{
 };
 use remi_agentloop_wasm::WasmAgentWithHttp;
 use serde_json::{Value as JsonValue, json};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::chat_client::proto as chat_proto;
 use crate::chat_client::{ChatStreamEvent, chat_stream_event};
@@ -669,42 +667,29 @@ pub(crate) async fn start_stream(
         return Err("Missing chat start/resume input".to_string());
     };
 
-    let stream = agent.clone();
-    let (tx, rx) = mpsc::channel(64);
     let mut run_tracer = LocalWasmRunTracer::from_loop_input(&loop_input, config);
+    if let Some(tracer) = run_tracer.as_mut() {
+        tracer.emit_initial_resume_traces().await;
+    }
 
-    tokio::spawn(async move {
-        if let Some(tracer) = run_tracer.as_mut() {
-            tracer.emit_initial_resume_traces().await;
-        }
+    Ok(Box::pin(async_stream::stream! {
+        let event_stream = agent
+            .chat(loop_input)
+            .await
+            .map_err(|error| error.message)?;
+        futures::pin_mut!(event_stream);
 
-        match stream.chat(loop_input).await {
-            Ok(event_stream) => {
-                let mut event_stream = std::pin::pin!(event_stream);
-                while let Some(event) = event_stream.next().await {
-                    if let Some(tracer) = run_tracer.as_mut() {
-                        tracer.on_protocol_event(&event).await;
-                    }
-                    tracing::debug!(
-                        event_type = protocol_event_type_name(&event),
-                        "[local_wasm] received guest protocol event"
-                    );
-                    if tx
-                        .send(map_protocol_event_to_chat_stream_event(event))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+        while let Some(event) = event_stream.next().await {
+            if let Some(tracer) = run_tracer.as_mut() {
+                tracer.on_protocol_event(&event).await;
             }
-            Err(error) => {
-                let _ = tx.send(Err(error.message)).await;
-            }
+            tracing::debug!(
+                event_type = protocol_event_type_name(&event),
+                "[local_wasm] received guest protocol event"
+            );
+            yield map_protocol_event_to_chat_stream_event(event);
         }
-    });
-
-    Ok(Box::pin(ReceiverStream::new(rx)))
+    }))
 }
 
 async fn loop_input_from_start(
@@ -745,7 +730,10 @@ async fn loop_input_from_start(
         metadata,
         message_metadata: None,
         user_name: None,
-        user_state: None,
+        user_state: input
+            .user_state
+            .as_ref()
+            .map(|user_state| prost_struct_to_json(user_state)),
     })
 }
 
@@ -1155,6 +1143,99 @@ fn map_protocol_event_to_chat_stream_event(
                 },
             )),
         },
+        ProtocolEvent::SubSession {
+            parent_tool_call_id,
+            sub_thread_id,
+            sub_run_id,
+            agent_name,
+            title,
+            depth,
+            event,
+        } => ChatStreamEvent {
+            event: Some(chat_stream_event::Event::SubSession(
+                chat_proto::ChatSubSessionEvent {
+                    parent_tool_call_id,
+                    sub_session_id: sub_thread_id,
+                    sub_run_id,
+                    agent_name,
+                    title: title.unwrap_or_default(),
+                    depth,
+                    event: Some(match event {
+                        remi_agentloop::prelude::SubSessionEventPayload::Start => {
+                            chat_proto::chat_sub_session_event::Event::Start(
+                                chat_proto::ChatSubSessionStartEvent {},
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::Delta { content } => {
+                            chat_proto::chat_sub_session_event::Event::Delta(
+                                chat_proto::ChatSubSessionDeltaEvent { content },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::ThinkingStart => {
+                            chat_proto::chat_sub_session_event::Event::ThinkingStart(
+                                chat_proto::ChatSubSessionThinkingStartEvent {},
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::ThinkingEnd { content } => {
+                            chat_proto::chat_sub_session_event::Event::ThinkingEnd(
+                                chat_proto::ChatSubSessionThinkingEndEvent { content },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::ToolCallStart { id, name } => {
+                            chat_proto::chat_sub_session_event::Event::ToolCallStart(
+                                chat_proto::ChatSubSessionToolCallStartEvent {
+                                    id,
+                                    tool_name: name,
+                                },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::ToolCallArgumentsDelta { id, delta } => {
+                            chat_proto::chat_sub_session_event::Event::ToolCallDelta(
+                                chat_proto::ChatSubSessionToolCallDeltaEvent {
+                                    id,
+                                    arguments_delta: delta,
+                                },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::ToolDelta { id, name, delta } => {
+                            chat_proto::chat_sub_session_event::Event::ToolDelta(
+                                chat_proto::ChatSubSessionToolDeltaEvent {
+                                    id,
+                                    tool_name: name,
+                                    delta,
+                                },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::ToolResult { id, name, result } => {
+                            chat_proto::chat_sub_session_event::Event::ToolResult(
+                                chat_proto::ChatSubSessionToolResultEvent {
+                                    id,
+                                    tool_name: name,
+                                    result,
+                                },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::TurnStart { turn } => {
+                            chat_proto::chat_sub_session_event::Event::TurnStart(
+                                chat_proto::ChatSubSessionTurnStartEvent { turn: turn as u32 },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::Done { final_output } => {
+                            chat_proto::chat_sub_session_event::Event::Done(
+                                chat_proto::ChatSubSessionDoneEvent {
+                                    final_output: final_output.unwrap_or_default(),
+                                },
+                            )
+                        }
+                        remi_agentloop::prelude::SubSessionEventPayload::Error { message } => {
+                            chat_proto::chat_sub_session_event::Event::Error(
+                                chat_proto::ChatSubSessionErrorEvent { message },
+                            )
+                        }
+                    }),
+                },
+            )),
+        },
         ProtocolEvent::Interrupt { interrupts } => ChatStreamEvent {
             event: Some(chat_stream_event::Event::Interrupt(
                 chat_proto::ChatInterruptStreamEvent {
@@ -1196,7 +1277,9 @@ fn map_protocol_event_to_chat_stream_event(
             )),
         },
         ProtocolEvent::Done => ChatStreamEvent {
-            event: Some(chat_stream_event::Event::Done(chat_proto::ChatDoneEvent {})),
+            event: Some(chat_stream_event::Event::Done(chat_proto::ChatDoneEvent {
+                state: None,
+            })),
         },
         ProtocolEvent::Cancelled => ChatStreamEvent {
             event: Some(chat_stream_event::Event::Cancelled(
@@ -1276,8 +1359,11 @@ fn map_custom_chat_event(event_type: String, extra: JsonValue) -> Result<ChatStr
                 });
             }
             Some("done") => {
+                let state = extra.get("state").and_then(json_to_prost_struct);
                 return Ok(ChatStreamEvent {
-                    event: Some(chat_stream_event::Event::Done(chat_proto::ChatDoneEvent {})),
+                    event: Some(chat_stream_event::Event::Done(chat_proto::ChatDoneEvent {
+                        state,
+                    })),
                 });
             }
             _ => {}
@@ -1310,17 +1396,18 @@ fn normalize_external_tool_call(call: &JsonValue) -> Option<(String, JsonValue)>
 
     let (variant, arguments) = obj.iter().next()?;
     let tool_name = match variant.as_str() {
-        "ListThings" => "list_things_tool",
-        "GetThingMarkdown" => "get_things_tool",
-        "AddThing" => "add_things_tool",
-        "EditThing" => "edit_things_tool",
-        "RemoveThing" => "remove_things_tool",
-        "MoveThing" => "move_things_tool",
+        "Ls" => "ls_tool",
+        "Cat" => "cat_tool",
+        "Create" => "create_tool",
+        "Tree" => "tree_tool",
+        "ReadPath" => "cat_tool",
+        "EditPath" => "edit_path_tool",
+        "DeletePath" => "delete_path_tool",
+        "MovePath" => "move_path_tool",
         "CreateTriggerSimple" => "create_trigger_simple",
         "CreateTrigger" => "create_trigger",
         "DeleteTrigger" => "delete_trigger",
         "TestTrigger" => "test_trigger",
-        "ListTriggers" => "list_triggers_tool",
         "RetrieveEvents" => "retrieve_events",
         "AbstractEvents" => "abstract_events",
         "ResolveUri" => "resolve_uri",
@@ -1688,6 +1775,70 @@ mod tests {
         assert_eq!(need_tool.tool_calls[0].tool_name, "resolve_uri");
     }
 
+    #[test]
+    fn custom_done_maps_state() {
+        let event = ProtocolEvent::Custom {
+            event_type: "remi_agent".to_string(),
+            extra: json!({
+                "type": "done",
+                "state": {
+                    "run_id": "run-1",
+                    "thread_id": "thread-1",
+                    "user_state": { "agent_mode": "deep" }
+                }
+            }),
+        };
+
+        let mapped = map_protocol_event_to_chat_stream_event(event).expect("mapped event");
+        let Some(chat_stream_event::Event::Done(done)) = mapped.event else {
+            panic!("expected done event");
+        };
+
+        let state = done.state.as_ref().map(prost_struct_to_json).expect("done state");
+        assert_eq!(state.get("run_id").and_then(|value| value.as_str()), Some("run-1"));
+        assert_eq!(
+            state
+                .get("user_state")
+                .and_then(|value| value.get("agent_mode"))
+                .and_then(|value| value.as_str()),
+            Some("deep")
+        );
+    }
+
+    #[test]
+    fn sub_session_maps_to_chat_sub_session_event() {
+        let event = ProtocolEvent::SubSession {
+            parent_tool_call_id: "call-1".to_string(),
+            sub_thread_id: "sub-thread-1".to_string(),
+            sub_run_id: "sub-run-1".to_string(),
+            agent_name: "calculator".to_string(),
+            title: Some("4+2*2".to_string()),
+            depth: 0,
+            event: remi_agentloop::prelude::SubSessionEventPayload::ToolCallStart {
+                id: "inner-call-1".to_string(),
+                name: "multiply".to_string(),
+            },
+        };
+
+        let mapped = map_protocol_event_to_chat_stream_event(event).expect("mapped event");
+        let Some(chat_stream_event::Event::SubSession(sub_session)) = mapped.event else {
+            panic!("expected sub_session event");
+        };
+
+        assert_eq!(sub_session.parent_tool_call_id, "call-1");
+        assert_eq!(sub_session.sub_session_id, "sub-thread-1");
+        assert_eq!(sub_session.sub_run_id, "sub-run-1");
+        assert_eq!(sub_session.agent_name, "calculator");
+        assert_eq!(sub_session.title, "4+2*2");
+
+        let Some(chat_proto::chat_sub_session_event::Event::ToolCallStart(tool_call)) = sub_session.event else {
+            panic!("expected nested tool_call_start event");
+        };
+
+        assert_eq!(tool_call.id, "inner-call-1");
+        assert_eq!(tool_call.tool_name, "multiply");
+    }
+
     #[tokio::test]
     async fn content_conversion_avoids_duplicate_text_parts() {
         let content = content_from_proto(
@@ -1733,6 +1884,7 @@ fn protocol_event_type_name(event: &ProtocolEvent) -> &'static str {
         ProtocolEvent::ToolCallDelta { .. } => "tool_call_delta",
         ProtocolEvent::ToolDelta { .. } => "tool_delta",
         ProtocolEvent::ToolResult { .. } => "tool_result",
+        ProtocolEvent::SubSession { .. } => "sub_session",
         ProtocolEvent::Interrupt { .. } => "interrupt",
         ProtocolEvent::TurnStart { .. } => "turn_start",
         ProtocolEvent::Usage { .. } => "usage",

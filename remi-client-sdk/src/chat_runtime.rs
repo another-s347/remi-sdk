@@ -53,6 +53,11 @@ struct SessionState {
     messages: Vec<CachedMessage>,
     index: HashMap<String, usize>,
     version: u64,
+    run_state: ChatRunState,
+    last_error: Option<String>,
+    pending_interrupt: Option<PendingInterrupt>,
+    cancel_tx: Option<mpsc::Sender<()>>,
+    current_run_id: Option<u64>,
     protocol_state: ChatProtocolSessionState,
     protocol_loaded: bool,
     /// Accumulated content by message ID (for streaming)
@@ -66,6 +71,8 @@ struct SessionState {
     tool_call_name: HashMap<String, String>,
     /// Accumulated tool result content by tool_call_id
     tool_result_content: HashMap<String, String>,
+    /// Structured sub-session drafts keyed by parent tool_call_id.
+    sub_sessions: HashMap<String, ProtocolSubSessionDraft>,
 }
 
 impl SessionState {
@@ -102,6 +109,227 @@ struct ProtocolToolCallDraft {
     id: String,
     tool_name: String,
     arguments_json: String,
+}
+
+#[derive(Clone)]
+struct ProtocolSubSessionDraft {
+    cached: CachedSubSession,
+    tool_call_items: HashMap<String, usize>,
+    tool_result_items: HashMap<String, usize>,
+}
+
+impl ProtocolSubSessionDraft {
+    fn new(
+        parent_tool_call_id: String,
+        sub_session_id: String,
+        sub_run_id: String,
+        agent_name: String,
+        title: Option<String>,
+        depth: u32,
+    ) -> Self {
+        Self {
+            cached: CachedSubSession {
+                parent_tool_call_id,
+                sub_session_id,
+                sub_run_id,
+                agent_name,
+                title,
+                depth,
+                items: Vec::new(),
+                final_output: None,
+                status: Some("running".to_string()),
+            },
+            tool_call_items: HashMap::new(),
+            tool_result_items: HashMap::new(),
+        }
+    }
+
+    fn from_cached(cached: CachedSubSession) -> Self {
+        Self {
+            cached,
+            tool_call_items: HashMap::new(),
+            tool_result_items: HashMap::new(),
+        }
+    }
+
+    fn snapshot(&self) -> CachedSubSession {
+        self.cached.clone()
+    }
+
+    fn append_markdown(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        match self.cached.items.last_mut() {
+            Some(CachedSubSessionItem::Markdown { text }) => text.push_str(delta),
+            _ => self.cached.items.push(CachedSubSessionItem::Markdown {
+                text: delta.to_string(),
+            }),
+        }
+    }
+
+    fn push_thinking(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.cached.items.push(CachedSubSessionItem::Thinking { text });
+    }
+
+    fn upsert_tool_call_start(&mut self, id: &str, tool_name: &str) {
+        if let Some(index) = self.tool_call_items.get(id).copied() {
+            if let Some(CachedSubSessionItem::ToolCall { tool_name: existing_name, .. }) =
+                self.cached.items.get_mut(index)
+            {
+                *existing_name = tool_name.to_string();
+            }
+            return;
+        }
+
+        let index = self.cached.items.len();
+        self.cached.items.push(CachedSubSessionItem::ToolCall {
+            tool_name: tool_name.to_string(),
+            arguments_json: None,
+        });
+        self.tool_call_items.insert(id.to_string(), index);
+    }
+
+    fn append_tool_call_delta(&mut self, id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        let index = if let Some(index) = self.tool_call_items.get(id).copied() {
+            index
+        } else {
+            let index = self.cached.items.len();
+            self.cached.items.push(CachedSubSessionItem::ToolCall {
+                tool_name: "(unknown)".to_string(),
+                arguments_json: Some(delta.to_string()),
+            });
+            self.tool_call_items.insert(id.to_string(), index);
+            return;
+        };
+
+        if let Some(CachedSubSessionItem::ToolCall { arguments_json, .. }) =
+            self.cached.items.get_mut(index)
+        {
+            let entry = arguments_json.get_or_insert_with(String::new);
+            entry.push_str(delta);
+        }
+    }
+
+    fn append_tool_result_delta(&mut self, id: &str, tool_name: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        let index = self
+            .tool_result_items
+            .entry(id.to_string())
+            .or_insert_with(|| {
+                let index = self.cached.items.len();
+                self.cached.items.push(CachedSubSessionItem::ToolResult {
+                    tool_name: tool_name.to_string(),
+                    result: String::new(),
+                });
+                index
+            })
+            .to_owned();
+
+        if let Some(CachedSubSessionItem::ToolResult { tool_name: existing_name, result }) =
+            self.cached.items.get_mut(index)
+        {
+            if !tool_name.trim().is_empty() {
+                *existing_name = tool_name.to_string();
+            }
+            result.push_str(delta);
+        }
+    }
+
+    fn set_tool_result(&mut self, id: &str, tool_name: &str, result: String) {
+        let index = self
+            .tool_result_items
+            .entry(id.to_string())
+            .or_insert_with(|| {
+                let index = self.cached.items.len();
+                self.cached.items.push(CachedSubSessionItem::ToolResult {
+                    tool_name: tool_name.to_string(),
+                    result: String::new(),
+                });
+                index
+            })
+            .to_owned();
+
+        if let Some(CachedSubSessionItem::ToolResult { tool_name: existing_name, result: existing_result }) =
+            self.cached.items.get_mut(index)
+        {
+            if !tool_name.trim().is_empty() {
+                *existing_name = tool_name.to_string();
+            }
+            *existing_result = result;
+        }
+    }
+
+    fn push_turn_start(&mut self, turn: u32) {
+        self.cached.items.push(CachedSubSessionItem::TurnStart { turn });
+    }
+
+    fn finish(&mut self, final_output: Option<String>) {
+        self.cached.final_output = final_output.filter(|value| !value.trim().is_empty());
+        self.cached.status = Some("completed".to_string());
+    }
+
+    fn fail(&mut self, message: String) {
+        self.cached.status = Some("error".to_string());
+        self.cached.items.push(CachedSubSessionItem::Error {
+            text: message,
+        });
+    }
+}
+
+fn combined_tool_call_arguments(session: &SessionState, tool_call_id: &str) -> Option<String> {
+    let args = session
+        .tool_call_args
+        .get(tool_call_id)
+        .map(|chunks| chunks.values().cloned().collect::<String>())
+        .unwrap_or_default();
+
+    if args.trim().is_empty() {
+        None
+    } else {
+        Some(args)
+    }
+}
+
+fn build_tool_call_message(session: &SessionState, tool_call_id: &str, now_ms: i64) -> CachedMessage {
+    let tool_name = session
+        .tool_call_name
+        .get(tool_call_id)
+        .cloned()
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let arguments_json = combined_tool_call_arguments(session, tool_call_id);
+
+    let mut message = CachedMessage::assistant(format!("tool_call:{}", tool_call_id), now_ms);
+    message.content = match arguments_json.as_ref() {
+        Some(arguments) => format!("Tool call: `{}`\n\n```json\n{}\n```", tool_name, arguments),
+        None => format!("Tool call: `{}`", tool_name),
+    };
+    message.tool_name = Some(tool_name);
+    message.sub_session = session
+        .sub_sessions
+        .get(tool_call_id)
+        .map(ProtocolSubSessionDraft::snapshot);
+    message
+}
+
+fn attach_sub_session_to_parent_tool_call(session: &mut SessionState, tool_call_id: &str, now_ms: i64) {
+    if !session.sub_sessions.contains_key(tool_call_id) {
+        return;
+    }
+
+    let message = build_tool_call_message(session, tool_call_id, now_ms);
+    session.upsert(message);
 }
 
 impl ProtocolTurnState {
@@ -184,6 +412,28 @@ impl ProtocolTurnState {
             .push(outcome_to_protocol_tool_message(outcome));
     }
 
+    fn has_tool_phase(&self) -> bool {
+        !self.tool_calls.is_empty() || !self.tool_messages.is_empty()
+    }
+
+    fn flush_phase_into_history(&mut self, session: &mut SessionState, assistant_id: &str) {
+        if let Some(user) = self.pending_user.take() {
+            session.protocol_state.history.push(user);
+        }
+        if let Some(assistant) = self.assistant_message(assistant_id) {
+            session.protocol_state.history.push(assistant);
+        }
+        session
+            .protocol_state
+            .history
+            .extend(self.tool_messages.drain(..));
+        session.protocol_state.pending_tool_execution = None;
+        self.assistant_content.clear();
+        self.assistant_reasoning = None;
+        self.tool_calls.clear();
+        self.committed = false;
+    }
+
     fn commit_completed(&mut self, session: &mut SessionState, assistant_id: &str) {
         if self.committed {
             return;
@@ -254,6 +504,7 @@ enum Command {
         system_prompt: Option<String>,
         references: Option<JsonValue>,
         attachments: Option<JsonValue>,
+        agent_mode: Option<String>,
         user_msg_id: Option<String>,
         assistant_msg_id: Option<String>,
         reply: oneshot::Sender<Result<(), String>>,
@@ -266,11 +517,20 @@ enum Command {
         reply: oneshot::Sender<Result<(), String>>,
     },
 
-    /// Cancel current run
-    Cancel { reply: oneshot::Sender<()> },
+    /// Cancel one session or every in-flight session.
+    Cancel {
+        session_id: Option<String>,
+        reply: oneshot::Sender<()>,
+    },
 
     /// Get current status
     GetStatus {
+        reply: oneshot::Sender<ChatRunStatus>,
+    },
+
+    /// Get status for a specific session
+    GetSessionStatus {
+        session_id: String,
         reply: oneshot::Sender<ChatRunStatus>,
     },
 
@@ -328,23 +588,18 @@ struct ActorState {
     config: ChatRuntimeConfig,
     backend: ChatExecutionBackend,
 
-    // Run state
-    state: ChatRunState,
-    active_session_id: Option<String>,
-    last_error: Option<String>,
-    pending_interrupt: Option<PendingInterrupt>,
-
     // Sessions
     sessions: HashMap<String, SessionState>,
+
+    // Last emitted status for compatibility with legacy polling APIs.
+    latest_status: ChatRunStatus,
+    next_run_id: u64,
 
     // External tool execution
     external_tool_executor: ExternalToolExecutor,
 
     // Event subscribers
     subscribers: Vec<mpsc::Sender<ChatRuntimeEvent>>,
-
-    // Cancel channel for current stream
-    cancel_tx: Option<mpsc::Sender<()>>,
 
     // SDK reference for DB persistence
     sdk: Option<Arc<TriggerSdk>>,
@@ -356,14 +611,11 @@ impl ActorState {
             access_token: None,
             config: ChatRuntimeConfig::default(),
             backend: ChatExecutionBackend::default(),
-            state: ChatRunState::Idle,
-            active_session_id: None,
-            last_error: None,
-            pending_interrupt: None,
             sessions: HashMap::new(),
+            latest_status: ChatRunStatus::default(),
+            next_run_id: 1,
             external_tool_executor: ExternalToolExecutor::new(),
             subscribers: Vec::new(),
-            cancel_tx: None,
             sdk: None,
         }
     }
@@ -377,27 +629,277 @@ impl ActorState {
             .retain(|tx| tx.try_send(event.clone()).is_ok());
     }
 
-    fn set_state(&mut self, new_state: ChatRunState) {
-        self.state = new_state;
+    fn next_run_id(&mut self) -> u64 {
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+        run_id
+    }
+
+    fn status_for_session(&self, session_id: &str) -> ChatRunStatus {
+        match self.sessions.get(session_id) {
+            Some(session) => ChatRunStatus {
+                state: session.run_state,
+                session_id: Some(session_id.to_string()),
+                error_message: session.last_error.clone(),
+                pending_interrupt: session.pending_interrupt.clone(),
+            },
+            None => ChatRunStatus {
+                session_id: Some(session_id.to_string()),
+                ..ChatRunStatus::default()
+            },
+        }
+    }
+
+    fn emit_session_status(&mut self, session_id: &str) {
+        let status = self.status_for_session(session_id);
+        self.latest_status = status.clone();
         self.emit_event(ChatRuntimeEvent::StatusChanged {
-            state: self.state,
-            session_id: self.active_session_id.clone(),
-            error: self.last_error.clone(),
+            state: status.state,
+            session_id: status.session_id,
+            error: status.error_message,
         });
     }
 
     fn status(&self) -> ChatRunStatus {
-        ChatRunStatus {
-            state: self.state,
-            session_id: self.active_session_id.clone(),
-            error_message: self.last_error.clone(),
-            pending_interrupt: self.pending_interrupt.clone(),
-        }
+        self.latest_status.clone()
     }
 }
 
 fn build_execution_backend(config: &ChatRuntimeConfig) -> Result<ChatExecutionBackend, String> {
     build_chat_agent(config).map(ChatExecutionBackend)
+}
+
+fn apply_agent_mode_override(
+    user_state: Option<JsonValue>,
+    agent_mode: Option<&str>,
+) -> Option<JsonValue> {
+    let Some(agent_mode) = agent_mode.and_then(|value| match value {
+        "ask" | "light" => Some("ask"),
+        "manager" | "deep" => Some("manager"),
+        _ => None,
+    }) else {
+        return user_state;
+    };
+
+    let mut user_state = match user_state {
+        Some(JsonValue::Object(map)) => JsonValue::Object(map),
+        _ => json!({}),
+    };
+
+    let Some(root) = user_state.as_object_mut() else {
+        return Some(json!({
+            "agent_mode": agent_mode,
+            "remi_handoff": { "current_agent": agent_mode },
+        }));
+    };
+
+    root.insert("agent_mode".to_string(), JsonValue::String(agent_mode.to_string()));
+    root.remove("handoff_summary");
+
+    let handoff = root
+        .entry("remi_handoff".to_string())
+        .or_insert_with(|| json!({}));
+    if !handoff.is_object() {
+        *handoff = json!({});
+    }
+    if let Some(handoff) = handoff.as_object_mut() {
+        handoff.insert(
+            "current_agent".to_string(),
+            JsonValue::String(agent_mode.to_string()),
+        );
+        handoff.remove("handoff_summary");
+    }
+
+    Some(user_state)
+}
+
+fn parse_active_context_json_text(text: &str) -> Option<JsonValue> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let parsed: JsonValue = serde_json::from_str(trimmed).ok()?;
+    match &parsed {
+        JsonValue::Object(map) if !map.is_empty() => Some(parsed),
+        JsonValue::Array(_) => Some(parsed),
+        _ => None,
+    }
+}
+
+fn references_to_active_context_json(references: Option<&JsonValue>) -> Option<JsonValue> {
+    let items = references?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut modes: BTreeMap<String, Vec<JsonValue>> = BTreeMap::new();
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(item_type) = object.get("type").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(uuid) = object.get("uuid").and_then(JsonValue::as_str) else {
+            continue;
+        };
+
+        let mode = object
+            .get("mode")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("viewing")
+            .to_string();
+
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".to_string(), JsonValue::String(item_type.to_string()));
+        entry.insert("uuid".to_string(), JsonValue::String(uuid.to_string()));
+        if let Some(title) = object.get("title").and_then(JsonValue::as_str) {
+            entry.insert("title".to_string(), JsonValue::String(title.to_string()));
+        }
+        if let Some(metadata) = object.get("metadata") {
+            entry.insert("metadata".to_string(), metadata.clone());
+        }
+        if let Some(is_auto_reference) = object
+            .get("is_auto_reference")
+            .and_then(JsonValue::as_bool)
+            .or_else(|| object.get("isAutoReference").and_then(JsonValue::as_bool))
+        {
+            entry.insert(
+                "is_auto_reference".to_string(),
+                JsonValue::Bool(is_auto_reference),
+            );
+        }
+
+        modes.entry(mode).or_default().push(JsonValue::Object(entry));
+    }
+
+    if modes.is_empty() {
+        return None;
+    }
+
+    Some(JsonValue::Object(
+        modes
+            .into_iter()
+            .map(|(mode, entries)| (mode, JsonValue::Array(entries)))
+            .collect(),
+    ))
+}
+
+fn merge_active_context_into_user_state(
+    user_state: Option<JsonValue>,
+    active_context: Option<JsonValue>,
+) -> Option<JsonValue> {
+    let Some(active_context) = active_context else {
+        return user_state;
+    };
+
+    let mut user_state = match user_state {
+        Some(JsonValue::Object(map)) => JsonValue::Object(map),
+        _ => json!({}),
+    };
+
+    if let Some(root) = user_state.as_object_mut() {
+        root.insert("active_context".to_string(), active_context);
+    }
+
+    Some(user_state)
+}
+
+fn uploaded_images_to_user_state(image_uris: &[UploadedImage]) -> Option<JsonValue> {
+    if image_uris.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "images": image_uris
+            .iter()
+            .map(|image| json!({ "uri": image.remi_uri }))
+            .collect::<Vec<_>>()
+    }))
+}
+
+fn merge_chat_attachments_into_user_state(
+    user_state: Option<JsonValue>,
+    attachment_context: Option<JsonValue>,
+) -> Option<JsonValue> {
+    let Some(attachment_context) = attachment_context else {
+        return user_state;
+    };
+
+    let mut user_state = match user_state {
+        Some(JsonValue::Object(map)) => JsonValue::Object(map),
+        _ => json!({}),
+    };
+
+    if let Some(root) = user_state.as_object_mut() {
+        root.insert("chat_input_attachments".to_string(), attachment_context);
+    }
+
+    Some(user_state)
+}
+
+fn build_chat_attachment_prompt(image_uris: &[UploadedImage]) -> Option<String> {
+    if image_uris.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from(
+        "## Chat Input Images\n\nThe current user message includes image attachments that are already available as remi:// URIs. If you want to save one into a Thing, call create_tool with type_name=\"image\", parent_path set to the target thing directory, and source_uri set to one of the URIs below. Example parent path: /collection/<collection_uuid>/things/<thing_uuid>.\n\n```yaml\nimages:\n",
+    );
+    for image in image_uris {
+        out.push_str(&format!("  - uri: \"{}\"\n", image.remi_uri.replace('"', "\\\"")));
+    }
+    out.push_str("```");
+    Some(out)
+}
+
+fn build_transient_system_prompt(
+    sdk: Option<&Arc<TriggerSdk>>,
+    device_id: &str,
+    system_prompt: Option<&str>,
+    active_context_json: Option<&JsonValue>,
+    attachment_prompt: Option<&str>,
+) -> Option<String> {
+    let system_prompt = system_prompt.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let system_prompt_active_context = system_prompt
+        .as_deref()
+        .and_then(parse_active_context_json_text);
+
+    let active_context = active_context_json
+        .cloned()
+        .or(system_prompt_active_context.clone());
+
+    let active_context_prompt = active_context
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok())
+        .and_then(|raw| {
+            sdk.and_then(|sdk| sdk.build_active_context_prompt(device_id, Some(&raw)).ok().flatten())
+        });
+
+    let base_prompt = match (system_prompt, active_context_prompt) {
+        (Some(_existing), Some(active_prompt)) if system_prompt_active_context.is_some() => Some(active_prompt),
+        (Some(existing), Some(_active_prompt)) => Some(existing),
+        (Some(existing), None) => Some(existing),
+        (None, Some(active_prompt)) => Some(active_prompt),
+        (None, None) => None,
+    };
+
+    match (base_prompt, attachment_prompt.filter(|value| !value.trim().is_empty())) {
+        (Some(base), Some(attachment_prompt)) => Some(format!("{base}\n\n{attachment_prompt}")),
+        (Some(base), None) => Some(base),
+        (None, Some(attachment_prompt)) => Some(attachment_prompt.to_string()),
+        (None, None) => None,
+    }
 }
 
 async fn open_chat_stream(
@@ -762,6 +1264,7 @@ impl ChatRuntime {
         system_prompt: Option<String>,
         references: Option<JsonValue>,
         attachments: Option<JsonValue>,
+        agent_mode: Option<String>,
         user_msg_id: Option<String>,
         assistant_msg_id: Option<String>,
     ) -> Result<(), String> {
@@ -773,6 +1276,7 @@ impl ChatRuntime {
                 system_prompt,
                 references,
                 attachments,
+                agent_mode,
                 user_msg_id,
                 assistant_msg_id,
                 reply: reply_tx,
@@ -796,11 +1300,14 @@ impl ChatRuntime {
         reply_rx.await.map_err(|_| "Runtime stopped")?
     }
 
-    /// Cancel current run
-    pub async fn cancel(&self) -> Result<(), String> {
+    /// Cancel one session or, when omitted, all running sessions.
+    pub async fn cancel(&self, session_id: Option<String>) -> Result<(), String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Cancel { reply: reply_tx })
+            .send(Command::Cancel {
+                session_id,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| "Runtime stopped")?;
         reply_rx.await.map_err(|_| "Runtime stopped")?;
@@ -819,6 +1326,29 @@ impl ChatRuntime {
             return ChatRunStatus::default();
         }
         reply_rx.await.unwrap_or_default()
+    }
+
+    /// Get status for one session.
+    pub async fn get_session_status(&self, session_id: &str) -> ChatRunStatus {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(Command::GetSessionStatus {
+                session_id: session_id.to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return ChatRunStatus {
+                session_id: Some(session_id.to_string()),
+                ..ChatRunStatus::default()
+            };
+        }
+        reply_rx.await.unwrap_or(ChatRunStatus {
+            session_id: Some(session_id.to_string()),
+            ..ChatRunStatus::default()
+        })
     }
 
     /// Get status version (for polling-based change detection)
@@ -987,6 +1517,7 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
                 system_prompt,
                 references,
                 attachments,
+                agent_mode,
                 user_msg_id,
                 assistant_msg_id,
                 reply,
@@ -998,6 +1529,7 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
                     system_prompt,
                     references,
                     attachments,
+                    agent_mode,
                     user_msg_id,
                     assistant_msg_id,
                 )
@@ -1014,14 +1546,43 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
                 let _ = reply.send(result);
             }
 
-            Command::Cancel { reply } => {
-                let mut s = state.write().await;
-                if let Some(tx) = s.cancel_tx.take() {
+            Command::Cancel { session_id, reply } => {
+                let mut cancellations = Vec::new();
+                {
+                    let mut s = state.write().await;
+                    match session_id.as_ref() {
+                        Some(session_id) => {
+                            if let Some(session) = s.sessions.get_mut(session_id) {
+                                if let Some(tx) = session.cancel_tx.take() {
+                                    cancellations.push(tx);
+                                }
+                                session.current_run_id = None;
+                                session.run_state = ChatRunState::Idle;
+                                session.last_error = None;
+                                session.pending_interrupt = None;
+                                s.emit_session_status(session_id);
+                            }
+                        }
+                        None => {
+                            let session_ids = s.sessions.keys().cloned().collect::<Vec<_>>();
+                            for session_id in session_ids {
+                                if let Some(session) = s.sessions.get_mut(&session_id) {
+                                    if let Some(tx) = session.cancel_tx.take() {
+                                        cancellations.push(tx);
+                                    }
+                                    session.current_run_id = None;
+                                    session.run_state = ChatRunState::Idle;
+                                    session.last_error = None;
+                                    session.pending_interrupt = None;
+                                }
+                                s.emit_session_status(&session_id);
+                            }
+                        }
+                    }
+                }
+                for tx in cancellations {
                     let _ = tx.send(()).await;
                 }
-                s.active_session_id = None;
-                s.state = ChatRunState::Idle;
-                s.pending_interrupt = None;
                 STATUS_VERSION.fetch_add(1, Ordering::SeqCst);
                 let _ = reply.send(());
             }
@@ -1029,6 +1590,11 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
             Command::GetStatus { reply } => {
                 let s = state.read().await;
                 let _ = reply.send(s.status());
+            }
+
+            Command::GetSessionStatus { session_id, reply } => {
+                let s = state.read().await;
+                let _ = reply.send(s.status_for_session(&session_id));
             }
 
             Command::GetMessages { session_id, reply } => {
@@ -1060,8 +1626,15 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
                 let sess = s.get_or_create_session(&session_id);
                 sess.messages.clear();
                 sess.index.clear();
+                sess.sub_sessions.clear();
                 for mut msg in messages {
                     msg.refresh_ui_elements();
+                    if let Some(sub_session) = msg.sub_session.clone() {
+                        sess.sub_sessions.insert(
+                            sub_session.parent_tool_call_id.clone(),
+                            ProtocolSubSessionDraft::from_cached(sub_session),
+                        );
+                    }
                     let id = msg.id.clone();
                     let idx = sess.messages.len();
                     sess.messages.push(msg);
@@ -1348,6 +1921,7 @@ async fn handle_send_message(
     system_prompt: Option<String>,
     references: Option<JsonValue>,
     attachments: Option<JsonValue>,
+    agent_mode: Option<String>,
     user_msg_id: Option<String>,
     assistant_msg_id: Option<String>,
 ) -> Result<(), String> {
@@ -1369,14 +1943,6 @@ async fn handle_send_message(
 
     ensure_protocol_state_loaded(&state, &session_id).await?;
 
-    // Cancel any existing run
-    {
-        let mut s = state.write().await;
-        if let Some(tx) = s.cancel_tx.take() {
-            let _ = tx.send(()).await;
-        }
-    }
-
     // Generate message IDs
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1390,28 +1956,36 @@ async fn handle_send_message(
     // The model may emit multiple assistant messages (different message IDs),
     // and pre-creating a single placeholder causes UI to look like it only
     // ever updates one bubble.
-    let cache_version = {
+    let (cache_version, previous_cancel, run_id) = {
         let mut s = state.write().await;
+        let run_id = s.next_run_id();
+        let mut previous_cancel = None;
         let version = {
             let sess = s.get_or_create_session(&session_id);
+            previous_cancel = sess.cancel_tx.take();
+            sess.current_run_id = Some(run_id);
+            sess.run_state = ChatRunState::Running;
+            sess.last_error = None;
+            sess.pending_interrupt = None;
             let mut m = CachedMessage::user(user_id.clone(), message.clone(), now_ms);
             m.references = references.clone();
             m.attachments = attachments.clone();
             sess.upsert(m);
             sess.version
         };
-        s.active_session_id = Some(session_id.clone());
-        s.state = ChatRunState::Running;
-        s.last_error = None;
-        s.pending_interrupt = None;
+        s.emit_session_status(&session_id);
         STATUS_VERSION.fetch_add(1, Ordering::SeqCst);
         s.emit_event(ChatRuntimeEvent::CacheUpdated {
             session_id: session_id.clone(),
             version,
         });
-        version
+        (version, previous_cancel, run_id)
     };
     let _ = cache_version; // silence unused warning
+
+    if let Some(tx) = previous_cancel {
+        let _ = tx.send(()).await;
+    }
 
     // Persist to DB
     if let Some(ref sdk) = sdk {
@@ -1454,13 +2028,14 @@ async fn handle_send_message(
             let error_msg = format!("Image upload failed: {}", e);
             tracing::error!(error = %error_msg, "Aborting chat send due to image upload failure");
             let mut s = state.write().await;
-            s.state = ChatRunState::Idle;
-            s.last_error = Some(error_msg.clone());
-            s.emit_event(ChatRuntimeEvent::StatusChanged {
-                state: ChatRunState::Idle,
-                session_id: Some(session_id.clone()),
-                error: Some(error_msg.clone()),
-            });
+            if let Some(session) = s.sessions.get_mut(&session_id) {
+                session.current_run_id = None;
+                session.run_state = ChatRunState::Error;
+                session.last_error = Some(error_msg.clone());
+                session.pending_interrupt = None;
+                session.cancel_tx = None;
+            }
+            s.emit_session_status(&session_id);
             return Err(error_msg);
         }
     };
@@ -1469,40 +2044,78 @@ async fn handle_send_message(
     let start_input = {
         let mut s = state.write().await;
         let session = s.get_or_create_session(&session_id);
-        if session.protocol_state.history.is_empty() {
-            if let Some(sys) = system_prompt.as_ref().filter(|value| !value.trim().is_empty()) {
-                session.protocol_state.history.push(ProtocolHistoryMessage {
-                    id: format!("system_{}", now_ms),
-                    role: "system".to_string(),
-                    content: JsonValue::String(sys.clone()),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    reasoning_content: None,
-                });
-            }
+        let latest_user_state = session
+            .protocol_state
+            .latest_state
+            .as_ref()
+            .and_then(|state| state.get("user_state"))
+            .cloned();
+        let raw_active_context = references_to_active_context_json(references.as_ref())
+            .or_else(|| system_prompt.as_deref().and_then(parse_active_context_json_text));
+        let normalized_active_context = raw_active_context.as_ref().and_then(|value| {
+            serde_json::to_string(value)
+                .ok()
+                .and_then(|raw| sdk.as_ref().and_then(|sdk| sdk.normalize_active_context_json(&config.device_id, Some(&raw)).ok().flatten()))
+                .or_else(|| Some(value.clone()))
+        });
+        let attachment_context = uploaded_images_to_user_state(&image_uris);
+        let effective_user_state = merge_chat_attachments_into_user_state(
+            merge_active_context_into_user_state(
+                apply_agent_mode_override(latest_user_state, agent_mode.as_deref()),
+                normalized_active_context,
+            ),
+            attachment_context,
+        );
+        let attachment_prompt = build_chat_attachment_prompt(&image_uris);
+        let transient_system_prompt = build_transient_system_prompt(
+            sdk.as_ref(),
+            &config.device_id,
+            system_prompt.as_deref(),
+            raw_active_context.as_ref(),
+            attachment_prompt.as_deref(),
+        );
+        let mut request_history = session.protocol_state.history.clone();
+        if let Some(sys) = transient_system_prompt {
+            request_history.push(ProtocolHistoryMessage {
+                id: format!("system_{}", now_ms),
+                role: "system".to_string(),
+                content: JsonValue::String(sys),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
         }
 
         chat_proto::ChatStartInput {
-            history: session
-                .protocol_state
-                .history
+            history: request_history
                 .iter()
                 .map(protocol_history_to_proto)
                 .collect(),
             current: Some(current_input.clone()),
             metadata: build_chat_start_metadata(&config, &session_id),
-            extra_tools: external_tool_schema::chat_start_extra_tools(None),
+            extra_tools: external_tool_schema::chat_start_extra_tools(effective_user_state.as_ref()),
+            user_state: effective_user_state
+                .clone()
+                .map(json_value_to_prost_struct),
         }
     };
 
     // Create cancel channel
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-    state.write().await.cancel_tx = Some(cancel_tx);
+    {
+        let mut s = state.write().await;
+        if let Some(session) = s.sessions.get_mut(&session_id) {
+            if session.current_run_id == Some(run_id) {
+                session.cancel_tx = Some(cancel_tx);
+            }
+        }
+    }
 
     // Spawn stream processing task
     let state_clone = state.clone();
     let session_id_clone = session_id.clone();
     let assistant_id_clone = assistant_id.clone();
+    let run_id_clone = run_id;
 
     tracing::info!(session_id = %session_id, "[ChatRuntime] spawning run_stream_loop");
     tokio::spawn(async move {
@@ -1531,24 +2144,32 @@ async fn handle_send_message(
         let mut should_persist = false;
         {
             let mut s = state_clone.write().await;
-            if s.active_session_id.as_ref() == Some(&session_id_clone) {
+            let should_handle_result = s
+                .sessions
+                .get(&session_id_clone)
+                .map(|session| session.current_run_id == Some(run_id_clone))
+                .unwrap_or(false);
+            if should_handle_result {
                 match result {
                     Ok(StreamResult::Completed) => {
-                        s.active_session_id = None;
-                        s.state = ChatRunState::Idle;
-                        s.last_error = None;
-                        s.pending_interrupt = None;
-                        // Emit StatusChanged event so subscribers know chat is done
-                        s.emit_event(ChatRuntimeEvent::StatusChanged {
-                            state: ChatRunState::Idle,
-                            session_id: Some(session_id_clone.clone()),
-                            error: None,
-                        });
+                        if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            session.current_run_id = None;
+                            session.cancel_tx = None;
+                            session.run_state = ChatRunState::Idle;
+                            session.last_error = None;
+                            session.pending_interrupt = None;
+                        }
+                        s.emit_session_status(&session_id_clone);
                         should_persist = true;
                     }
                     Ok(StreamResult::WaitingForUser(pending)) => {
-                        s.state = ChatRunState::WaitingForUser;
-                        s.pending_interrupt = Some(pending.clone());
+                        if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            session.cancel_tx = None;
+                            session.run_state = ChatRunState::WaitingForUser;
+                            session.last_error = None;
+                            session.pending_interrupt = Some(pending.clone());
+                        }
+                        s.emit_session_status(&session_id_clone);
                         s.emit_event(ChatRuntimeEvent::InterruptPending {
                             session_id: session_id_clone.clone(),
                             interrupt_id: pending.interrupt_id,
@@ -1558,17 +2179,14 @@ async fn handle_send_message(
                         should_persist = true;
                     }
                     Err(e) => {
-                        s.active_session_id = None;
-                        s.state = ChatRunState::Error;
-                        s.last_error = Some(e.clone());
-                        s.pending_interrupt = None;
-
-                        // Emit StatusChanged so Flutter can stop waiting and show the error.
-                        s.emit_event(ChatRuntimeEvent::StatusChanged {
-                            state: ChatRunState::Error,
-                            session_id: Some(session_id_clone.clone()),
-                            error: Some(e.clone()),
-                        });
+                        if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            session.current_run_id = None;
+                            session.cancel_tx = None;
+                            session.run_state = ChatRunState::Error;
+                            session.last_error = Some(e.clone());
+                            session.pending_interrupt = None;
+                        }
+                        s.emit_session_status(&session_id_clone);
 
                         // Mark the last assistant message as error (best-effort).
                         let mut version_opt: Option<u64> = None;
@@ -1601,7 +2219,6 @@ async fn handle_send_message(
                         should_persist = true;
                     }
                 }
-                s.cancel_tx = None;
                 STATUS_VERSION.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -1626,26 +2243,24 @@ async fn handle_resume(
     ensure_protocol_state_loaded(&state, &session_id).await?;
 
     // Verify we're in WaitingForUser state
-    let (access_token, config, backend, assistant_id, resume_input) = {
+    let (access_token, config, backend, assistant_id, resume_input, previous_cancel, run_id) = {
         let mut s = state.write().await;
-        if s.state != ChatRunState::WaitingForUser {
-            return Err("Not waiting for user".to_string());
-        }
-        if s.active_session_id.as_ref() != Some(&session_id) {
-            return Err("Session mismatch".to_string());
-        }
-
         let assistant_id = format!("assistant_{}", chrono::Utc::now().timestamp_millis());
+        let run_id = s.next_run_id();
 
         let session = s
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| "Session state missing".to_string())?;
+        if session.run_state != ChatRunState::WaitingForUser {
+            return Err("Not waiting for user".to_string());
+        }
         let pending = session
             .protocol_state
             .pending_tool_execution
             .clone()
             .ok_or_else(|| "No pending tool execution state".to_string())?;
+        let previous_cancel = session.cancel_tx.take();
 
         let manual_results = manual_resume_outcomes(&pending, resume_value)?;
         let mut all_results = Vec::new();
@@ -1668,8 +2283,11 @@ async fn handle_resume(
             results: all_results.iter().filter_map(tool_outcome_to_proto).collect(),
         };
 
-        s.state = ChatRunState::Running;
-        s.pending_interrupt = None;
+        session.current_run_id = Some(run_id);
+        session.run_state = ChatRunState::Running;
+        session.last_error = None;
+        session.pending_interrupt = None;
+        s.emit_session_status(&session_id);
         STATUS_VERSION.fetch_add(1, Ordering::SeqCst);
 
         (
@@ -1678,17 +2296,31 @@ async fn handle_resume(
             s.backend.clone(),
             assistant_id,
             resume_input,
+            previous_cancel,
+            run_id,
         )
     };
 
+    if let Some(tx) = previous_cancel {
+        let _ = tx.send(()).await;
+    }
+
     // Create cancel channel
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-    state.write().await.cancel_tx = Some(cancel_tx);
+    {
+        let mut s = state.write().await;
+        if let Some(session) = s.sessions.get_mut(&session_id) {
+            if session.current_run_id == Some(run_id) {
+                session.cancel_tx = Some(cancel_tx);
+            }
+        }
+    }
 
     // Spawn stream processing task
     let state_clone = state.clone();
     let session_id_clone = session_id.clone();
     let assistant_id_clone = assistant_id.clone();
+    let run_id_clone = run_id;
 
     tokio::spawn(async move {
         let result = run_stream_loop(
@@ -1709,24 +2341,32 @@ async fn handle_resume(
         let mut should_persist = false;
         {
             let mut s = state_clone.write().await;
-            if s.active_session_id.as_ref() == Some(&session_id_clone) {
+            let should_handle_result = s
+                .sessions
+                .get(&session_id_clone)
+                .map(|session| session.current_run_id == Some(run_id_clone))
+                .unwrap_or(false);
+            if should_handle_result {
                 match result {
                     Ok(StreamResult::Completed) => {
-                        s.active_session_id = None;
-                        s.state = ChatRunState::Idle;
-                        s.last_error = None;
-                        s.pending_interrupt = None;
-                        // Emit StatusChanged event so subscribers know chat is done
-                        s.emit_event(ChatRuntimeEvent::StatusChanged {
-                            state: ChatRunState::Idle,
-                            session_id: Some(session_id_clone.clone()),
-                            error: None,
-                        });
+                        if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            session.current_run_id = None;
+                            session.cancel_tx = None;
+                            session.run_state = ChatRunState::Idle;
+                            session.last_error = None;
+                            session.pending_interrupt = None;
+                        }
+                        s.emit_session_status(&session_id_clone);
                         should_persist = true;
                     }
                     Ok(StreamResult::WaitingForUser(pending)) => {
-                        s.state = ChatRunState::WaitingForUser;
-                        s.pending_interrupt = Some(pending.clone());
+                        if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            session.cancel_tx = None;
+                            session.run_state = ChatRunState::WaitingForUser;
+                            session.last_error = None;
+                            session.pending_interrupt = Some(pending.clone());
+                        }
+                        s.emit_session_status(&session_id_clone);
                         s.emit_event(ChatRuntimeEvent::InterruptPending {
                             session_id: session_id_clone.clone(),
                             interrupt_id: pending.interrupt_id,
@@ -1736,16 +2376,14 @@ async fn handle_resume(
                         should_persist = true;
                     }
                     Err(e) => {
-                        s.active_session_id = None;
-                        s.state = ChatRunState::Error;
-                        s.last_error = Some(e.clone());
-                        s.pending_interrupt = None;
-
-                        s.emit_event(ChatRuntimeEvent::StatusChanged {
-                            state: ChatRunState::Error,
-                            session_id: Some(session_id_clone.clone()),
-                            error: Some(e.clone()),
-                        });
+                        if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            session.current_run_id = None;
+                            session.cancel_tx = None;
+                            session.run_state = ChatRunState::Error;
+                            session.last_error = Some(e.clone());
+                            session.pending_interrupt = None;
+                        }
+                        s.emit_session_status(&session_id_clone);
 
                         // Mark the last assistant message as error (best-effort).
                         let mut version_opt: Option<u64> = None;
@@ -1778,7 +2416,6 @@ async fn handle_resume(
                         should_persist = true;
                     }
                 }
-                s.cancel_tx = None;
                 STATUS_VERSION.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -1884,6 +2521,17 @@ async fn run_stream_loop(
                                 return Err(fatal);
                             }
 
+                            if should_rotate_assistant_after_tool_phase(&turn_state, &event) {
+                                let mut s = state.write().await;
+                                if let Some(session) = s.sessions.get_mut(&session_id) {
+                                    turn_state.flush_phase_into_history(session, &current_assistant_id);
+                                }
+                                current_assistant_id = format!(
+                                    "assistant_{}_post_tool",
+                                    chrono::Utc::now().timestamp_millis()
+                                );
+                            }
+
                             if let Some(chat_stream_event::Event::Interrupt(interrupt_event)) = event.event.as_ref() {
                                 if !interrupt_event.interrupts.is_empty() {
                                     return Err("Interrupt-based tool flow is no longer supported; expected external tool calling".to_string());
@@ -1950,6 +2598,22 @@ async fn run_stream_loop(
             }
         }
     }
+}
+
+fn should_rotate_assistant_after_tool_phase(
+    turn_state: &ProtocolTurnState,
+    event: &ChatStreamEvent,
+) -> bool {
+    if !turn_state.has_tool_phase() {
+        return false;
+    }
+
+    matches!(
+        event.event.as_ref(),
+        Some(chat_stream_event::Event::Delta(_))
+            | Some(chat_stream_event::Event::ThinkingStart(_))
+            | Some(chat_stream_event::Event::ThinkingEnd(_))
+    )
 }
 
 async fn process_stream_event(
@@ -2041,13 +2705,7 @@ async fn process_stream_event(
                 session
                     .tool_call_name
                     .insert(tool_call.id.clone(), tool_call.tool_name.clone());
-
-                let mut message = CachedMessage::assistant(
-                    format!("tool_call:{}", tool_call.id),
-                    now_ms,
-                );
-                message.content = format!("Tool call: `{}`", tool_call.tool_name);
-                message.tool_name = Some(tool_call.tool_name.clone());
+                let message = build_tool_call_message(session, &tool_call.id, now_ms);
                 session.upsert(message);
                 Some(session.version)
             } else {
@@ -2081,30 +2739,10 @@ async fn process_stream_event(
                     tool_call.arguments_delta
                 );
                 entry.insert(0, combined.clone());
-
-                let tool_name = session
-                    .tool_call_name
-                    .get(&tool_call.id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        turn_state
-                            .tool_calls
-                            .iter()
-                            .find(|call| call.id == tool_call.id)
-                            .map(|call| call.tool_name.clone())
-                            .unwrap_or_else(|| "(unknown)".to_string())
-                    });
-
-                let mut message = CachedMessage::assistant(
-                    format!("tool_call:{}", tool_call.id),
-                    now_ms,
-                );
-                message.content = format!(
-                    "Tool call: `{}`\n\n```json\n{}\n```",
-                    tool_name,
-                    combined
-                );
-                message.tool_name = Some(tool_name);
+                if !turn_state.tool_calls.iter().any(|call| call.id == tool_call.id) {
+                    turn_state.record_tool_call_start(&tool_call.id, "(unknown)");
+                }
+                let message = build_tool_call_message(session, &tool_call.id, now_ms);
                 session.upsert(message);
                 Some(session.version)
             } else {
@@ -2220,6 +2858,109 @@ async fn process_stream_event(
             }
             Ok(StreamControl::Continue)
         }
+        Some(chat_stream_event::Event::SubSession(sub_session)) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+
+            let mut s = state.write().await;
+            let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+                let draft = session
+                    .sub_sessions
+                    .entry(sub_session.parent_tool_call_id.clone())
+                    .or_insert_with(|| {
+                        ProtocolSubSessionDraft::new(
+                            sub_session.parent_tool_call_id.clone(),
+                            sub_session.sub_session_id.clone(),
+                            sub_session.sub_run_id.clone(),
+                            sub_session.agent_name.clone(),
+                            if sub_session.title.trim().is_empty() {
+                                None
+                            } else {
+                                Some(sub_session.title.clone())
+                            },
+                            sub_session.depth,
+                        )
+                    });
+
+                if draft.cached.sub_session_id.is_empty() {
+                    draft.cached.sub_session_id = sub_session.sub_session_id.clone();
+                }
+                if draft.cached.sub_run_id.is_empty() {
+                    draft.cached.sub_run_id = sub_session.sub_run_id.clone();
+                }
+                if draft.cached.agent_name.trim().is_empty() {
+                    draft.cached.agent_name = sub_session.agent_name.clone();
+                }
+                if draft.cached.title.is_none() && !sub_session.title.trim().is_empty() {
+                    draft.cached.title = Some(sub_session.title.clone());
+                }
+                if draft.cached.depth == 0 {
+                    draft.cached.depth = sub_session.depth;
+                }
+
+                match sub_session.event.as_ref() {
+                    Some(chat_proto::chat_sub_session_event::Event::Start(_)) => {
+                        draft.cached.status = Some("running".to_string());
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::Delta(delta)) => {
+                        draft.append_markdown(&delta.content);
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::ThinkingStart(_)) => {}
+                    Some(chat_proto::chat_sub_session_event::Event::ThinkingEnd(thinking)) => {
+                        draft.push_thinking(thinking.content.clone());
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::ToolCallStart(tool_call)) => {
+                        draft.upsert_tool_call_start(&tool_call.id, &tool_call.tool_name);
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::ToolCallDelta(tool_call)) => {
+                        draft.append_tool_call_delta(&tool_call.id, &tool_call.arguments_delta);
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::ToolDelta(tool_result)) => {
+                        draft.append_tool_result_delta(
+                            &tool_result.id,
+                            &tool_result.tool_name,
+                            &tool_result.delta,
+                        );
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::ToolResult(tool_result)) => {
+                        draft.set_tool_result(
+                            &tool_result.id,
+                            &tool_result.tool_name,
+                            tool_result.result.clone(),
+                        );
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::TurnStart(turn_start)) => {
+                        draft.push_turn_start(turn_start.turn);
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::Done(done)) => {
+                        draft.finish(if done.final_output.trim().is_empty() {
+                            None
+                        } else {
+                            Some(done.final_output.clone())
+                        });
+                    }
+                    Some(chat_proto::chat_sub_session_event::Event::Error(error)) => {
+                        draft.fail(error.message.clone());
+                    }
+                    None => {}
+                }
+
+                attach_sub_session_to_parent_tool_call(session, &sub_session.parent_tool_call_id, now_ms);
+                Some(session.version)
+            } else {
+                None
+            };
+
+            if let Some(version) = version_opt {
+                s.emit_event(ChatRuntimeEvent::CacheUpdated {
+                    session_id: session_id.to_string(),
+                    version,
+                });
+            }
+            Ok(StreamControl::Continue)
+        }
         Some(chat_stream_event::Event::NeedToolExecution(need_tool)) => {
             handle_need_tool_execution_event(
                 state,
@@ -2230,10 +2971,11 @@ async fn process_stream_event(
             )
             .await
         }
-        Some(chat_stream_event::Event::Done(_)) => {
+        Some(chat_stream_event::Event::Done(done)) => {
             let mut s = state.write().await;
             if let Some(session) = s.sessions.get_mut(session_id) {
                 turn_state.commit_completed(session, assistant_id);
+                session.protocol_state.latest_state = done.state.as_ref().map(prost_struct_to_json);
             }
             Ok(StreamControl::Continue)
         }
@@ -2312,6 +3054,7 @@ async fn handle_need_tool_execution_event(
 
     let mut s = state.write().await;
     if let Some(session) = s.sessions.get_mut(session_id) {
+        session.protocol_state.latest_state = Some(normalized_state.clone());
         if execution_plan.pending_calls.is_empty() {
             turn_state.commit_completed(session, assistant_id);
         } else {
@@ -2623,6 +3366,63 @@ mod tests {
             metadata_json.get("traffic_mark").and_then(|value| value.as_str()),
             Some("local_wasm")
         );
+    }
+
+    #[test]
+    fn references_are_promoted_into_active_context_json() {
+        let references = json!([
+            {
+                "type": "thing",
+                "uuid": "t1",
+                "title": "Buy milk",
+                "isAutoReference": true,
+                "metadata": {"source": "chat"}
+            },
+            {
+                "type": "collection",
+                "uuid": "c1",
+                "title": "Inbox",
+                "mode": "editing"
+            }
+        ]);
+
+        let active = references_to_active_context_json(Some(&references)).expect("active context");
+        assert_eq!(active["viewing"][0]["uuid"], json!("t1"));
+        assert_eq!(active["viewing"][0]["is_auto_reference"], json!(true));
+        assert_eq!(active["editing"][0]["uuid"], json!("c1"));
+    }
+
+    #[test]
+    fn merge_active_context_into_user_state_preserves_existing_keys() {
+        let merged = merge_active_context_into_user_state(
+            Some(json!({"agent_mode": "manager"})),
+            Some(json!({"viewing": [{"type": "thing", "uuid": "t1"}]})),
+        )
+        .expect("merged state");
+
+        assert_eq!(merged["agent_mode"], json!("manager"));
+        assert_eq!(merged["active_context"]["viewing"][0]["uuid"], json!("t1"));
+    }
+
+    #[test]
+    fn uploaded_images_are_exposed_in_user_state_and_prompt() {
+        let images = vec![
+            UploadedImage {
+                remi_uri: "remi://remote/a.png?type=image%2Fpng".to_string(),
+            },
+            UploadedImage {
+                remi_uri: "remi://local/images/b.png?type=image%2Fpng&device=d1".to_string(),
+            },
+        ];
+
+        let user_state = merge_chat_attachments_into_user_state(None, uploaded_images_to_user_state(&images))
+            .expect("user state");
+        assert_eq!(user_state["chat_input_attachments"]["images"][0]["uri"], json!("remi://remote/a.png?type=image%2Fpng"));
+
+        let prompt = build_chat_attachment_prompt(&images).expect("prompt");
+        assert!(prompt.contains("create_tool with type=\"image\""));
+        assert!(prompt.contains("remi://remote/a.png?type=image%2Fpng"));
+        assert!(prompt.contains("/collection/<collection_uuid>/things/<thing_uuid>"));
     }
 }
 
