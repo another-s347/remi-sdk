@@ -12,7 +12,6 @@ use crate::external_tool_schema;
 use crate::external_tools::{
     ExternalToolCallRequest, ExternalToolExecutor, manual_resume_outcomes,
 };
-use crate::interrupt_handler::InterruptHandlerRegistry;
 use crate::local_wasm::ChatEventStream;
 use crate::remi_uri::{RemiUri, mime_from_extension};
 use base64::Engine as _;
@@ -556,12 +555,6 @@ enum Command {
     /// Clear session cache
     ClearCache {
         session_id: String,
-        reply: oneshot::Sender<()>,
-    },
-
-    /// Register legacy interrupt handler registry
-    SetHandlerRegistry {
-        registry: InterruptHandlerRegistry,
         reply: oneshot::Sender<()>,
     },
 
@@ -1423,22 +1416,6 @@ impl ChatRuntime {
         }
     }
 
-    /// Set interrupt handler registry for legacy callers.
-    pub async fn set_handler_registry(&self, registry: InterruptHandlerRegistry) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(Command::SetHandlerRegistry {
-                registry,
-                reply: reply_tx,
-            })
-            .await
-            .is_ok()
-        {
-            let _ = reply_rx.await;
-        }
-    }
-
     /// Set the unified external tool executor.
     pub async fn set_external_tool_executor(&self, executor: ExternalToolExecutor) {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1646,12 +1623,6 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
 
             Command::ClearCache { session_id, reply } => {
                 state.write().await.sessions.remove(&session_id);
-                let _ = reply.send(());
-            }
-
-            Command::SetHandlerRegistry { registry, reply } => {
-                state.write().await.external_tool_executor =
-                    ExternalToolExecutor::from_registry(registry);
                 let _ = reply.send(());
             }
 

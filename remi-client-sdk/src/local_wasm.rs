@@ -1404,7 +1404,7 @@ fn normalize_external_tool_call(call: &JsonValue) -> Option<(String, JsonValue)>
         "EditPath" => "edit_path_tool",
         "DeletePath" => "delete_path_tool",
         "MovePath" => "move_path_tool",
-        "CreateTriggerSimple" => "create_trigger_simple",
+        "CreateTriggerSimple" | "CreateTimerTrigger" => "create_timer_trigger",
         "CreateTrigger" => "create_trigger",
         "DeleteTrigger" => "delete_trigger",
         "TestTrigger" => "test_trigger",

@@ -1,6 +1,6 @@
 use remi_client_sdk::things_handlers::TriggerRulePublishedHandler;
 use remi_client_sdk::things_crdt::ThingCollectionUpsert;
-use remi_client_sdk::{InterruptHandler, TriggerRegistration, TriggerRule, TriggerSdk};
+use remi_client_sdk::{ExternalToolHandler, TriggerRegistration, TriggerRule, TriggerSdk};
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -28,8 +28,8 @@ fn build_registration(trigger_uuid: &str, name: &str, cron_expr: &str) -> Trigge
     }
 }
 
-#[test]
-fn trigger_rule_published_rebind_deletes_old_trigger() {
+#[tokio::test]
+async fn trigger_rule_published_rebind_deletes_old_trigger() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("events.db");
     let sdk = Arc::new(TriggerSdk::initialize(&db_path).expect("sdk init"));
@@ -60,19 +60,17 @@ fn trigger_rule_published_rebind_deletes_old_trigger() {
     let handler = TriggerRulePublishedHandler::new(sdk.clone(), device_id.clone());
     let new_trigger_uuid = "trigger-new";
     let payload = json!({
-        "payload": {
-            "trigger_rule_published": {
-                "trigger_uuid": new_trigger_uuid,
-                "name": "New trigger",
-                "rule_config_json": build_rule_config("0 10 * * *"),
-                "bind_uuid": collection_uuid,
-                "bind_type": "collection"
-            }
-        }
+        "type": "trigger_rule_published",
+        "trigger_uuid": new_trigger_uuid,
+        "name": "New trigger",
+        "rule_config_json": build_rule_config("0 10 * * *"),
+        "bind_uuid": collection_uuid,
+        "bind_type": "collection"
     });
 
     handler
         .handle("interrupt-1", &payload)
+        .await
         .expect("handle trigger publish");
 
     let triggers = sdk.list_triggers().expect("list triggers");
@@ -91,8 +89,8 @@ fn trigger_rule_published_rebind_deletes_old_trigger() {
     assert_eq!(collection.trigger_uuid.as_deref(), Some(new_trigger_uuid));
 }
 
-#[test]
-fn trigger_rule_published_missing_entity_does_not_register() {
+#[tokio::test]
+async fn trigger_rule_published_missing_entity_does_not_register() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("events.db");
     let sdk = Arc::new(TriggerSdk::initialize(&db_path).expect("sdk init"));
@@ -100,18 +98,15 @@ fn trigger_rule_published_missing_entity_does_not_register() {
 
     let handler = TriggerRulePublishedHandler::new(sdk.clone(), device_id.clone());
     let payload = json!({
-        "payload": {
-            "trigger_rule_published": {
-                "trigger_uuid": "trigger-missing",
-                "name": "Missing target",
-                "rule_config_json": build_rule_config("0 11 * * *"),
-                "bind_uuid": "missing-collection",
-                "bind_type": "collection"
-            }
-        }
+        "type": "trigger_rule_published",
+        "trigger_uuid": "trigger-missing",
+        "name": "Missing target",
+        "rule_config_json": build_rule_config("0 11 * * *"),
+        "bind_uuid": "missing-collection",
+        "bind_type": "collection"
     });
 
-    let result = handler.handle("interrupt-2", &payload);
+    let result = handler.handle("interrupt-2", &payload).await;
     assert!(result.is_err());
 
     let triggers = sdk.list_triggers().expect("list triggers");

@@ -13,6 +13,7 @@ const MANAGED_EXTERNAL_TOOL_NAMES: &[&str] = &[
     "ls_tool",
     "cat_tool",
     "create_tool",
+    "create_timer_trigger",
     "tree_tool",
     "add_things_tool",
     "edit_path_tool",
@@ -265,7 +266,7 @@ fn test_trigger() -> JsonValue {
 fn retrieve_events() -> JsonValue {
     tool(
         "retrieve_events",
-        "Retrieve telemetry events within an explicit time window.",
+        "Retrieve telemetry events within an explicit time window. If the requested window is empty but the device has recorded events, the result may include available_time_range with the earliest and latest recorded event timestamps.",
         obj(
             json!({
                 "start_time": str_prop("ISO-8601 start timestamp."),
@@ -316,21 +317,43 @@ fn cat_tool() -> JsonValue {
 fn create_tool() -> JsonValue {
     tool(
         "create_tool",
-        "Create a new trigger, collection, thing, or image entry from a parent path. The tool generates a new UUID automatically and returns the created UUID and path.",
+        "Create a new collection, thing, or image entry from a parent path. The tool generates a new UUID automatically and returns the created UUID and path.",
         obj(
             json!({
-                "parent_path": str_prop("Parent path. Use '/' or '/trigger' for triggers. Use '/' or '/collection' for collections. Use '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things' for things. Use '/collection/<collection_uuid>/things/<thing_uuid>' for image entries."),
+                "parent_path": str_prop("Parent path. Use '/' or '/collection' for collections. Use '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things' for things. Use '/collection/<collection_uuid>/things/<thing_uuid>' for image entries."),
                 "type_name": {
                     "type": "string",
                     "description": "Entity type to create.",
-                    "enum": ["trigger", "collection", "thing", "image"]
+                    "enum": ["collection", "thing", "image"]
                 },
-                "title": nullable_str("Optional initial title. Defaults to 'New Trigger', 'New Collection', or 'New Thing'. For image entries this becomes the entry title."),
-                "content": nullable_str("Optional initial markdown content for things. Ignored for triggers, collections, and images."),
-                "source_uri": nullable_str("Required for type='image'. Must be a remi:// URI, typically one of the current chat input image attachments."),
-                "bind_path": nullable_str("Optional bind target path for triggers only. Supported targets are a collection or thing path, or their trigger file path. Examples: '/collection/<collection_uuid>', '/collection/<collection_uuid>/trigger', '/collection/<collection_uuid>/things/<thing_uuid>', '/collection/<collection_uuid>/things/<thing_uuid>/trigger'.")
+                "title": nullable_str("Optional initial title. Defaults to 'New Collection' or 'New Thing'. For image entries this becomes the entry title."),
+                "content": nullable_str("Optional initial markdown content for things. Ignored for collections and images."),
+                "source_uri": nullable_str("Required for type='image'. Must be a remi:// URI, typically one of the current chat input image attachments.")
             }),
             &["parent_path", "type_name"],
+        ),
+    )
+}
+
+fn create_timer_trigger() -> JsonValue {
+    tool(
+        "create_timer_trigger",
+        "Create or update a simple timer-based or cron-based trigger and bind it to a thing or collection in one step. Provide exactly one of cron or timer_condition. This is the fast path for simple reminders; for more complex triggers, call trigger_subagent.",
+        obj(
+            json!({
+                "binding_uuid": str_prop("UUID of the thing or collection that should receive the trigger binding."),
+                "binding_type": {
+                    "type": "string",
+                    "description": "Binding target type.",
+                    "enum": ["thing", "collection"]
+                },
+                "name": str_prop("Human-readable trigger name."),
+                "cron": nullable_str("POSIX 5-field cron expression such as '0 9 * * 1-5'. Use this for recurring schedules. Provide cron or timer_condition, not both."),
+                "timer_condition": nullable_str("One-shot timer value. Accepts either a raw timer(...) expression or a bare value such as '2026-04-05T09:00:00+08:00' or '30min'. Provide timer_condition or cron, not both."),
+                "trigger_uuid": nullable_str("Optional existing trigger UUID to update instead of creating a fresh one."),
+                "user_request": nullable_str("Optional original user request for audit/debug context.")
+            }),
+            &["binding_uuid", "binding_type", "name"],
         ),
     )
 }
@@ -353,6 +376,7 @@ fn manager_tool_definitions() -> Vec<JsonValue> {
         ls_tool(),
         cat_tool(),
         create_tool(),
+        create_timer_trigger(),
         tree_tool(),
         edit_path_tool(),
         delete_path_tool(),
@@ -397,6 +421,7 @@ mod tests {
         assert!(names.iter().any(|name| name == "cat_tool"));
         assert!(names.iter().any(|name| name == "retrieve_events"));
         assert!(names.iter().any(|name| name == "create_tool"));
+        assert!(names.iter().any(|name| name == "create_timer_trigger"));
         assert!(!names.iter().any(|name| name == "create_trigger"));
         assert!(!names.iter().any(|name| name == "delete_trigger"));
         assert!(!names.iter().any(|name| name == "add_things_tool"));

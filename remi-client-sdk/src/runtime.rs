@@ -16,7 +16,7 @@ use crate::types::{
     TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, TimeZone, Timelike, Utc};
 use croner::Cron;
 use rule_trigger_engine::{
     EvaluationContext, MonitoringEvent, PreconditionPolicy, Rule as EngineRule, TriggerConfig,
@@ -51,6 +51,54 @@ fn format_offset_seconds(total_seconds: i32) -> String {
     let hours = abs / 3600;
     let minutes = (abs % 3600) / 60;
     format!("{sign}{hours:02}:{minutes:02}")
+}
+
+fn parse_event_query_datetime(input: &str, end_of_day: bool) -> Result<DateTime<Utc>> {
+    let input = input.trim();
+    if input.is_empty() {
+        anyhow::bail!("timestamp must not be empty");
+    }
+
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(input) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+
+    let local_offset = FixedOffset::from_str(&local_timezone_offset_string())
+        .unwrap_or_else(|_| default_timezone());
+
+    if let Ok(parsed) = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+        let naive = if end_of_day {
+            parsed.and_hms_milli_opt(23, 59, 59, 999)
+        } else {
+            parsed.and_hms_opt(0, 0, 0)
+        }
+        .ok_or_else(|| anyhow!("Failed to resolve local date: {input}"))?;
+
+        return local_offset
+            .from_local_datetime(&naive)
+            .single()
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok_or_else(|| anyhow!("Failed to resolve local date with offset {}: {input}", local_offset));
+    }
+
+    for pattern in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(input, pattern) {
+            return local_offset
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok_or_else(|| anyhow!("Failed to resolve local datetime with offset {}: {input}", local_offset));
+        }
+    }
+
+    anyhow::bail!(
+        "Invalid timestamp '{input}'. Expected RFC3339/ISO-8601 or local datetime like 2026-04-02 09:00:00"
+    )
 }
 
 pub trait TriggerCallback: Send + Sync {
@@ -271,12 +319,10 @@ impl TriggerSdk {
     }
 
     pub fn events_list_between_json(&self, start_time: &str, end_time: &str) -> Result<String> {
-        let start = chrono::DateTime::parse_from_rfc3339(start_time)
-            .context("Invalid start_time (RFC3339)")?
-            .with_timezone(&Utc);
-        let end = chrono::DateTime::parse_from_rfc3339(end_time)
-            .context("Invalid end_time (RFC3339)")?
-            .with_timezone(&Utc);
+        let start = parse_event_query_datetime(start_time, false)
+            .context("Invalid start_time")?;
+        let end = parse_event_query_datetime(end_time, true)
+            .context("Invalid end_time")?;
         if start > end {
             anyhow::bail!("start_time must be <= end_time");
         }
@@ -338,6 +384,10 @@ impl TriggerSdk {
 
     pub fn event_count(&self) -> Result<i64> {
         self.storage.events_count()
+    }
+
+    pub fn event_time_range(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+        self.storage.events_time_range()
     }
 
     pub fn list_triggers(&self) -> Result<Vec<TriggerInfo>> {
@@ -4016,6 +4066,7 @@ fn parse_cached_message_storage_json(message_json: &str) -> Result<CachedMessage
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::str::FromStr;
     use tempfile::tempdir;
 
@@ -4145,6 +4196,63 @@ mod tests {
             "timer precondition should be normalized to an absolute RFC3339 timestamp: {}",
             stored_preconditions[0].rule
         );
+    }
+
+    #[test]
+    fn test_events_list_between_json_accepts_local_naive_timestamps() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+
+        let timestamp = Utc.with_ymd_and_hms(2026, 4, 2, 1, 15, 0).single().unwrap();
+        sdk.record_event(EventPayload {
+            event_type: "DesktopAppFocus".to_string(),
+            timestamp,
+            metadata: json!({ "window_title": "VSCode" }),
+        })
+        .expect("record event");
+
+        let output = sdk
+            .events_list_between_json("2026-04-02 09:00:00", "2026-04-02 09:30:00")
+            .expect("events between");
+        let events: Vec<EventPayload> = serde_json::from_str(&output).expect("parse events json");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "DesktopAppFocus");
+    }
+
+    #[test]
+    fn test_events_abstract_json_reports_recorded_events() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+
+        sdk.record_event(EventPayload {
+            event_type: "DesktopAppFocus".to_string(),
+            timestamp: Utc.with_ymd_and_hms(2026, 4, 2, 1, 0, 0).single().unwrap(),
+            metadata: json!({ "window_title": "VSCode" }),
+        })
+        .expect("record focus");
+        sdk.record_event(EventPayload {
+            event_type: "DesktopNetworkOnline".to_string(),
+            timestamp: Utc.with_ymd_and_hms(2026, 4, 2, 1, 5, 0).single().unwrap(),
+            metadata: json!({ "connected": true }),
+        })
+        .expect("record network");
+
+        let output = sdk.events_abstract_json(3).expect("abstract events");
+        let summary: serde_json::Value = serde_json::from_str(&output).expect("parse summary");
+        let hours = summary
+            .get("hours")
+            .and_then(|value| value.as_array())
+            .expect("hours array");
+
+        assert!(!hours.is_empty(), "abstract summary should include recorded hours");
+        let total_events = hours
+            .iter()
+            .map(|hour| hour.get("total_events").and_then(|value| value.as_u64()).unwrap_or(0))
+            .sum::<u64>();
+        assert_eq!(total_events, 2);
     }
 
     #[test]

@@ -1,11 +1,13 @@
 use serde_json::{Value as JsonValue, json};
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
 
-use crate::InterruptHandler;
 use crate::chat_types::{
-    InterruptAction, PendingInterrupt, PendingToolCall, PendingToolExecutionState,
-    RichHandlerResult, ToolExecutionOutcome,
+    PendingInterrupt, PendingToolCall, PendingToolExecutionState, RichHandlerResult,
+    ToolExecutionOutcome,
 };
-use crate::interrupt_handler::{InterruptHandlerRegistry, extract_interrupt_type};
+use crate::external_tool_handler::ExternalToolHandler;
 
 #[derive(Debug, Clone)]
 pub struct ExternalToolCallRequest {
@@ -25,7 +27,7 @@ pub struct ExternalToolExecutionPlan {
 
 #[derive(Clone, Default)]
 pub struct ExternalToolExecutor {
-    registry: InterruptHandlerRegistry,
+    handlers: HashMap<String, Arc<dyn ExternalToolHandler>>,
 }
 
 impl ExternalToolExecutor {
@@ -33,29 +35,25 @@ impl ExternalToolExecutor {
         Self::default()
     }
 
-    pub fn from_registry(registry: InterruptHandlerRegistry) -> Self {
-        Self { registry }
-    }
-
-    pub fn register<H: InterruptHandler + 'static>(
+    pub fn register<H: ExternalToolHandler + 'static>(
         &mut self,
-        interrupt_type: impl Into<String>,
+        tool_kind: impl Into<String>,
         handler: H,
     ) {
-        self.registry.register(interrupt_type, handler);
+        self.handlers.insert(tool_kind.into(), Arc::new(handler));
     }
 
-    pub fn with_handler<H: InterruptHandler + 'static>(
+    pub fn with_handler<H: ExternalToolHandler + 'static>(
         mut self,
-        interrupt_type: impl Into<String>,
+        tool_kind: impl Into<String>,
         handler: H,
     ) -> Self {
-        self.registry.register(interrupt_type, handler);
+        self.register(tool_kind, handler);
         self
     }
 
-    pub fn has_handler(&self, interrupt_type: &str) -> bool {
-        self.registry.has_handler(interrupt_type)
+    pub fn has_handler(&self, tool_kind: &str) -> bool {
+        self.handlers.contains_key(tool_kind)
     }
 
     pub async fn resolve_calls(
@@ -66,6 +64,7 @@ impl ExternalToolExecutor {
 
         for tool_call in calls {
             let display_data = tool_call_display_payload(&tool_call.tool_name, &tool_call.arguments);
+            let tool_kind = tool_call_kind(&display_data).map(ToString::to_string);
             let pending_call = PendingToolCall {
                 tool_call_id: tool_call.tool_call_id.clone(),
                 tool_name: tool_call.tool_name.clone(),
@@ -73,52 +72,45 @@ impl ExternalToolExecutor {
                 display_data: display_data.clone(),
             };
 
-            match self.registry.process(&tool_call.tool_call_id, &display_data).await {
-                InterruptAction::AutoResume(values) => {
-                    let resume_value = values
-                        .get(&tool_call.tool_call_id)
-                        .cloned()
-                        .or_else(|| values.values().next().cloned())
-                        .unwrap_or_else(|| {
-                            RichHandlerResult::Json(json!({
-                                "error": "handler did not return a resume value"
-                            }))
-                        });
-                    let outcome = raw_resume_value_to_outcome(&pending_call, resume_value);
-                    if extract_interrupt_type(&display_data) == "trigger_rule_published"
-                        && outcome.error.is_none()
-                    {
-                        plan.trigger_scheduler_sync_needed = true;
-                    }
-                    plan.things_changed = true;
-                    plan.resolved_results.push(outcome);
-                }
-                InterruptAction::WaitForUser { pending } => {
-                    let display_data = pending
-                        .iter()
-                        .find(|item| item.interrupt_id == tool_call.tool_call_id)
-                        .map(|item| item.display_data.clone())
-                        .unwrap_or(display_data);
-                    plan.pending_calls.push(PendingToolCall {
-                        display_data,
-                        ..pending_call
-                    });
-                }
-                InterruptAction::Skip => {
-                    plan.pending_calls.push(pending_call);
-                }
+            let Some(tool_kind) = tool_kind else {
+                plan.pending_calls.push(pending_call);
+                continue;
+            };
+
+            let Some(handler) = self.handlers.get(&tool_kind).cloned() else {
+                plan.pending_calls.push(pending_call);
+                continue;
+            };
+
+            tracing::info!(
+                tool_call_id = %tool_call.tool_call_id,
+                tool_kind = %tool_kind,
+                "[ExternalToolExecutor] Executing local tool handler"
+            );
+
+            let resume_value = match handler.handle_rich(&tool_call.tool_call_id, &display_data).await {
+                Ok(result) => result,
+                Err(error) => RichHandlerResult::Json(json!({
+                    "error": error,
+                    "tool_kind": tool_kind,
+                })),
+            };
+
+            let outcome = raw_resume_value_to_outcome(&pending_call, resume_value);
+            if tool_kind == "trigger_rule_published" && outcome.error.is_none() {
+                plan.trigger_scheduler_sync_needed = true;
             }
+            plan.things_changed = true;
+            plan.resolved_results.push(outcome);
         }
 
         plan.first_pending_interrupt = plan.pending_calls.first().map(|call| PendingInterrupt {
             interrupt_id: call.tool_call_id.clone(),
             interrupt_type: {
-                let extracted = extract_interrupt_type(&call.display_data);
-                if extracted.trim().is_empty() {
-                    call.tool_name.clone()
-                } else {
-                    extracted
-                }
+                tool_call_kind(&call.display_data)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| call.tool_name.clone())
             },
             display_data: call.display_data.clone(),
         });
@@ -168,17 +160,9 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
         "edit_path_tool" => merge_tool_payload("virtual_fs_edit_request", arguments),
         "delete_path_tool" => merge_tool_payload("virtual_fs_delete_request", arguments),
         "move_path_tool" => merge_tool_payload("virtual_fs_move_request", arguments),
-        "create_trigger" | "create_trigger_simple" => {
-            let mut payload = merge_tool_payload("trigger_rule_published", arguments);
-            payload["version"] = json!(if arguments.get("trigger_uuid").is_some() { 2 } else { 1 });
-            payload
-        }
-        "delete_trigger" => json!({
-            "type": "external_tool_call",
-            "tool_name": "delete_trigger",
-            "arguments": arguments,
-            "message": "delete_trigger currently needs bind_uuid and bind_type for legacy auto-handlers",
-        }),
+        "create_trigger" => build_trigger_publish_payload(arguments),
+        "create_timer_trigger" | "create_trigger_simple" => build_timer_trigger_publish_payload(arguments),
+        "delete_trigger" => merge_tool_payload("trigger_rule_deleted", arguments),
         "test_trigger" => json!({
             "type": "trigger_test_request",
             "trigger_json": arguments.get("trigger").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
@@ -205,6 +189,136 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
             "arguments": arguments,
         }),
     }
+}
+
+fn build_trigger_publish_payload(arguments: &JsonValue) -> JsonValue {
+    let name = trigger_name_from_arguments(arguments);
+    let rule_config_json = trigger_rule_config_from_arguments(arguments, &name);
+
+    json!({
+        "type": "trigger_rule_published",
+        "trigger_uuid": trigger_uuid_from_arguments(arguments),
+        "name": name,
+        "rule_config_json": rule_config_json,
+        "user_request": string_arg(arguments, &["user_request"]),
+        "event_analysis": string_arg(arguments, &["event_analysis"]),
+        "bind_uuid": string_arg(arguments, &["binding_uuid", "bind_uuid"]).unwrap_or_default(),
+        "bind_type": string_arg(arguments, &["binding_type", "bind_type"]).unwrap_or_else(|| "thing".to_string()),
+        "version": if arguments.get("trigger_uuid").is_some() { json!(2) } else { json!(1) }
+    })
+}
+
+fn build_timer_trigger_publish_payload(arguments: &JsonValue) -> JsonValue {
+    let name = trigger_name_from_arguments(arguments);
+    let cron = string_arg(arguments, &["cron"]);
+    let timer_condition = string_arg(arguments, &["timer_condition"]);
+    let legacy_condition = string_arg(arguments, &["condition"]);
+
+    let precondition_rule = match (timer_condition.as_deref(), cron.as_deref()) {
+        (Some(timer), _) if !timer.trim().is_empty() => normalize_timer_rule(timer),
+        (_, Some(cron_expr)) if !cron_expr.trim().is_empty() => normalize_cron_rule(cron_expr),
+        _ => String::new(),
+    };
+
+    let precondition = if precondition_rule.is_empty() {
+        Vec::<JsonValue>::new()
+    } else {
+        vec![json!({
+            "rule": precondition_rule,
+            "description": if timer_condition.as_deref().is_some() { "timer" } else { "cron" },
+        })]
+    };
+
+    let condition = legacy_condition
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            vec![json!({
+                "rule": value,
+                "description": "condition",
+            })]
+        })
+        .unwrap_or_default();
+
+    json!({
+        "type": "trigger_rule_published",
+        "trigger_uuid": trigger_uuid_from_arguments(arguments),
+        "name": name,
+        "rule_config_json": {
+            "name": name,
+            "precondition": precondition,
+            "condition": condition,
+        },
+        "user_request": string_arg(arguments, &["user_request"]),
+        "bind_uuid": string_arg(arguments, &["binding_uuid", "bind_uuid"]).unwrap_or_default(),
+        "bind_type": string_arg(arguments, &["binding_type", "bind_type"]).unwrap_or_else(|| "thing".to_string()),
+        "version": if arguments.get("trigger_uuid").is_some() { json!(2) } else { json!(1) }
+    })
+}
+
+fn string_arg(arguments: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(JsonValue::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn trigger_uuid_from_arguments(arguments: &JsonValue) -> String {
+    string_arg(arguments, &["trigger_uuid"]).unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn trigger_name_from_arguments(arguments: &JsonValue) -> String {
+    string_arg(arguments, &["name"])
+        .or_else(|| {
+            parse_rule_json(arguments)
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "New Trigger".to_string())
+}
+
+fn trigger_rule_config_from_arguments(arguments: &JsonValue, name: &str) -> JsonValue {
+    let mut rule = parse_rule_json(arguments);
+    if let Some(object) = rule.as_object_mut() {
+        object.entry("name".to_string()).or_insert_with(|| JsonValue::String(name.to_string()));
+    }
+    rule
+}
+
+fn parse_rule_json(arguments: &JsonValue) -> JsonValue {
+    let raw = arguments.get("rule").or_else(|| arguments.get("trigger"));
+    match raw {
+        Some(JsonValue::String(value)) => serde_json::from_str(value).unwrap_or_else(|_| json!({})),
+        Some(other) => other.clone(),
+        None => json!({}),
+    }
+}
+
+fn normalize_cron_rule(cron: &str) -> String {
+    let trimmed = cron.trim();
+    if trimmed.starts_with("cron(") {
+        trimmed.to_string()
+    } else {
+        format!("cron('{trimmed}')")
+    }
+}
+
+fn normalize_timer_rule(timer: &str) -> String {
+    let trimmed = timer.trim();
+    if trimmed.starts_with("timer(") {
+        trimmed.to_string()
+    } else {
+        format!("timer('{trimmed}')")
+    }
+}
+
+fn tool_call_kind(payload: &JsonValue) -> Option<&str> {
+    payload
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn merge_tool_payload(interrupt_type: &str, arguments: &JsonValue) -> JsonValue {
@@ -282,12 +396,12 @@ mod tests {
         tool_call_display_payload,
     };
     use crate::chat_types::{PendingToolCall, PendingToolExecutionState};
-    use crate::interrupt_handler::InterruptHandler;
+    use crate::external_tool_handler::ExternalToolHandler;
 
     struct EchoHandler;
 
     #[async_trait]
-    impl InterruptHandler for EchoHandler {
+    impl ExternalToolHandler for EchoHandler {
         async fn handle(
             &self,
             _interrupt_id: &str,
@@ -372,15 +486,15 @@ mod tests {
         let payload = tool_call_display_payload(
             "create_tool",
             &json!({
-                "parent_path": "/trigger",
-                "type_name": "trigger",
-                "type": "trigger"
+                "parent_path": "/collection",
+                "type_name": "collection",
+                "type": "collection"
             }),
         );
 
         assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("virtual_fs_create_request"));
-        assert_eq!(payload.get("type_name").and_then(JsonValue::as_str), Some("trigger"));
-        assert!(payload.get("type").and_then(JsonValue::as_str) != Some("trigger"));
+        assert_eq!(payload.get("type_name").and_then(JsonValue::as_str), Some("collection"));
+        assert!(payload.get("type").and_then(JsonValue::as_str) != Some("collection"));
     }
 
     #[test]
@@ -392,6 +506,45 @@ mod tests {
 
         assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("virtual_fs_create_request"));
         assert_eq!(payload.get("type_name").and_then(JsonValue::as_str), Some("thing"));
+    }
+
+    #[test]
+    fn create_trigger_payload_matches_registered_handler_shape() {
+        let payload = tool_call_display_payload(
+            "create_trigger",
+            &json!({
+                "binding_uuid": "thing-1",
+                "binding_type": "thing",
+                "name": "Morning reminder",
+                "rule": {
+                    "precondition": [{"rule": "cron('0 9 * * *')", "description": "daily"}],
+                    "condition": []
+                }
+            }),
+        );
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("trigger_rule_published"));
+        assert_eq!(payload.get("bind_uuid").and_then(JsonValue::as_str), Some("thing-1"));
+        assert_eq!(payload.get("bind_type").and_then(JsonValue::as_str), Some("thing"));
+        assert_eq!(payload.get("name").and_then(JsonValue::as_str), Some("Morning reminder"));
+        assert_eq!(payload.get("rule_config_json").and_then(|value| value.get("precondition")).and_then(JsonValue::as_array).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn create_timer_trigger_payload_builds_timer_rule() {
+        let payload = tool_call_display_payload(
+            "create_timer_trigger",
+            &json!({
+                "binding_uuid": "collection-1",
+                "binding_type": "collection",
+                "name": "One-shot reminder",
+                "timer_condition": "2026-04-05T09:00:00+08:00"
+            }),
+        );
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("trigger_rule_published"));
+        assert_eq!(payload.get("bind_uuid").and_then(JsonValue::as_str), Some("collection-1"));
+        assert_eq!(payload.get("rule_config_json").and_then(|value| value.get("precondition")).and_then(|value| value.get(0)).and_then(|value| value.get("rule")).and_then(JsonValue::as_str), Some("timer('2026-04-05T09:00:00+08:00')"));
     }
 
     #[tokio::test]

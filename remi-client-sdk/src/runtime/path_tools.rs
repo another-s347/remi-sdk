@@ -1,6 +1,5 @@
 use super::TriggerSdk;
 use crate::things_crdt::{ContentEntry, ContentEntryPayload, ContentEntryUpdate, ImageField, ThingCollectionUpsert, ThingDatatype, ThingUpsert};
-use crate::trigger_events::TriggerEvent;
 use crate::types::{TriggerRegistration, TriggerRule, VirtualFsNodeKind, VirtualFsReadResult};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value as JsonValue, json};
@@ -8,7 +7,6 @@ use serde_json::{Value as JsonValue, json};
 const ROOT_PATH: &str = "/";
 const TRIGGER_PREVIEW_LIMIT: usize = 5;
 const ENTRY_REFERENCE_SCHEME: &str = "remi-entry://";
-const THING_STATUS_VALUES: &[&str] = &["none", "in-progress", "stalled", "done"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VirtualPath {
@@ -465,11 +463,11 @@ impl TriggerSdk {
             .map(normalize_path)
             .transpose()?;
 
-        if kind != "trigger" && bind_path.is_some() {
+        if bind_path.is_some() {
             return Err(friendly_anyhow(
                 bind_path.as_deref().unwrap_or(ROOT_PATH),
                 "bind_path_unsupported",
-                "bind_path is only supported when create_tool type is 'trigger'.",
+                "bind_path is no longer supported by create_tool. Use create_trigger or create_timer_trigger for trigger creation and binding.",
             ));
         }
 
@@ -482,32 +480,6 @@ impl TriggerSdk {
         }
 
         let (created_path, created_uuid, extra) = match (kind.as_str(), parent) {
-            ("trigger", VirtualPath::Root | VirtualPath::TriggerRoot) => {
-                let trigger_uuid = uuid
-                    .filter(|value| !value.trim().is_empty())
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                self.storage.insert_trigger(TriggerRegistration {
-                    trigger_uuid: trigger_uuid.clone(),
-                    name: title.unwrap_or("New Trigger").to_string(),
-                    version: "1.0".to_string(),
-                    precondition: Vec::new(),
-                    condition: Vec::new(),
-                }, None)?;
-                self.emit_trigger_event(TriggerEvent::TriggerUpsert {
-                    trigger_uuid: trigger_uuid.clone(),
-                });
-
-                if let Some(bind_path) = bind_path.as_deref() {
-                    self.bind_created_trigger(device_id, &trigger_uuid, bind_path)?;
-                }
-
-                (
-                    format!("/trigger/{trigger_uuid}"),
-                    trigger_uuid,
-                    JsonValue::Null,
-                )
-            }
             ("collection", VirtualPath::Root | VirtualPath::CollectionRoot) => {
                 let collection_uuid = uuid
                     .filter(|value| !value.trim().is_empty())
@@ -659,13 +631,6 @@ impl TriggerSdk {
                     "Collections can only be created under '/' or '/collection'.",
                 ));
             }
-            ("trigger", _) => {
-                return Err(friendly_anyhow(
-                    &parent_path,
-                    "invalid_parent",
-                    "Triggers can only be created under '/' or '/trigger'.",
-                ));
-            }
             ("thing", _) => {
                 return Err(friendly_anyhow(
                     &parent_path,
@@ -684,7 +649,7 @@ impl TriggerSdk {
                 return Err(friendly_anyhow(
                     &parent_path,
                     "invalid_type",
-                    "create_tool type must be 'trigger', 'collection', 'thing', or 'image'.",
+                    "create_tool type must be 'collection', 'thing', or 'image'. Use create_trigger or create_timer_trigger for triggers.",
                 ));
             }
         };
@@ -696,52 +661,11 @@ impl TriggerSdk {
             "path": created_path,
         });
         if let JsonValue::Object(object) = &mut response {
-            if kind == "trigger" {
-                let rule_path = format!("{}/rule.json", object.get("path").and_then(JsonValue::as_str).unwrap_or_default());
-                object.insert(
-                    "message".to_string(),
-                    JsonValue::String(format!(
-                        "Trigger shell created. To write the trigger rule, edit {}.",
-                        rule_path
-                    )),
-                );
-                object.insert("next_edit_path".to_string(), JsonValue::String(rule_path));
-            }
             if let JsonValue::Object(extra) = extra {
                 object.extend(extra);
             }
         }
         Ok(response)
-    }
-
-    fn bind_created_trigger(&self, device_id: &str, trigger_uuid: &str, bind_path: &str) -> Result<()> {
-        match parse_virtual_path(bind_path)? {
-            VirtualPath::CollectionDir { collection_uuid } => {
-                self.things_set_collection_trigger_uuid(device_id, &collection_uuid, Some(trigger_uuid))?;
-                self.upsert_trigger_binding(trigger_uuid, "collection", &collection_uuid)?;
-            }
-            VirtualPath::CollectionTriggerUuid { collection_uuid } => {
-                self.things_set_collection_trigger_uuid(device_id, &collection_uuid, Some(trigger_uuid))?;
-                self.upsert_trigger_binding(trigger_uuid, "collection", &collection_uuid)?;
-            }
-            VirtualPath::ThingDir { thing_uuid, .. } => {
-                self.things_set_thing_trigger_uuid(device_id, &thing_uuid, Some(trigger_uuid))?;
-                self.upsert_trigger_binding(trigger_uuid, "thing", &thing_uuid)?;
-            }
-            VirtualPath::ThingTriggerUuid { thing_uuid, .. } => {
-                self.things_set_thing_trigger_uuid(device_id, &thing_uuid, Some(trigger_uuid))?;
-                self.upsert_trigger_binding(trigger_uuid, "thing", &thing_uuid)?;
-            }
-            _ => {
-                return Err(friendly_anyhow(
-                    bind_path,
-                    "invalid_bind_path",
-                    "Trigger bind_path must target a collection or thing path, such as '/collection/{collection_uuid}', '/collection/{collection_uuid}/trigger', '/collection/{collection_uuid}/things/{thing_uuid}', or '/collection/{collection_uuid}/things/{thing_uuid}/trigger'.",
-                ));
-            }
-        }
-
-        Ok(())
     }
 
     fn build_tree_node(&self, device_id: &str, path: &VirtualPath) -> Result<TreeNode> {
@@ -1391,13 +1315,7 @@ fn render_thing_nodes(
 }
 
 fn thing_status_node(status: &str) -> TreeNode {
-    TreeNode::with_children(
-        format!("status [value=\"{}\"]", status),
-        vec![TreeNode::new(format!(
-            "allowed: {}",
-            THING_STATUS_VALUES.join(", ")
-        ))],
-    )
+    TreeNode::new(format!("status [value=\"{}\"]", status))
 }
 
 fn render_tree(root: &TreeNode) -> String {

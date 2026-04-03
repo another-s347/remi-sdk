@@ -9,9 +9,9 @@ mod context_prompt;
 pub mod crdt_sync;
 pub mod data_lifecycle;
 pub mod events_events;
+mod external_tool_handler;
 mod external_tool_schema;
 pub mod external_tools;
-pub mod interrupt_handler;
 mod local_wasm;
 pub mod location_service;
 pub mod profile;
@@ -46,10 +46,10 @@ pub use chat_runtime::ChatRuntime;
 pub use chat_types::{
     CachedMessage, ChatLocalWasmConfig, ChatLocalWasmSource, ChatRunState, ChatRunStatus,
     ChatSessionExportBundle, ChatTracingConfig,
-    ChatRuntimeBackend, ChatRuntimeConfig, ChatRuntimeEvent, InterruptAction, PendingInterrupt,
+    ChatRuntimeBackend, ChatRuntimeConfig, ChatRuntimeEvent, PendingInterrupt,
 };
+pub use external_tool_handler::ExternalToolHandler;
 pub use external_tools::ExternalToolExecutor;
-pub use interrupt_handler::{InterruptHandler, InterruptHandlerRegistry};
 pub use location_service::{
     LocationService, LocationServiceError, haversine_distance, is_within_range,
 };
@@ -58,7 +58,7 @@ pub use realtime::{RealtimeConfig, RemiRealtimeEvent, SupabaseRealtimeManager};
 pub use remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 pub use runtime::{NotificationCallback, TriggerCallback, TriggerSdk};
 pub use things_client::ThingsClient;
-pub use things_handlers::{register_things_external_tools, register_things_handlers};
+pub use things_handlers::register_things_external_tools;
 pub use trigger_client::{ServerTriggerInfo, TriggerClient};
 pub use types::{
     ChatSession, ChatSessionUpdate, CoordinateSystem, EventPayload, Location, LocationCacheEntry,
@@ -68,7 +68,7 @@ pub use types::{
     TriggerLogEntry, TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule,
     TriggerRunType, VirtualFsNodeKind, VirtualFsReadResult,
 };
-pub use url_handlers::{register_url_external_tools, register_url_handlers};
+pub use url_handlers::register_url_external_tools;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TriggerContext;

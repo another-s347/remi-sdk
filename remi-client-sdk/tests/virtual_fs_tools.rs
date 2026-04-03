@@ -147,7 +147,6 @@ fn virtual_fs_tree_and_read_cover_root_trigger_and_thing_files() -> Result<()> {
     assert!(tree.contains("trigger [value=\"tr-1\"]"));
     assert!(tree.contains("t1/ [name=\"Buy milk\", status=\"none\"]"));
     assert!(tree.contains("status [value=\"none\"]"));
-    assert!(tree.contains("allowed: none, in-progress, stalled, done"));
 
     let collection_name = sdk.read_virtual_path(device_id, "/collection/c1/name")?;
     assert_eq!(collection_name.content, "Inbox");
@@ -253,16 +252,6 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
     sdk.delete_virtual_path(device_id, "/collection/c2/things/t1")?;
     assert!(sdk.things_get_thing_markdown(device_id, "t1")?.is_none());
 
-    let created_trigger = sdk.create_virtual_path(device_id, "/trigger", "trigger", Some("Wake Up"), None, None, Some("/collection/c1"), Some("tr-new"))?;
-    assert_eq!(created_trigger["uuid"], json!("tr-new"));
-    assert_eq!(created_trigger["path"], json!("/trigger/tr-new"));
-    assert_eq!(sdk.read_virtual_path(device_id, "/trigger/tr-new/name")?.content, "Wake Up");
-    let created_trigger_rule: JsonValue = serde_json::from_str(&sdk.read_virtual_path(device_id, "/trigger/tr-new/rule.json")?.content)?;
-    assert_eq!(created_trigger_rule["version"], json!("1.0"));
-    assert_eq!(created_trigger_rule["precondition"], json!([]));
-    assert_eq!(created_trigger_rule["condition"], json!([]));
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/trigger")?.content, "tr-new");
-
     let created_collection = sdk.create_virtual_path(device_id, "/collection", "collection", None, None, None, None, Some("c3"))?;
     assert_eq!(created_collection["uuid"], json!("c3"));
     assert_eq!(created_collection["path"], json!("/collection/c3"));
@@ -296,10 +285,6 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
     assert_eq!(created_image_entry["payload"]["type"], json!("image"));
     assert_eq!(created_image_entry["payload"]["uri"], json!(chat_image_uri));
 
-    let created_thing_trigger = sdk.create_virtual_path(device_id, "/trigger", "trigger", Some("Thing Trigger"), None, None, Some("/collection/c1/things/t-new/trigger"), Some("tr-thing"))?;
-    assert_eq!(created_thing_trigger["uuid"], json!("tr-thing"));
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t-new/trigger")?.content, "tr-thing");
-
     Ok(())
 }
 
@@ -325,12 +310,12 @@ fn virtual_fs_returns_friendly_errors_for_invalid_and_unsupported_paths() -> Res
     assert!(err.to_string().contains("collection_not_found"));
 
     let err = sdk.create_virtual_path(device_id, "/collection/c1", "trigger", Some("Bad Parent"), None, None, None, Some("tr-bad"))
-        .expect_err("trigger create under collection should fail");
-    assert!(err.to_string().contains("invalid_parent"));
+        .expect_err("trigger create should now fail at type validation");
+    assert!(err.to_string().contains("invalid_type"));
 
-    let err = sdk.create_virtual_path(device_id, "/trigger", "trigger", Some("Bad Bind"), None, None, Some("/trigger/tr-1"), Some("tr-bad-bind"))
-        .expect_err("trigger bind to trigger path should fail");
-    assert!(err.to_string().contains("invalid_bind_path"));
+    let err = sdk.create_virtual_path(device_id, "/collection", "collection", Some("Bad Bind"), None, None, Some("/collection/c1"), Some("c-bad-bind"))
+        .expect_err("create_tool bind_path should be rejected");
+    assert!(err.to_string().contains("bind_path_unsupported"));
 
     let err = sdk.create_virtual_path(device_id, "/collection/c1/things/t1", "image", Some("Bad Image"), None, Some("https://example.com/foo.png"), None, Some("entry-bad-image"))
         .expect_err("image create with non-remi uri should fail");

@@ -1,10 +1,10 @@
-//! Built-in interrupt handlers for Things operations and Trigger publishing.
+//! Built-in external tool handlers for Things operations and Trigger publishing.
 
 use async_trait::async_trait;
 use crate::TriggerSdk;
 use crate::chat_types::{RichHandlerResult, ToolImagePart};
+use crate::external_tool_handler::ExternalToolHandler;
 use crate::external_tools::ExternalToolExecutor;
-use crate::interrupt_handler::{InterruptHandler, extract_interrupt_data};
 use crate::remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert, ThingsSnapshot};
 use crate::types::{TriggerRegistration, TriggerRule};
@@ -269,14 +269,14 @@ impl CollectionAddedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for CollectionAddedHandler {
+impl ExternalToolHandler for CollectionAddedHandler {
     async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::debug!(
             interrupt_id = %interrupt_id,
             payload = %payload,
             "[CollectionAddedHandler] Received interrupt"
         );
-        let data = extract_interrupt_data(payload, "things_collection_added");
+        let data = payload.clone();
         tracing::debug!(
             extracted_data = %data,
             "[CollectionAddedHandler] Extracted data from payload"
@@ -331,9 +331,9 @@ impl CollectionEditedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for CollectionEditedHandler {
+impl ExternalToolHandler for CollectionEditedHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "things_collection_edited");
+        let data = payload.clone();
         let info: ThingCollectionInfo = if data.get("collection").is_some() {
             let env: ThingsCollectionEnvelope = serde_json::from_value(data)
                 .map_err(|e| format!("Failed to parse collection envelope: {}", e))?;
@@ -378,9 +378,9 @@ impl CollectionRemovedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for CollectionRemovedHandler {
+impl ExternalToolHandler for CollectionRemovedHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "things_collection_removed");
+        let data = payload.clone();
         let uuid = data
             .get("uuid")
             .and_then(|v| v.as_str())
@@ -410,9 +410,9 @@ impl ThingAddedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for ThingAddedHandler {
+impl ExternalToolHandler for ThingAddedHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "things_thing_added");
+        let data = payload.clone();
         let info = parse_thing_info(&data)?;
 
         let thing_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
@@ -472,9 +472,9 @@ impl ThingEditedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for ThingEditedHandler {
+impl ExternalToolHandler for ThingEditedHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "things_thing_edited");
+        let data = payload.clone();
         let info = parse_thing_info(&data)?;
 
         let thing_uuid = normalize_required_uuid(&info.uuid, "uuid")?;
@@ -652,7 +652,13 @@ mod tests {
 
         let sdk = Arc::new(TriggerSdk::initialize(&db_path).expect("sdk"));
         let device_id = "device-test";
-        sdk.create_virtual_path(device_id, "/trigger", "trigger", Some("Watch VSCode"), None, None, None, Some("t1"))
+        sdk.register_trigger(TriggerRegistration {
+            trigger_uuid: "t1".to_string(),
+            name: "Watch VSCode".to_string(),
+            version: "1.0".to_string(),
+            precondition: Vec::new(),
+            condition: Vec::new(),
+        })
             .expect("create trigger");
 
         let handler = VirtualFsEditHandler::new(sdk.clone(), device_id.to_string());
@@ -673,6 +679,66 @@ mod tests {
 
         assert_eq!(result.get("ok").and_then(JsonValue::as_bool), Some(true));
         assert_eq!(result.get("path").and_then(JsonValue::as_str), Some("/trigger/t1/rule.json"));
+    }
+
+    #[tokio::test]
+    async fn events_retrieve_handler_includes_available_time_range_for_empty_window() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = Arc::new(TriggerSdk::initialize(&db_path).expect("sdk init"));
+
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-04-02T01:15:00+00:00")
+            .expect("timestamp")
+            .with_timezone(&chrono::Utc);
+        sdk.record_event(crate::types::EventPayload {
+            event_type: "DesktopAppFocus".to_string(),
+            timestamp,
+            metadata: json!({ "window_title": "VSCode" }),
+        })
+        .expect("record event");
+
+        let handler = EventsRetrieveRequestHandler::new(sdk);
+        let result = handler
+            .handle(
+                "call-1",
+                &json!({
+                    "type": "events_retrieve_request",
+                    "start_time": "2026-01-20T00:00:00+08:00",
+                    "end_time": "2026-01-23T23:59:59+08:00"
+                }),
+            )
+            .await
+            .expect("retrieve events");
+
+        assert_eq!(
+            result
+                .get("events")
+                .and_then(JsonValue::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            result
+                .get("available_time_range")
+                .and_then(|value| value.get("start_time"))
+                .and_then(JsonValue::as_str),
+            Some("2026-04-02T01:15:00+00:00")
+        );
+        assert_eq!(
+            result
+                .get("available_time_range")
+                .and_then(|value| value.get("end_time"))
+                .and_then(JsonValue::as_str),
+            Some("2026-04-02T01:15:00+00:00")
+        );
+        assert!(
+            result
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .contains("Recorded events are available between 2026-04-02T01:15:00+00:00 and 2026-04-02T01:15:00+00:00"),
+            "message should point the caller at the existing event time bounds"
+        );
     }
 
     #[tokio::test]
@@ -724,11 +790,11 @@ impl ThingRemovedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for ThingRemovedHandler {
+impl ExternalToolHandler for ThingRemovedHandler {
     async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::info!(interrupt_id = %interrupt_id, payload = %payload, "[ThingRemovedHandler] Received interrupt");
 
-        let data = extract_interrupt_data(payload, "things_thing_removed");
+        let data = payload.clone();
         tracing::info!(data = %data, "[ThingRemovedHandler] Extracted data");
 
         let info: ThingRemoveInfo = serde_json::from_value(data)
@@ -763,9 +829,9 @@ impl ThingContentEditHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for ThingContentEditHandler {
+impl ExternalToolHandler for ThingContentEditHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "things_thing_content_edit");
+        let data = payload.clone();
         let edit: ThingContentEdit = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse content edit: {}", e))?;
 
@@ -810,11 +876,11 @@ impl ThingMovedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for ThingMovedHandler {
+impl ExternalToolHandler for ThingMovedHandler {
     async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::info!(interrupt_id = %interrupt_id, payload = %payload, "[ThingMovedHandler] Received interrupt");
 
-        let data = extract_interrupt_data(payload, "things_thing_moved");
+        let data = payload.clone();
         tracing::info!(data = %data, "[ThingMovedHandler] Extracted data");
 
         let info: ThingMoveInfo = match serde_json::from_value(data.clone()) {
@@ -913,9 +979,9 @@ impl EventsRetrieveRequestHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for EventsRetrieveRequestHandler {
+impl ExternalToolHandler for EventsRetrieveRequestHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "events_retrieve_request");
+        let data = payload.clone();
         let req: EventsRetrieveRequest = match serde_json::from_value(data) {
             Ok(v) => v,
             Err(e) => {
@@ -934,7 +1000,31 @@ impl InterruptHandler for EventsRetrieveRequestHandler {
             Ok(events_json) => {
                 let events: JsonValue =
                     serde_json::from_str(&events_json).unwrap_or(JsonValue::String(events_json));
-                Ok(json!({                    "events": events,
+                if let Some(items) = events.as_array() {
+                    if items.is_empty() {
+                        if let Ok(Some((start, end))) = self.sdk.event_time_range() {
+                            let start_time = start.to_rfc3339();
+                            let end_time = end.to_rfc3339();
+                            return Ok(json!({
+                                "events": [],
+                                "message": format!(
+                                    "No events found in the requested time window. Recorded events are available between {start_time} and {end_time}."
+                                ),
+                                "requested_time_range": {
+                                    "start_time": req.start_time,
+                                    "end_time": req.end_time,
+                                },
+                                "available_time_range": {
+                                    "start_time": start_time,
+                                    "end_time": end_time,
+                                },
+                            }));
+                        }
+                    }
+                }
+
+                Ok(json!({
+                    "events": events,
                 }))
             }
             Err(e) => Ok(
@@ -958,9 +1048,9 @@ impl EventsAbstractRequestHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for EventsAbstractRequestHandler {
+impl ExternalToolHandler for EventsAbstractRequestHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "events_abstract_request");
+        let data = payload.clone();
         let req: EventsAbstractRequest =
             serde_json::from_value(data).unwrap_or(EventsAbstractRequest { top_n: None });
 
@@ -1017,9 +1107,9 @@ impl ThingsListSnapshotHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for ThingsListSnapshotHandler {
+impl ExternalToolHandler for ThingsListSnapshotHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "things_list_snapshot_request");
+        let data = payload.clone();
         let req: ThingsListSnapshotRequest = serde_json::from_value(data).unwrap_or_default();
 
         let entity_type = req
@@ -1065,9 +1155,9 @@ impl ThingsGetThingMarkdownHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for ThingsGetThingMarkdownHandler {
+impl ExternalToolHandler for ThingsGetThingMarkdownHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "things_get_thing_markdown_request");
+        let data = payload.clone();
         let req: ThingsGetThingMarkdownRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse things_get_thing_markdown_request: {e}"))?;
 
@@ -1105,9 +1195,9 @@ impl VirtualFsTreeHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for VirtualFsTreeHandler {
+impl ExternalToolHandler for VirtualFsTreeHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_tree_request");
+        let data = payload.clone();
         let req: VirtualFsTreeRequest = serde_json::from_value(data).unwrap_or_default();
 
         self.sdk
@@ -1129,9 +1219,9 @@ impl VirtualFsLsHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for VirtualFsLsHandler {
+impl ExternalToolHandler for VirtualFsLsHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_ls_request");
+        let data = payload.clone();
         let req: VirtualFsLsRequest = serde_json::from_value(data).unwrap_or_default();
 
         self.sdk
@@ -1153,9 +1243,9 @@ impl VirtualFsCatHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for VirtualFsCatHandler {
+impl ExternalToolHandler for VirtualFsCatHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_cat_request");
+        let data = payload.clone();
         let req: VirtualFsCatRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse virtual_fs_cat_request: {e}"))?;
 
@@ -1166,7 +1256,7 @@ impl InterruptHandler for VirtualFsCatHandler {
     }
 
     async fn handle_rich(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<RichHandlerResult, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_cat_request");
+        let data = payload.clone();
         let req: VirtualFsCatRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse virtual_fs_cat_request: {e}"))?;
 
@@ -1195,9 +1285,9 @@ impl VirtualFsEditHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for VirtualFsEditHandler {
+impl ExternalToolHandler for VirtualFsEditHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_edit_request");
+        let data = payload.clone();
         let req: VirtualFsEditRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse virtual_fs_edit_request: {e}"))?;
 
@@ -1227,9 +1317,9 @@ impl VirtualFsDeleteHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for VirtualFsDeleteHandler {
+impl ExternalToolHandler for VirtualFsDeleteHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_delete_request");
+        let data = payload.clone();
         let req: VirtualFsDeleteRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse virtual_fs_delete_request: {e}"))?;
 
@@ -1251,9 +1341,9 @@ impl VirtualFsMoveHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for VirtualFsMoveHandler {
+impl ExternalToolHandler for VirtualFsMoveHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_move_request");
+        let data = payload.clone();
         let req: VirtualFsMoveRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse virtual_fs_move_request: {e}"))?;
 
@@ -1275,9 +1365,9 @@ impl VirtualFsCreateHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for VirtualFsCreateHandler {
+impl ExternalToolHandler for VirtualFsCreateHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "virtual_fs_create_request");
+        let data = payload.clone();
         let req: VirtualFsCreateRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse virtual_fs_create_request: {e}"))?;
 
@@ -1333,14 +1423,14 @@ impl TriggerRulePublishedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for TriggerRulePublishedHandler {
+impl ExternalToolHandler for TriggerRulePublishedHandler {
     async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::debug!(
             interrupt_id = %interrupt_id,
             payload = %payload,
-            "[TriggerRulePublishedHandler] Received interrupt"
+            "[TriggerRulePublishedHandler] Received external tool call"
         );
-        let data = extract_interrupt_data(payload, "trigger_rule_published");
+        let data = payload.clone();
         let info: TriggerRulePublished = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse trigger_rule_published: {}", e))?;
 
@@ -1532,7 +1622,7 @@ impl InterruptHandler for TriggerRulePublishedHandler {
         }
 
         tracing::info!(
-            "Trigger {} ({}) registered locally via interrupt",
+            "Trigger {} ({}) registered locally via external tool",
             info.name,
             trigger_uuid
         );
@@ -1572,7 +1662,9 @@ impl InterruptHandler for TriggerRulePublishedHandler {
 
         // Resume value: keep consistent with other handlers.
         Ok(json!({
-            "confirmed": true,            "trigger_uuid": trigger_uuid,
+            "confirmed": true,
+            "trigger_uuid": trigger_uuid,
+            "path": format!("/trigger/{}", trigger_uuid),
             "name": info.name,
             "bound_to": {
                 "type": entity_type,
@@ -1590,8 +1682,10 @@ impl InterruptHandler for TriggerRulePublishedHandler {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerRuleDeleted {
     pub trigger_uuid: String,
-    pub bind_uuid: String,
-    pub bind_type: String, // "thing" or "collection"
+    #[serde(default)]
+    pub bind_uuid: Option<String>,
+    #[serde(default)]
+    pub bind_type: Option<String>, // "thing" or "collection"
 }
 
 /// Handler for trigger_rule_deleted - unbinds and removes a trigger locally
@@ -1607,32 +1701,34 @@ impl TriggerRuleDeletedHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for TriggerRuleDeletedHandler {
+impl ExternalToolHandler for TriggerRuleDeletedHandler {
     async fn handle(&self, interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
         tracing::debug!(
             interrupt_id = %interrupt_id,
             payload = %payload,
-            "[TriggerRuleDeletedHandler] Received interrupt"
+            "[TriggerRuleDeletedHandler] Received external tool call"
         );
-        let data = extract_interrupt_data(payload, "trigger_rule_deleted");
+        let data = payload.clone();
         let info: TriggerRuleDeleted = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse trigger_rule_deleted: {}", e))?;
 
         let trigger_uuid = normalize_required_uuid(&info.trigger_uuid, "trigger_uuid")?;
-        let bind_uuid = normalize_required_uuid(&info.bind_uuid, "bind_uuid")?;
-        let bind_type = info.bind_type.trim().to_lowercase();
+        let bind_uuid = normalize_optional_string(info.bind_uuid);
+        let bind_type = normalize_optional_string(info.bind_type).map(|value| value.to_lowercase());
 
-        if bind_type != "thing" && bind_type != "collection" {
-            return Err(format!(
-                "Invalid bind_type '{}'; expected 'thing' or 'collection'",
-                bind_type
-            ));
+        if let Some(bind_type) = bind_type.as_deref() {
+            if bind_type != "thing" && bind_type != "collection" {
+                return Err(format!(
+                    "Invalid bind_type '{}'; expected 'thing' or 'collection'",
+                    bind_type
+                ));
+            }
         }
 
         tracing::info!(
             trigger_uuid = %trigger_uuid,
-            bind_uuid = %bind_uuid,
-            bind_type = %bind_type,
+            bind_uuid = ?bind_uuid,
+            bind_type = ?bind_type,
             "[TriggerRuleDeletedHandler] Deleting trigger"
         );
 
@@ -1653,54 +1749,29 @@ impl InterruptHandler for TriggerRuleDeletedHandler {
         tracing::info!(
             trigger_uuid = %trigger_uuid,
             deleted = %deleted,
-            "Trigger deleted via interrupt"
+            "Trigger deleted via external tool"
         );
 
-        Ok(json!({
+        let mut response = json!({
             "confirmed": true,
             "trigger_uuid": trigger_uuid,
             "deleted": deleted,
-            "unbound_from": {
+        });
+
+        if let (Some(bind_type), Some(bind_uuid)) = (bind_type, bind_uuid) {
+            response["unbound_from"] = json!({
                 "type": bind_type,
                 "uuid": bind_uuid,
-            },
-        }))
+            });
+        }
+
+        Ok(response)
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════�?
 // Registry Builder Helper
 // ══════════════════════════════════════════════════════════════════════════════�?
-
-use crate::interrupt_handler::InterruptHandlerRegistry;
-
-trait ThingsHandlerRegistrar {
-    fn register_handler<H: InterruptHandler + 'static>(
-        &mut self,
-        interrupt_type: impl Into<String>,
-        handler: H,
-    );
-}
-
-impl ThingsHandlerRegistrar for InterruptHandlerRegistry {
-    fn register_handler<H: InterruptHandler + 'static>(
-        &mut self,
-        interrupt_type: impl Into<String>,
-        handler: H,
-    ) {
-        self.register(interrupt_type, handler);
-    }
-}
-
-impl ThingsHandlerRegistrar for ExternalToolExecutor {
-    fn register_handler<H: InterruptHandler + 'static>(
-        &mut self,
-        interrupt_type: impl Into<String>,
-        handler: H,
-    ) {
-        self.register(interrupt_type, handler);
-    }
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Triggers List Handler
@@ -1718,7 +1789,7 @@ impl TriggersListHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for TriggersListHandler {
+impl ExternalToolHandler for TriggersListHandler {
     async fn handle(&self, _interrupt_id: &str, _payload: &JsonValue) -> Result<JsonValue, String> {
         let json_str = self
             .sdk
@@ -1728,7 +1799,7 @@ impl InterruptHandler for TriggersListHandler {
         let triggers: JsonValue = serde_json::from_str(&json_str)
             .map_err(|e| format!("Failed to parse triggers JSON: {e}"))?;
 
-        tracing::info!("Triggers list provided via interrupt");
+        tracing::info!("Triggers list provided via external tool");
 
         Ok(json!({ "triggers": triggers }))
     }
@@ -1762,9 +1833,9 @@ impl TriggerTestRequestHandler {
 }
 
 #[async_trait]
-impl InterruptHandler for TriggerTestRequestHandler {
+impl ExternalToolHandler for TriggerTestRequestHandler {
     async fn handle(&self, _interrupt_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let data = extract_interrupt_data(payload, "trigger_test_request");
+        let data = payload.clone();
         let req: TriggerTestRequest = serde_json::from_value(data)
             .map_err(|e| format!("Failed to parse trigger_test_request: {e}"))?;
 
@@ -1780,19 +1851,10 @@ impl InterruptHandler for TriggerTestRequestHandler {
         let result: JsonValue = serde_json::from_str(&result_json)
             .map_err(|e| format!("Failed to parse trigger test result: {e}"))?;
 
-        tracing::info!("Trigger test completed via interrupt");
+        tracing::info!("Trigger test completed via external tool");
 
         Ok(result)
     }
-}
-
-/// Register all built-in things handlers
-pub fn register_things_handlers(
-    registry: &mut InterruptHandlerRegistry,
-    sdk: Arc<TriggerSdk>,
-    device_id: &str,
-) {
-    register_things_handlers_inner(registry, sdk, device_id);
 }
 
 /// Register all built-in things handlers on the unified external tool executor.
@@ -1801,105 +1863,97 @@ pub fn register_things_external_tools(
     sdk: Arc<TriggerSdk>,
     device_id: &str,
 ) {
-    register_things_handlers_inner(executor, sdk, device_id);
-}
-
-fn register_things_handlers_inner<R: ThingsHandlerRegistrar>(
-    registry: &mut R,
-    sdk: Arc<TriggerSdk>,
-    device_id: &str,
-) {
     let device_id = device_id.to_string();
 
-    registry.register_handler(
+    executor.register(
         "things_collection_added",
         CollectionAddedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_collection_edited",
         CollectionEditedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_collection_removed",
         CollectionRemovedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_thing_added",
         ThingAddedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_thing_edited",
         ThingEditedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_thing_removed",
         ThingRemovedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_thing_content_edit",
         ThingContentEditHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_thing_moved",
         ThingMovedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_list_snapshot_request",
         ThingsListSnapshotHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "things_get_thing_markdown_request",
         ThingsGetThingMarkdownHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "virtual_fs_ls_request",
         VirtualFsLsHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "virtual_fs_tree_request",
         VirtualFsTreeHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "virtual_fs_cat_request",
         VirtualFsCatHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "virtual_fs_edit_request",
         VirtualFsEditHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "virtual_fs_delete_request",
         VirtualFsDeleteHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "virtual_fs_move_request",
         VirtualFsMoveHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "virtual_fs_create_request",
         VirtualFsCreateHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "events_retrieve_request",
         EventsRetrieveRequestHandler::new(sdk.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "events_abstract_request",
         EventsAbstractRequestHandler::new(sdk.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "trigger_rule_published",
         TriggerRulePublishedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "trigger_rule_deleted",
         TriggerRuleDeletedHandler::new(sdk.clone(), device_id.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "triggers_list_request",
         TriggersListHandler::new(sdk.clone()),
     );
-    registry.register_handler(
+    executor.register(
         "trigger_test_request",
         TriggerTestRequestHandler::new(sdk.clone()),
     );

@@ -506,29 +506,6 @@ pub struct PendingToolExecutionState {
     pub pending_calls: Vec<PendingToolCall>,
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Interrupt Handling
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Result of processing an interrupt
-#[derive(Debug, Clone)]
-pub enum InterruptAction {
-    /// Automatically resume with computed values for multiple interrupts.
-    /// The map contains interrupt_id -> resume_value pairs.
-    /// When there are multiple pending interrupts, all must be resolved together.
-    AutoResume(std::collections::HashMap<String, RichHandlerResult>),
-
-    /// Wait for user input before resuming.
-    /// Contains all pending interrupts that need user action.
-    WaitForUser {
-        /// All pending interrupts that need user input
-        pending: Vec<PendingInterruptInfo>,
-    },
-
-    /// Skip this interrupt (continue waiting for more chunks)
-    Skip,
-}
-
 /// Rich result that a handler can return — either plain JSON or structured multimodal data.
 #[derive(Debug, Clone)]
 pub enum RichHandlerResult {
@@ -536,14 +513,6 @@ pub enum RichHandlerResult {
     Json(JsonValue),
     /// Raw image bytes to be forwarded to the LLM as an image part.
     Image(ToolImagePart),
-}
-
-/// Info about a single pending interrupt awaiting user action
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingInterruptInfo {
-    pub interrupt_id: String,
-    pub interrupt_type: String,
-    pub display_data: JsonValue,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
