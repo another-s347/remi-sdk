@@ -26,6 +26,8 @@ enum VirtualPath {
     ThingStatus { collection_uuid: String, thing_uuid: String },
     ThingContent { collection_uuid: String, thing_uuid: String },
     ThingEntry { collection_uuid: String, thing_uuid: String, index: usize },
+    ThingEntryData { collection_uuid: String, thing_uuid: String, index: usize },
+    ThingEntrySchema { collection_uuid: String, thing_uuid: String, index: usize },
     ThingChildrenDir { collection_uuid: String, thing_uuid: String },
 }
 
@@ -229,6 +231,16 @@ impl TriggerSdk {
                 })?;
                 self.edit_thing_entry_path(device_id, &path, thing_uuid, index, entry_value)?
             }
+            VirtualPath::ThingEntryData {
+                ref thing_uuid,
+                index,
+                ..
+            } => self.edit_thing_entry_data_path(device_id, &path, thing_uuid, index, operation, value)?,
+            VirtualPath::ThingEntrySchema {
+                ref thing_uuid,
+                index,
+                ..
+            } => self.edit_thing_entry_schema_path(device_id, &path, thing_uuid, index, operation, value)?,
             VirtualPath::Root
             | VirtualPath::TriggerRoot
             | VirtualPath::TriggerDir { .. }
@@ -241,7 +253,7 @@ impl TriggerSdk {
                 return Err(friendly_anyhow(
                     &path,
                     "is_directory",
-                    "The target path is a directory. Use tree_tool for listing or target a file node such as name, status, content.md, entries.{idx}, or rule.json.",
+                    "The target path is a directory. Use tree_tool for listing or target a file node such as name, status, content.md, entries.{idx}, entries.{idx}.data.json, entries.{idx}.schema.json, or rule.json.",
                 ));
             }
         };
@@ -308,6 +320,13 @@ impl TriggerSdk {
                     "message": format!("Deleted content entry {} from thing '{}'", index, thing_uuid),
                     "deleted_entry_id": entry.id,
                 })
+            }
+            VirtualPath::ThingEntryData { .. } | VirtualPath::ThingEntrySchema { .. } => {
+                return Err(friendly_anyhow(
+                    &path,
+                    "delete_unsupported",
+                    "Delete the entry shell path entries.{idx} to remove a json_object entry and its associated schema/data documents.",
+                ));
             }
             VirtualPath::Root
             | VirtualPath::TriggerRoot
@@ -624,6 +643,48 @@ impl TriggerSdk {
                     }),
                 )
             }
+            (
+                "json_object",
+                VirtualPath::ThingDir {
+                    collection_uuid,
+                    thing_uuid,
+                },
+            ) => {
+                let initial_data = match content.map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(raw) => serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+                        friendly_anyhow(
+                            &parent_path,
+                            "invalid_content",
+                            &format!("json_object content must be valid JSON: {error}"),
+                        )
+                    })?,
+                    None => json!({}),
+                };
+
+                let entry_id = self.things_add_json_object_content_entry(
+                    device_id,
+                    &thing_uuid,
+                    title,
+                    Some(&initial_data),
+                    None,
+                )?;
+
+                let after_entries = self.things_get_content_entries(device_id, &thing_uuid)?;
+                let entry_index = after_entries
+                    .iter()
+                    .position(|entry| entry.id == entry_id)
+                    .ok_or_else(|| anyhow!("Created json_object entry '{}' was not found after insertion", entry_id))?;
+                let entry_path = format!("/collection/{collection_uuid}/things/{thing_uuid}/entries.{entry_index}");
+
+                (
+                    entry_path,
+                    entry_id,
+                    json!({
+                        "thing_uuid": thing_uuid,
+                        "collection_uuid": collection_uuid,
+                    }),
+                )
+            }
             ("collection", _) => {
                 return Err(friendly_anyhow(
                     &parent_path,
@@ -645,11 +706,18 @@ impl TriggerSdk {
                     "Images can only be created under a thing directory such as '/collection/{collection_uuid}/things/{thing_uuid}'.",
                 ));
             }
+            ("json_object", _) => {
+                return Err(friendly_anyhow(
+                    &parent_path,
+                    "invalid_parent",
+                    "json_object entries can only be created under a thing directory such as '/collection/{collection_uuid}/things/{thing_uuid}'.",
+                ));
+            }
             _ => {
                 return Err(friendly_anyhow(
                     &parent_path,
                     "invalid_type",
-                    "create_tool type must be 'collection', 'thing', or 'image'. Use create_trigger or create_timer_trigger for triggers.",
+                    "create_tool type must be 'collection', 'thing', 'image', or 'json_object'. Use create_trigger or create_timer_trigger for triggers.",
                 ));
             }
         };
@@ -801,10 +869,24 @@ impl TriggerSdk {
                 let entry = self.content_entry_by_index(device_id, thing_uuid, *index)?;
                 serde_json::to_string_pretty(&entry).context("Failed to serialize content entry")
             }
+            VirtualPath::ThingEntryData { thing_uuid, index, .. } => {
+                let entry = self.content_entry_by_index(device_id, thing_uuid, *index)?;
+                let data = self
+                    .things_get_json_object_entry_data(device_id, thing_uuid, &entry.id)?
+                    .unwrap_or_else(|| json!({}));
+                serde_json::to_string_pretty(&data).context("Failed to serialize json_object data")
+            }
+            VirtualPath::ThingEntrySchema { thing_uuid, index, .. } => {
+                let entry = self.content_entry_by_index(device_id, thing_uuid, *index)?;
+                let schema = self
+                    .things_get_json_object_entry_schema(device_id, thing_uuid, &entry.id)?
+                    .unwrap_or(JsonValue::Null);
+                serde_json::to_string_pretty(&schema).context("Failed to serialize json_object schema")
+            }
             _ => Err(friendly_anyhow(
                 &display_path(path),
                 "read_unsupported",
-                "cat_tool only supports file nodes such as name, trigger, status, content.md, entries.{idx}, and rule.json.",
+                "cat_tool only supports file nodes such as name, trigger, status, content.md, entries.{idx}, entries.{idx}.data.json, entries.{idx}.schema.json, and rule.json.",
             )),
         }
     }
@@ -901,6 +983,73 @@ impl TriggerSdk {
             "path": path,
             "message": format!("Updated content entry {} for thing '{}'", index, thing_uuid),
             "entry": updated,
+        }))
+    }
+
+    fn edit_thing_entry_data_path(
+        &self,
+        device_id: &str,
+        path: &str,
+        thing_uuid: &str,
+        index: usize,
+        operation: &str,
+        value: Option<&JsonValue>,
+    ) -> Result<JsonValue> {
+        if operation != "overwrite" {
+            return Err(friendly_anyhow(
+                path,
+                "invalid_operation",
+                "entries.{idx}.data.json only supports overwrite.",
+            ));
+        }
+
+        let entry = self.content_entry_by_index(device_id, thing_uuid, index)?;
+        let data = value.ok_or_else(|| {
+            friendly_anyhow(
+                path,
+                "invalid_value",
+                "entries.{idx}.data.json overwrite requires a JSON value.",
+            )
+        })?;
+        self.things_set_json_object_entry_data(device_id, thing_uuid, &entry.id, data)?;
+        let updated = self
+            .things_get_json_object_entry_data(device_id, thing_uuid, &entry.id)?
+            .unwrap_or_else(|| json!({}));
+        Ok(json!({
+            "ok": true,
+            "path": path,
+            "message": format!("Updated json_object data for entry {} on thing '{}'", index, thing_uuid),
+            "value": updated,
+        }))
+    }
+
+    fn edit_thing_entry_schema_path(
+        &self,
+        device_id: &str,
+        path: &str,
+        thing_uuid: &str,
+        index: usize,
+        operation: &str,
+        value: Option<&JsonValue>,
+    ) -> Result<JsonValue> {
+        if operation != "overwrite" {
+            return Err(friendly_anyhow(
+                path,
+                "invalid_operation",
+                "entries.{idx}.schema.json only supports overwrite.",
+            ));
+        }
+
+        let entry = self.content_entry_by_index(device_id, thing_uuid, index)?;
+        self.things_set_json_object_entry_schema(device_id, thing_uuid, &entry.id, value)?;
+        let updated = self
+            .things_get_json_object_entry_schema(device_id, thing_uuid, &entry.id)?
+            .unwrap_or(JsonValue::Null);
+        Ok(json!({
+            "ok": true,
+            "path": path,
+            "message": format!("Updated json_object schema for entry {} on thing '{}'", index, thing_uuid),
+            "value": updated,
         }))
     }
 
@@ -1114,6 +1263,34 @@ fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
             collection_uuid: (*collection_uuid).to_string(),
             thing_uuid: (*thing_uuid).to_string(),
         }),
+        ["collection", collection_uuid, "things", thing_uuid, entry_segment]
+            if entry_segment.starts_with("entries.") && entry_segment.ends_with(".data.json") =>
+        {
+            let index = entry_segment[8..entry_segment.len() - ".data.json".len()]
+                .parse::<usize>()
+                .map_err(|_| {
+                    friendly_anyhow(path, "invalid_entry_index", "entries.{idx}.data.json must use a non-negative integer index.")
+                })?;
+            Ok(VirtualPath::ThingEntryData {
+                collection_uuid: (*collection_uuid).to_string(),
+                thing_uuid: (*thing_uuid).to_string(),
+                index,
+            })
+        }
+        ["collection", collection_uuid, "things", thing_uuid, entry_segment]
+            if entry_segment.starts_with("entries.") && entry_segment.ends_with(".schema.json") =>
+        {
+            let index = entry_segment[8..entry_segment.len() - ".schema.json".len()]
+                .parse::<usize>()
+                .map_err(|_| {
+                    friendly_anyhow(path, "invalid_entry_index", "entries.{idx}.schema.json must use a non-negative integer index.")
+                })?;
+            Ok(VirtualPath::ThingEntrySchema {
+                collection_uuid: (*collection_uuid).to_string(),
+                thing_uuid: (*thing_uuid).to_string(),
+                index,
+            })
+        }
         ["collection", collection_uuid, "things", thing_uuid, entry_segment] if entry_segment.starts_with("entries.") => {
             let index = entry_segment[8..].parse::<usize>().map_err(|_| {
                 friendly_anyhow(path, "invalid_entry_index", "entries.{idx} must end with a non-negative integer index.")
@@ -1255,7 +1432,14 @@ fn thing_dir_children(
         entries
             .iter()
             .enumerate()
-            .map(|(index, _)| TreeNode::new(format!("entries.{}", index))),
+            .flat_map(|(index, entry)| {
+                let mut nodes = vec![TreeNode::new(format!("entries.{}", index))];
+                if matches!(entry.payload, ContentEntryPayload::JsonObject(_)) {
+                    nodes.push(TreeNode::new(format!("entries.{}.data.json", index)));
+                    nodes.push(TreeNode::new(format!("entries.{}.schema.json", index)));
+                }
+                nodes
+            }),
     );
 
     let thing_children = child_things(snapshot, collection_uuid, Some(thing_uuid));
@@ -1403,6 +1587,8 @@ fn display_path(path: &VirtualPath) -> String {
         VirtualPath::ThingStatus { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/status"),
         VirtualPath::ThingContent { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/content.md"),
         VirtualPath::ThingEntry { collection_uuid, thing_uuid, index } => format!("/collection/{collection_uuid}/things/{thing_uuid}/entries.{index}"),
+        VirtualPath::ThingEntryData { collection_uuid, thing_uuid, index } => format!("/collection/{collection_uuid}/things/{thing_uuid}/entries.{index}.data.json"),
+        VirtualPath::ThingEntrySchema { collection_uuid, thing_uuid, index } => format!("/collection/{collection_uuid}/things/{thing_uuid}/entries.{index}.schema.json"),
         VirtualPath::ThingChildrenDir { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/things"),
     }
 }

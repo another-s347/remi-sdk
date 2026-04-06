@@ -355,6 +355,8 @@ pub enum ContentEntryKind {
     Location,
     /// Markdown document (stored in separate ThingMarkdown document)
     Markdown,
+    /// JSON object content with separate data/schema documents
+    JsonObject,
     /// Date/datetime content
     Date,
     /// Image content (URI + caption + metadata)
@@ -370,6 +372,7 @@ impl ContentEntryKind {
         match self {
             ContentEntryKind::Location => "location",
             ContentEntryKind::Markdown => "markdown",
+            ContentEntryKind::JsonObject => "json_object",
             ContentEntryKind::Date => "date",
             ContentEntryKind::Image => "image",
             ContentEntryKind::Url => "url",
@@ -381,11 +384,36 @@ impl ContentEntryKind {
         match s {
             "location" => ContentEntryKind::Location,
             "markdown" => ContentEntryKind::Markdown,
+            "json_object" => ContentEntryKind::JsonObject,
             "date" => ContentEntryKind::Date,
             "image" => ContentEntryKind::Image,
             "url" => ContentEntryKind::Url,
             other => ContentEntryKind::Custom(other.to_string()),
         }
+    }
+}
+
+/// JSON object entry stored as separate content documents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonObjectField {
+    /// UUID of the opaque content document that stores the object data.
+    pub data_doc_uuid: String,
+    /// Optional UUID of the opaque content document that stores the JSON Schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_doc_uuid: Option<String>,
+}
+
+impl JsonObjectField {
+    pub fn new(data_doc_uuid: impl Into<String>) -> Self {
+        Self {
+            data_doc_uuid: data_doc_uuid.into(),
+            schema_doc_uuid: None,
+        }
+    }
+
+    pub fn with_schema_doc_uuid(mut self, schema_doc_uuid: impl Into<String>) -> Self {
+        self.schema_doc_uuid = Some(schema_doc_uuid.into());
+        self
     }
 }
 
@@ -400,6 +428,8 @@ pub enum ContentEntryPayload {
         /// UUID of the ThingMarkdown document
         doc_uuid: String,
     },
+    /// JSON object content with separate data/schema documents
+    JsonObject(JsonObjectField),
     /// Date content
     Date(DateField),
     /// Image content (URI + caption + metadata)
@@ -418,6 +448,7 @@ impl ContentEntryPayload {
         match self {
             ContentEntryPayload::Location(_) => ContentEntryKind::Location,
             ContentEntryPayload::Markdown { .. } => ContentEntryKind::Markdown,
+            ContentEntryPayload::JsonObject(_) => ContentEntryKind::JsonObject,
             ContentEntryPayload::Date(_) => ContentEntryKind::Date,
             ContentEntryPayload::Image(_) => ContentEntryKind::Image,
             ContentEntryPayload::Url(_) => ContentEntryKind::Url,
@@ -527,6 +558,41 @@ impl ContentEntry {
             payload: ContentEntryPayload::Markdown {
                 doc_uuid: doc_uuid.into(),
             },
+        }
+    }
+
+    /// Create a new JSON object content entry.
+    pub fn json_object(data_doc_uuid: impl Into<String>, order: f64) -> Self {
+        Self::new(
+            ContentEntryPayload::JsonObject(JsonObjectField::new(data_doc_uuid)),
+            order,
+        )
+    }
+
+    /// Create a new JSON object content entry with specified ID.
+    pub fn json_object_with_id(
+        id: impl Into<String>,
+        data_doc_uuid: impl Into<String>,
+        order: f64,
+    ) -> Self {
+        Self::with_id(
+            id,
+            ContentEntryPayload::JsonObject(JsonObjectField::new(data_doc_uuid)),
+            order,
+        )
+    }
+
+    /// Create a new JSON object content entry with title.
+    pub fn json_object_with_title(
+        title: impl Into<String>,
+        data_doc_uuid: impl Into<String>,
+        order: f64,
+    ) -> Self {
+        Self {
+            id: generate_uuid(),
+            title: Some(title.into()),
+            order,
+            payload: ContentEntryPayload::JsonObject(JsonObjectField::new(data_doc_uuid)),
         }
     }
 

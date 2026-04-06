@@ -306,9 +306,9 @@ fn abstract_events() -> JsonValue {
 fn cat_tool() -> JsonValue {
     tool(
         "cat_tool",
-        "Read a virtual filesystem file. For image entries, cat_tool returns the image directly instead of JSON text. Valid file nodes include trigger name/rule.json and collection or thing name/trigger/status/content.md/entries.{idx}.",
+        "Read a virtual filesystem file. For image entries, cat_tool returns the image directly instead of JSON text. Valid file nodes include trigger name/rule.json and collection or thing name/trigger/status/content.md/entries.{idx}/entries.{idx}.data.json/entries.{idx}.schema.json.",
         obj(
-            json!({ "path": str_prop("Absolute file path to read, such as '/trigger/<uuid>/rule.json', '/collection/<collection_uuid>/trigger', or '/collection/<collection_uuid>/things/<thing_uuid>/entries.1'.") }),
+            json!({ "path": str_prop("Absolute file path to read, such as '/trigger/<uuid>/rule.json', '/collection/<collection_uuid>/trigger', '/collection/<collection_uuid>/things/<thing_uuid>/entries.1', or '/collection/<collection_uuid>/things/<thing_uuid>/entries.1.data.json'.") }),
             &["path"],
         ),
     )
@@ -317,17 +317,17 @@ fn cat_tool() -> JsonValue {
 fn create_tool() -> JsonValue {
     tool(
         "create_tool",
-        "Create a new collection, thing, or image entry from a parent path. The tool generates a new UUID automatically and returns the created UUID and path.",
+        "Create a new collection, thing, image entry, or json_object entry from a parent path. The tool generates a new UUID automatically and returns the created UUID and path.",
         obj(
             json!({
-                "parent_path": str_prop("Parent path. Use '/' or '/collection' for collections. Use '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things' for things. Use '/collection/<collection_uuid>/things/<thing_uuid>' for image entries."),
+                "parent_path": str_prop("Parent path. Use '/' or '/collection' for collections. Use '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things' for things. Use '/collection/<collection_uuid>/things/<thing_uuid>' for image or json_object entries."),
                 "type_name": {
                     "type": "string",
                     "description": "Entity type to create.",
-                    "enum": ["collection", "thing", "image"]
+                    "enum": ["collection", "thing", "image", "json_object"]
                 },
-                "title": nullable_str("Optional initial title. Defaults to 'New Collection' or 'New Thing'. For image entries this becomes the entry title."),
-                "content": nullable_str("Optional initial markdown content for things. Ignored for collections and images."),
+                "title": nullable_str("Optional initial title. Defaults to 'New Collection' or 'New Thing'. For image or json_object entries this becomes the entry title."),
+                "content": nullable_str("Optional initial markdown content for things. For json_object entries this may be a JSON object string used as initial data. Ignored for collections and images."),
                 "source_uri": nullable_str("Required for type='image'. Must be a remi:// URI, typically one of the current chat input image attachments.")
             }),
             &["parent_path", "type_name"],

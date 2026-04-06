@@ -204,6 +204,7 @@ impl ServerKeyDiscovery {
 struct LocalReachabilityFilters {
     active_collections: Option<std::collections::HashSet<String>>,
     active_things: Option<std::collections::HashSet<String>>,
+    active_content_documents: Option<std::collections::HashSet<String>>,
 }
 
 struct PullMissingDocumentsOutput {
@@ -238,6 +239,7 @@ fn build_local_reachability_filters(
     Ok(LocalReachabilityFilters {
         active_collections: Some(doc_set.active_collection_uuids()?),
         active_things: Some(doc_set.active_thing_uuids()?),
+        active_content_documents: Some(doc_set.active_content_document_uuids()?),
     })
 }
 
@@ -267,7 +269,10 @@ fn clean_document_should_receive(
         "thing_markdown" => filters
             .active_things
             .as_ref()
-            .map(|active| active.contains(uuid))
+            .zip(filters.active_content_documents.as_ref())
+            .map(|(active_things, active_content_documents)| {
+                active_things.contains(uuid) || active_content_documents.contains(uuid)
+            })
             .unwrap_or(true),
         _ => true,
     }
@@ -287,7 +292,10 @@ fn should_pull_missing_document(
         "thing_markdown" => filters
             .active_things
             .as_ref()
-            .map(|active| active.contains(uuid))
+            .zip(filters.active_content_documents.as_ref())
+            .map(|(active_things, active_content_documents)| {
+                active_things.contains(uuid) || active_content_documents.contains(uuid)
+            })
             .unwrap_or(true),
         _ => true,
     }
@@ -759,6 +767,11 @@ where
                         phase1b_server_reply_messages += output.server_reply_messages;
                         documents_pulled += 1;
                         observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
+                        if doc_row.data_type == "collection" {
+                            if let Ok(updated_filters) = build_local_reachability_filters(sdk, device_id) {
+                                reachability = updated_filters;
+                            }
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1018,6 +1031,11 @@ where
                     &doc_bytes,
                     reachability,
                 );
+                if dt_str == "collection" {
+                    if let Ok(updated_filters) = build_local_reachability_filters(sdk, device_id) {
+                        *reachability = updated_filters;
+                    }
+                }
 
                 documents_pulled += 1;
                 observe_sync_timestamp(&mut last_sync_at, snapshot_sync_at);
@@ -1073,6 +1091,11 @@ where
                             &doc_bytes,
                             reachability,
                         );
+                        if dt_str == "collection" {
+                            if let Ok(updated_filters) = build_local_reachability_filters(sdk, device_id) {
+                                *reachability = updated_filters;
+                            }
+                        }
 
                         documents_pulled += 1;
                         observe_sync_timestamp(&mut last_sync_at, snapshot_sync_at);

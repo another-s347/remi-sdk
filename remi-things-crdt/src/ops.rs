@@ -1284,6 +1284,13 @@ fn write_content_entry_payload(
             put_string(doc, &payload_obj, "type", "markdown")?;
             put_string(doc, &payload_obj, "doc_uuid", doc_uuid)?;
         }
+        ContentEntryPayload::JsonObject(field) => {
+            put_string(doc, &payload_obj, "type", "json_object")?;
+            put_string(doc, &payload_obj, "data_doc_uuid", &field.data_doc_uuid)?;
+            if let Some(schema_doc_uuid) = &field.schema_doc_uuid {
+                put_string(doc, &payload_obj, "schema_doc_uuid", schema_doc_uuid)?;
+            }
+        }
         ContentEntryPayload::Date(date) => {
             put_string(doc, &payload_obj, "type", "date")?;
             put_u64(doc, &payload_obj, "timestamp_ms", date.timestamp_ms as u64)?;

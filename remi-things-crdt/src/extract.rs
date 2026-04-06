@@ -810,6 +810,14 @@ fn extract_content_entry_payload(
             let doc_uuid = get_string(doc, payload_obj, "doc_uuid")?.unwrap_or_default();
             Ok(Some(ContentEntryPayload::Markdown { doc_uuid }))
         }
+        "json_object" => {
+            let data_doc_uuid = get_string(doc, payload_obj, "data_doc_uuid")?.unwrap_or_default();
+            let schema_doc_uuid = get_string(doc, payload_obj, "schema_doc_uuid")?;
+            Ok(Some(ContentEntryPayload::JsonObject(crate::datatype::JsonObjectField {
+                data_doc_uuid,
+                schema_doc_uuid,
+            })))
+        }
         "date" => {
             let timestamp_ms = get_u64(doc, payload_obj, "timestamp_ms")?.unwrap_or(0) as i64;
             let has_time = match doc.get(payload_obj, "has_time")? {

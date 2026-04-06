@@ -4,10 +4,11 @@ use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
 use crate::storage::Storage;
 use crate::chat_types::{CachedMessage, ChatProtocolSessionState, ChatSessionExportBundle};
 use crate::things_crdt::{
-    ContentEntry, ContentEntryUpdate, ThingCollectionEntry, ThingCollectionUpsert, ThingEntry,
-    ThingUpsert, ThingsSnapshot, ThingsSnapshotState,
+    ContentEntry, ContentEntryPayload, ContentEntryUpdate, JsonObjectField,
+    ThingCollectionEntry, ThingCollectionUpsert, ThingEntry, ThingUpsert, ThingsSnapshot,
+    ThingsSnapshotState,
 };
-use crate::things_events::{ThingsDocumentEvent, ThingsEvent};
+use crate::things_events::{ThingsDocumentChangeKind, ThingsDocumentEvent, ThingsEvent};
 use crate::trigger_events::TriggerEvent;
 use crate::types::{
     EventPayload, NotificationSource, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
@@ -18,10 +19,11 @@ use crate::types::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, TimeZone, Timelike, Utc};
 use croner::Cron;
+use jsonschema::JSONSchema;
 use rule_trigger_engine::{
     EvaluationContext, MonitoringEvent, PreconditionPolicy, Rule as EngineRule, TriggerConfig,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use serde_json::to_string;
 use std::path::Path;
 use std::str::FromStr;
@@ -668,6 +670,57 @@ impl TriggerSdk {
     ) -> Result<crate::things_crdt::ThingsDocumentSet> {
         let persistence = crate::things_crdt::DocumentPersistence::new(&self.storage);
         persistence.load_or_init_document_set(device_id)
+    }
+
+    fn resolve_thing_collection_uuid(
+        doc_set: &crate::things_crdt::ThingsDocumentSet,
+        thing_uuid: &str,
+    ) -> Result<String> {
+        let snapshot = doc_set.extract_snapshot()?;
+        match snapshot.things.iter().find(|thing| thing.uuid == thing_uuid) {
+            Some(thing) => Ok(thing.collection_uuid.clone()),
+            None => doc_set
+                .find_thing_collection_uuid(thing_uuid)
+                .ok_or_else(|| anyhow!("Thing not found: {}", thing_uuid)),
+        }
+    }
+
+    fn validate_json_object_data(schema: Option<&Value>, data: &Value) -> Result<()> {
+        if !data.is_object() {
+            anyhow::bail!("json_object data must be a JSON object")
+        }
+
+        if let Some(schema) = schema {
+            let compiled = JSONSchema::compile(schema)
+                .map_err(|error| anyhow!("Invalid JSON Schema: {error}"))?;
+            let errors = compiled
+                .validate(data)
+                .map(|_| Vec::new())
+                .unwrap_or_else(|errors| errors.map(|error| error.to_string()).collect::<Vec<_>>());
+            if !errors.is_empty() {
+                anyhow::bail!("JSON object does not satisfy schema: {}", errors.join("; "));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn resolve_json_object_entry_field(
+        entries: &[ContentEntry],
+        entry_id: &str,
+    ) -> Result<JsonObjectField> {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| anyhow!("Content entry not found: {}", entry_id))?;
+        match &entry.payload {
+            ContentEntryPayload::JsonObject(field) => Ok(field.clone()),
+            other => anyhow::bail!(
+                "Content entry '{}' is not a json_object entry (found {:?})",
+                entry_id,
+                other.kind()
+            ),
+        }
     }
 
     pub fn things_list_snapshot(&self, device_id: &str) -> Result<ThingsSnapshotState> {
@@ -1688,32 +1741,7 @@ impl TriggerSdk {
         entry: ContentEntry,
     ) -> Result<String> {
         let mut doc_set = self.get_or_init_document_set(device_id)?;
-
-        // Find the thing's collection — try snapshot first, fall back to direct scan.
-        let collection_uuid = {
-            let snapshot = doc_set.extract_snapshot()?;
-            match snapshot.things.iter().find(|t| t.uuid == thing_uuid) {
-                Some(t) => t.collection_uuid.clone(),
-                None => {
-                    // Snapshot didn't contain the thing (root <-> collection linkage may be stale).
-                    // Scan collection documents directly.
-                    tracing::warn!(
-                        thing_uuid,
-                        snapshot_thing_count = snapshot.things.len(),
-                        "things_add_content_entry: thing not in snapshot, scanning collection docs"
-                    );
-                    doc_set
-                        .find_thing_collection_uuid(thing_uuid)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Thing not found: {} (snapshot had {} things)",
-                                thing_uuid,
-                                snapshot.things.len()
-                            )
-                        })?
-                }
-            }
-        };
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
 
         let id = entry.id.clone();
 
@@ -1738,23 +1766,7 @@ impl TriggerSdk {
         update: ContentEntryUpdate,
     ) -> Result<()> {
         let mut doc_set = self.get_or_init_document_set(device_id)?;
-
-        // Find the thing's collection — try snapshot first, fall back to direct scan.
-        let collection_uuid = {
-            let snapshot = doc_set.extract_snapshot()?;
-            match snapshot.things.iter().find(|t| t.uuid == thing_uuid) {
-                Some(t) => t.collection_uuid.clone(),
-                None => {
-                    tracing::warn!(
-                        thing_uuid,
-                        "things_update_content_entry: thing not in snapshot, scanning collection docs"
-                    );
-                    doc_set
-                        .find_thing_collection_uuid(thing_uuid)
-                        .ok_or_else(|| anyhow::anyhow!("Thing not found: {}", thing_uuid))?
-                }
-            }
-        };
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
 
         let events = doc_set.update_content_entry(
             &collection_uuid,
@@ -1778,28 +1790,204 @@ impl TriggerSdk {
         entry_id: &str,
     ) -> Result<()> {
         let mut doc_set = self.get_or_init_document_set(device_id)?;
-
-        // Find the thing's collection — try snapshot first, fall back to direct scan.
-        let collection_uuid = {
-            let snapshot = doc_set.extract_snapshot()?;
-            match snapshot.things.iter().find(|t| t.uuid == thing_uuid) {
-                Some(t) => t.collection_uuid.clone(),
-                None => {
-                    tracing::warn!(
-                        thing_uuid,
-                        "things_delete_content_entry: thing not in snapshot, scanning collection docs"
-                    );
-                    doc_set
-                        .find_thing_collection_uuid(thing_uuid)
-                        .ok_or_else(|| anyhow::anyhow!("Thing not found: {}", thing_uuid))?
-                }
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let json_object_field = entries.iter().find(|entry| entry.id == entry_id).and_then(|entry| {
+            match &entry.payload {
+                ContentEntryPayload::JsonObject(field) => Some(field.clone()),
+                _ => None,
             }
-        };
+        });
 
         let events = doc_set.delete_content_entry(&collection_uuid, thing_uuid, entry_id)?;
+        if let Some(field) = json_object_field {
+            let data_key = crate::things_crdt::DocumentKey::thing_content(&field.data_doc_uuid);
+            doc_set.remove_document(&data_key);
+            let _ = self.storage.delete_crdt_document(&field.data_doc_uuid, "thing_markdown");
+
+            if let Some(schema_doc_uuid) = field.schema_doc_uuid {
+                let schema_key = crate::things_crdt::DocumentKey::thing_content(&schema_doc_uuid);
+                doc_set.remove_document(&schema_key);
+                let _ = self.storage.delete_crdt_document(&schema_doc_uuid, "thing_markdown");
+            }
+        }
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
         self.emit_document_events(device_id, events);
 
+        Ok(())
+    }
+
+    pub fn things_add_json_object_content_entry(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        title: Option<&str>,
+        data: Option<&Value>,
+        schema: Option<&Value>,
+    ) -> Result<String> {
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let order = entries.iter().map(|entry| entry.order).fold(-1.0_f64, f64::max) + 1.0;
+
+        let data_value = data.cloned().unwrap_or_else(|| json!({}));
+        Self::validate_json_object_data(schema, &data_value)?;
+
+        let data_doc_uuid = uuid::Uuid::new_v4().to_string();
+        doc_set.set_thing_json_content(&data_doc_uuid, thing_uuid, "json_object_data", &data_value)?;
+
+        let schema_doc_uuid = if let Some(schema_value) = schema {
+            let schema_doc_uuid = uuid::Uuid::new_v4().to_string();
+            doc_set.set_thing_json_content(&schema_doc_uuid, thing_uuid, "json_object_schema", schema_value)?;
+            Some(schema_doc_uuid)
+        } else {
+            None
+        };
+
+        let entry = ContentEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.map(|value| value.to_string()),
+            order,
+            payload: ContentEntryPayload::JsonObject(JsonObjectField {
+                data_doc_uuid,
+                schema_doc_uuid,
+            }),
+        };
+
+        let entry_id = entry.id.clone();
+        let events = doc_set.add_content_entry(&collection_uuid, thing_uuid, entry)?;
+        doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
+        Ok(entry_id)
+    }
+
+    pub fn things_get_json_object_entry_data(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+    ) -> Result<Option<Value>> {
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let field = Self::resolve_json_object_entry_field(&entries, entry_id)?;
+        doc_set.get_thing_json_content(&field.data_doc_uuid, thing_uuid)
+    }
+
+    pub fn things_get_json_object_entry_schema(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+    ) -> Result<Option<Value>> {
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let field = Self::resolve_json_object_entry_field(&entries, entry_id)?;
+        let Some(schema_doc_uuid) = field.schema_doc_uuid else {
+            return Ok(None);
+        };
+        doc_set.get_thing_json_content(&schema_doc_uuid, thing_uuid)
+    }
+
+    pub fn things_set_json_object_entry_data(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+        data: &Value,
+    ) -> Result<()> {
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let field = Self::resolve_json_object_entry_field(&entries, entry_id)?;
+        let schema = match &field.schema_doc_uuid {
+            Some(schema_doc_uuid) => doc_set.get_thing_json_content(schema_doc_uuid, thing_uuid)?,
+            None => None,
+        };
+
+        Self::validate_json_object_data(schema.as_ref(), data)?;
+        doc_set.set_thing_json_content(&field.data_doc_uuid, thing_uuid, "json_object_data", data)?;
+        doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(
+            device_id,
+            vec![ThingsDocumentEvent::content_entry(
+                ThingsDocumentChangeKind::Updated,
+                &collection_uuid,
+                thing_uuid,
+                entry_id,
+            )],
+        );
+        Ok(())
+    }
+
+    pub fn things_set_json_object_entry_schema(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+        schema: Option<&Value>,
+    ) -> Result<()> {
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let mut field = Self::resolve_json_object_entry_field(&entries, entry_id)?;
+        let mut events = Vec::new();
+        let data = doc_set
+            .get_thing_json_content(&field.data_doc_uuid, thing_uuid)?
+            .unwrap_or_else(|| json!({}));
+
+        Self::validate_json_object_data(schema, &data)?;
+
+        match schema {
+            Some(schema_value) => {
+                let schema_doc_uuid = field
+                    .schema_doc_uuid
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                doc_set.set_thing_json_content(
+                    &schema_doc_uuid,
+                    thing_uuid,
+                    "json_object_schema",
+                    schema_value,
+                )?;
+                if field.schema_doc_uuid.as_deref() != Some(schema_doc_uuid.as_str()) {
+                    field.schema_doc_uuid = Some(schema_doc_uuid);
+                    events.extend(doc_set.update_content_entry(
+                        &collection_uuid,
+                        thing_uuid,
+                        entry_id,
+                        None,
+                        None,
+                        Some(ContentEntryPayload::JsonObject(field)),
+                    )?);
+                }
+            }
+            None => {
+                if let Some(schema_doc_uuid) = field.schema_doc_uuid.take() {
+                    let schema_key = crate::things_crdt::DocumentKey::thing_content(&schema_doc_uuid);
+                    doc_set.remove_document(&schema_key);
+                    let _ = self.storage.delete_crdt_document(&schema_doc_uuid, "thing_markdown");
+                    events.extend(doc_set.update_content_entry(
+                        &collection_uuid,
+                        thing_uuid,
+                        entry_id,
+                        None,
+                        None,
+                        Some(ContentEntryPayload::JsonObject(field)),
+                    )?);
+                }
+            }
+        }
+
+        doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        events.push(ThingsDocumentEvent::content_entry(
+            ThingsDocumentChangeKind::Updated,
+            &collection_uuid,
+            thing_uuid,
+            entry_id,
+        ));
+        self.emit_document_events(device_id, events);
         Ok(())
     }
 
@@ -1810,22 +1998,7 @@ impl TriggerSdk {
         thing_uuid: &str,
     ) -> Result<Vec<ContentEntry>> {
         let doc_set = self.get_or_init_document_set(device_id)?;
-
-        let collection_uuid = {
-            let snapshot = doc_set.extract_snapshot()?;
-            match snapshot.things.iter().find(|t| t.uuid == thing_uuid) {
-                Some(t) => t.collection_uuid.clone(),
-                None => {
-                    tracing::warn!(
-                        thing_uuid,
-                        "things_get_content_entries: thing not in snapshot, scanning collection docs"
-                    );
-                    doc_set
-                        .find_thing_collection_uuid(thing_uuid)
-                        .ok_or_else(|| anyhow::anyhow!("Thing not found: {}", thing_uuid))?
-                }
-            }
-        };
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
 
         doc_set.get_content_entries(&collection_uuid, thing_uuid)
     }
