@@ -9,7 +9,7 @@ pub mod util;
 pub mod view;
 
 pub use datatype::{
-    CrdtDataType, DateField, ImageField, LocationField, UrlField, ThingBuiltInFields, ThingBuiltInFieldsUpdate, ThingDatatype, ROOT_DOC_UUID,
+	CrdtDataType, DateField, ImageField, JsonObjectField, LocationField, UrlField, ThingBuiltInFields, ThingBuiltInFieldsUpdate, ThingDatatype, ROOT_DOC_UUID,
     // V3 multi-value content entries
     ContentEntry, ContentEntryKind, ContentEntryPayload, ContentEntryUpdate, generate_uuid,
 };

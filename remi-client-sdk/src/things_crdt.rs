@@ -11,7 +11,7 @@ use crate::things_events::{
 
 pub use remi_things_crdt::{
     ContentEntry, ContentEntryKind, ContentEntryPayload, ContentEntryUpdate, DateField, ImageField,
-    LocationField, ThingDatatype, UrlField,
+    JsonObjectField, LocationField, ThingDatatype, UrlField,
 };
 
 use remi_things_crdt::{
@@ -28,16 +28,18 @@ use remi_things_crdt::{
     Schema,
     // V3 built-in fields (multi-value)
     ThingBuiltInFieldsUpdate,
+    ThingContentView,
     ThingMarkdownOp,
     ThingMarkdownView,
     TriggerUpdate,
     apply_collection_op,
     apply_thing_markdown_op,
     compact_collection_doc,
+    compact_thing_content_doc,
     compact_root_doc,
-    compact_thing_markdown_doc,
     extract_collection_doc_view,
     extract_root_view,
+    extract_thing_content_view,
     extract_thing_markdown_view,
     // V3 compaction
     needs_compaction,
@@ -165,6 +167,7 @@ pub struct ContentTypeRegistry;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RegisteredContentType {
     Markdown,
+    JsonObject,
     Url,
     Location,
     Date,
@@ -186,6 +189,7 @@ impl ContentTypeRegistry {
 
         match payload_type {
             "markdown" => Ok(RegisteredContentType::Markdown),
+            "json_object" => Ok(RegisteredContentType::JsonObject),
             "url" => Ok(RegisteredContentType::Url),
             "location" => Ok(RegisteredContentType::Location),
             "date" => Ok(RegisteredContentType::Date),
@@ -250,6 +254,7 @@ impl ContentTypeRegistry {
     pub fn parse_content_entry_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
         match self.detect_payload_type(value)? {
             RegisteredContentType::Markdown => self.parse_markdown_payload(value),
+            RegisteredContentType::JsonObject => self.parse_json_object_payload(value),
             RegisteredContentType::Url => self.parse_url_payload(value),
             RegisteredContentType::Location => self.parse_location_payload(value),
             RegisteredContentType::Date => self.parse_date_payload(value),
@@ -333,6 +338,24 @@ impl ContentTypeRegistry {
             .map(|item| item.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         Ok(ContentEntryPayload::Markdown { doc_uuid })
+    }
+
+    fn parse_json_object_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
+        let data_doc_uuid = value
+            .get("data_doc_uuid")
+            .and_then(|item| item.as_str())
+            .filter(|item| !item.trim().is_empty())
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let schema_doc_uuid = value
+            .get("schema_doc_uuid")
+            .and_then(|item| item.as_str())
+            .filter(|item| !item.trim().is_empty())
+            .map(|item| item.to_string());
+        Ok(ContentEntryPayload::JsonObject(JsonObjectField {
+            data_doc_uuid,
+            schema_doc_uuid,
+        }))
     }
 
     fn parse_url_payload(&self, value: &Value) -> Result<ContentEntryPayload> {
@@ -522,6 +545,11 @@ impl ContentTypeRegistry {
             ContentEntryPayload::Markdown { doc_uuid } => json!({
                 "type": "markdown",
                 "doc_uuid": doc_uuid,
+            }),
+            ContentEntryPayload::JsonObject(field) => json!({
+                "type": "json_object",
+                "data_doc_uuid": field.data_doc_uuid,
+                "schema_doc_uuid": field.schema_doc_uuid,
             }),
             ContentEntryPayload::Url(url) => json!({
                 "type": "url",
@@ -1031,6 +1059,13 @@ impl DocumentKey {
         }
     }
 
+    pub fn thing_content(uuid: &str) -> Self {
+        Self {
+            uuid: uuid.to_string(),
+            data_type: CrdtDataType::ThingMarkdown,
+        }
+    }
+
     pub fn data_type_str(&self) -> &'static str {
         self.data_type.as_str()
     }
@@ -1141,8 +1176,17 @@ impl<'a> DocumentStoreMut<'a> {
                     .context("Failed to compact collection document")?
             }
             CrdtDataType::ThingMarkdown => {
-                compact_thing_markdown_doc(&state.automerge_doc, &key.uuid, self.device_id)
-                    .context("Failed to compact thing markdown document")?
+                let doc = AutoCommit::load(&state.automerge_doc)
+                    .context("Failed to load thing content document for compaction")?;
+                let thing_uuid = match doc.get(automerge::ROOT, "thing_uuid")? {
+                    Some((AmValue::Scalar(value), _)) => match value.as_ref() {
+                        ScalarValue::Str(value) => value.to_string(),
+                        _ => key.uuid.clone(),
+                    },
+                    _ => key.uuid.clone(),
+                };
+                compact_thing_content_doc(&state.automerge_doc, &key.uuid, &thing_uuid, self.device_id)
+                    .context("Failed to compact thing content document")?
             }
         };
 
@@ -1216,7 +1260,7 @@ impl<'a> ThingsDomainReader<'a> {
     }
 
     fn thing_markdown_view(&self, thing_uuid: &str) -> Result<ThingMarkdownView> {
-        let key = DocumentKey::thing_markdown(thing_uuid);
+        let key = DocumentKey::thing_content(thing_uuid);
         match self.store.get(&key) {
             Some(state) => extract_thing_markdown_view(&state.automerge_doc, thing_uuid),
             None => Ok(ThingMarkdownView {
@@ -1225,6 +1269,44 @@ impl<'a> ThingsDomainReader<'a> {
                 content: None,
             }),
         }
+    }
+
+    fn thing_content_view(
+        &self,
+        document_uuid: &str,
+        thing_uuid: &str,
+    ) -> Result<Option<ThingContentView>> {
+        let key = DocumentKey::thing_content(document_uuid);
+        let Some(state) = self.store.get(&key) else {
+            return Ok(None);
+        };
+
+        Ok(Some(extract_thing_content_view(
+            &state.automerge_doc,
+            document_uuid,
+            thing_uuid,
+        )?))
+    }
+
+    fn thing_content_document_uuids(&self, thing_uuid: &str) -> Result<Vec<String>> {
+        let mut uuids = Vec::new();
+
+        for (key, state) in self.store.iter() {
+            if key.data_type != CrdtDataType::ThingMarkdown {
+                continue;
+            }
+
+            let Ok(view) = extract_thing_content_view(&state.automerge_doc, &key.uuid, thing_uuid) else {
+                continue;
+            };
+
+            if view.thing_uuid == thing_uuid {
+                uuids.push(key.uuid.clone());
+            }
+        }
+
+        uuids.sort();
+        Ok(uuids)
     }
 
     fn get_content_entries(
@@ -1359,6 +1441,52 @@ impl<'a> ThingsDomainReader<'a> {
         Ok(live_things)
     }
 
+    fn active_content_document_uuids(&self) -> Result<HashSet<String>> {
+        let live_collections = self.active_collection_uuids()?;
+        let mut live_docs = HashSet::new();
+
+        for coll_uuid in &live_collections {
+            let key = DocumentKey::collection(coll_uuid);
+            let Some(state) = self.store.get(&key) else {
+                continue;
+            };
+
+            let view = extract_collection_doc_view(&state.automerge_doc, coll_uuid)?;
+            if view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            for thing in &view.things {
+                if thing.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false) {
+                    continue;
+                }
+
+                for entry in self.get_content_entries(coll_uuid, &thing.id)? {
+                    match entry.payload {
+                        ContentEntryPayload::Markdown { doc_uuid } => {
+                            live_docs.insert(doc_uuid);
+                        }
+                        ContentEntryPayload::JsonObject(field) => {
+                            live_docs.insert(field.data_doc_uuid);
+                            if let Some(schema_doc_uuid) = field.schema_doc_uuid {
+                                live_docs.insert(schema_doc_uuid);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(live_docs)
+    }
+
     fn extract_snapshot(&self) -> Result<ThingsSnapshot> {
         self.extract_snapshot_with_options(SnapshotOptions::default())
     }
@@ -1487,10 +1615,20 @@ impl<'a> ThingsDomainWriter<'a> {
         Ok(())
     }
 
-    fn get_or_init_thing_markdown(&mut self, thing_uuid: &str) -> Result<()> {
-        let key = DocumentKey::thing_markdown(thing_uuid);
+    fn get_or_init_thing_content(
+        &mut self,
+        document_uuid: &str,
+        thing_uuid: &str,
+        content_type: &str,
+    ) -> Result<()> {
+        let key = DocumentKey::thing_content(document_uuid);
         if !self.documents.contains_key(&key) {
-            let doc_bytes = Schema::init_thing_markdown_doc(self.device_id, thing_uuid)?;
+            let doc_bytes = Schema::init_thing_content_doc(
+                self.device_id,
+                document_uuid,
+                thing_uuid,
+                content_type,
+            )?;
             self.documents
                 .insert(key, self.new_document_state(doc_bytes));
         }
@@ -1524,12 +1662,22 @@ impl<'a> ThingsDomainWriter<'a> {
         })
     }
 
-    fn apply_thing_markdown_update(&mut self, thing_uuid: &str, op: ThingMarkdownOp) -> Result<()> {
-        self.get_or_init_thing_markdown(thing_uuid)?;
-        let key = DocumentKey::thing_markdown(thing_uuid);
+    fn apply_thing_content_update(
+        &mut self,
+        document_uuid: &str,
+        thing_uuid: &str,
+        content_type: &str,
+        op: ThingMarkdownOp,
+    ) -> Result<()> {
+        self.get_or_init_thing_content(document_uuid, thing_uuid, content_type)?;
+        let key = DocumentKey::thing_content(document_uuid);
         self.apply_document_update(&key, |doc| {
             apply_thing_markdown_op(doc, self.device_id, thing_uuid, op)
         })
+    }
+
+    fn apply_thing_markdown_update(&mut self, thing_uuid: &str, op: ThingMarkdownOp) -> Result<()> {
+        self.apply_thing_content_update(thing_uuid, thing_uuid, "markdown", op)
     }
 
     fn root_collection_list_ids(doc: &AutoCommit) -> Result<Vec<ObjId>> {
@@ -1835,6 +1983,21 @@ impl<'a> ThingsDomainWriter<'a> {
         self.apply_thing_markdown_update(thing_uuid, ThingMarkdownOp::SetContent { content })
     }
 
+    fn set_thing_content_document(
+        &mut self,
+        document_uuid: &str,
+        thing_uuid: &str,
+        content_type: &str,
+        content: Content,
+    ) -> Result<()> {
+        self.apply_thing_content_update(
+            document_uuid,
+            thing_uuid,
+            content_type,
+            ThingMarkdownOp::SetContent { content },
+        )
+    }
+
     fn splice_thing_text(
         &mut self,
         thing_uuid: &str,
@@ -2000,6 +2163,10 @@ impl ThingsDocumentSet {
     /// Return thing UUIDs that are still reachable through live collection documents.
     pub fn active_thing_uuids(&self) -> Result<HashSet<String>> {
         self.domain_reader().active_thing_uuids()
+    }
+
+    pub fn active_content_document_uuids(&self) -> Result<HashSet<String>> {
+        self.domain_reader().active_content_document_uuids()
     }
 
     // ===== V3 Compaction =====
@@ -2303,7 +2470,7 @@ impl ThingsDocumentSet {
 
     fn thing_markdown_document_exists(&self, thing_uuid: &str) -> bool {
         self.documents
-            .contains_key(&DocumentKey::thing_markdown(thing_uuid))
+            .contains_key(&DocumentKey::thing_content(thing_uuid))
     }
 
     // ===== ThingMarkdown Operations =====
@@ -2413,6 +2580,42 @@ impl ThingsDocumentSet {
     }
 
     // ===== Snapshot Generation =====
+
+    pub fn set_thing_json_content(
+        &mut self,
+        document_uuid: &str,
+        thing_uuid: &str,
+        content_type: &str,
+        value: &Value,
+    ) -> Result<()> {
+        let payload_json = serde_json::to_string(value)
+            .context("Failed to serialize thing content JSON payload")?;
+        self.domain_writer().set_thing_content_document(
+            document_uuid,
+            thing_uuid,
+            content_type,
+            Content::Opaque {
+                kind: content_type.to_string(),
+                payload_json,
+            },
+        )
+    }
+
+    pub fn get_thing_json_content(
+        &self,
+        document_uuid: &str,
+        thing_uuid: &str,
+    ) -> Result<Option<Value>> {
+        let Some(view) = self.domain_reader().thing_content_view(document_uuid, thing_uuid)? else {
+            return Ok(None);
+        };
+
+        Ok(view.content.and_then(|content| content.payload))
+    }
+
+    pub fn thing_content_document_uuids(&self, thing_uuid: &str) -> Result<Vec<String>> {
+        self.domain_reader().thing_content_document_uuids(thing_uuid)
+    }
 
     /// Extract a full snapshot from all documents
     pub fn extract_snapshot(&self) -> Result<ThingsSnapshot> {
@@ -3090,11 +3293,13 @@ impl<'a, R: CrdtDocumentRepository + ?Sized> DocumentPersistence<'a, R> {
         let thing_uuids: Vec<String> = coll_view.things.iter().map(|t| t.id.clone()).collect();
 
         for thing_uuid in &thing_uuids {
-            let key = DocumentKey::thing_markdown(thing_uuid);
-            doc_set.remove_document(&key);
-            self.repository
-                .delete_crdt_document(thing_uuid, "thing_markdown")
-                .ok();
+            for document_uuid in doc_set.thing_content_document_uuids(thing_uuid)? {
+                let key = DocumentKey::thing_content(&document_uuid);
+                doc_set.remove_document(&key);
+                self.repository
+                    .delete_crdt_document(&document_uuid, "thing_markdown")
+                    .ok();
+            }
         }
 
         let key = DocumentKey::collection(collection_uuid);

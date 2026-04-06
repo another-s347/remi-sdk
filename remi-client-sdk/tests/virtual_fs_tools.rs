@@ -331,3 +331,139 @@ fn virtual_fs_returns_friendly_errors_for_invalid_and_unsupported_paths() -> Res
 
     Ok(())
 }
+
+#[test]
+fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> Result<()> {
+    let (_dir, sdk) = init_sdk()?;
+    let device_id = "device-json";
+
+    sdk.things_upsert_collection(
+        device_id,
+        ThingCollectionUpsert {
+            uuid: "c-json".to_string(),
+            title: "Structured".to_string(),
+            trigger_uuid: None,
+            created_at: None,
+            updated_at: None,
+        },
+    )?;
+    sdk.things_upsert_thing(
+        device_id,
+        ThingUpsert {
+            uuid: "t-json".to_string(),
+            title: "Config".to_string(),
+            datatype: ThingDatatype::Markdown,
+            data: Some(json!({"markdown": "holder"})),
+            collection_uuid: "c-json".to_string(),
+            trigger_uuid: None,
+            parent_uuid: None,
+            created_at: None,
+            updated_at: None,
+        },
+    )?;
+
+    let created = sdk.create_virtual_path(
+        device_id,
+        "/collection/c-json/things/t-json",
+        "json_object",
+        Some("Config Data"),
+        Some(r#"{"enabled":true}"#),
+        None,
+        None,
+        None,
+    )?;
+    assert_eq!(created["path"], json!("/collection/c-json/things/t-json/entries.0"));
+
+    let entry: JsonValue = serde_json::from_str(
+        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?.content,
+    )?;
+    assert_eq!(entry["payload"]["type"], json!("json_object"));
+    let data_doc_uuid = entry["payload"]["data_doc_uuid"]
+        .as_str()
+        .context("data_doc_uuid")?;
+
+    let data: JsonValue = serde_json::from_str(
+        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0.data.json")?.content,
+    )?;
+    assert_eq!(data, json!({"enabled": true}));
+
+    let tree = sdk.tree_virtual_path(device_id, Some("/collection/c-json/things/t-json"))?;
+    assert!(tree.contains("entries.0"));
+    assert!(tree.contains("entries.0.data.json"));
+    assert!(tree.contains("entries.0.schema.json"));
+
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c-json/things/t-json/entries.0.schema.json",
+        "overwrite",
+        Some(&json!({
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "count": {"type": "integer"}
+            },
+            "required": ["enabled"]
+        })),
+        None,
+        None,
+        None,
+    )?;
+
+    let schema: JsonValue = serde_json::from_str(
+        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0.schema.json")?.content,
+    )?;
+    assert_eq!(schema["type"], json!("object"));
+
+    let updated_entry: JsonValue = serde_json::from_str(
+        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?.content,
+    )?;
+    let schema_doc_uuid = updated_entry["payload"]["schema_doc_uuid"]
+        .as_str()
+        .context("schema_doc_uuid")?;
+
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c-json/things/t-json/entries.0.data.json",
+        "overwrite",
+        Some(&json!({"enabled": false, "count": 3})),
+        None,
+        None,
+        None,
+    )?;
+
+    let invalid_data_err = sdk
+        .edit_virtual_path(
+            device_id,
+            "/collection/c-json/things/t-json/entries.0.data.json",
+            "overwrite",
+            Some(&json!({"enabled": "yes"})),
+            None,
+            None,
+            None,
+        )
+        .expect_err("invalid data should fail schema validation");
+    assert!(invalid_data_err.to_string().contains("does not satisfy schema"));
+
+    let invalid_schema_err = sdk
+        .edit_virtual_path(
+            device_id,
+            "/collection/c-json/things/t-json/entries.0.schema.json",
+            "overwrite",
+            Some(&json!({
+                "type": "object",
+                "properties": {"enabled": {"type": "string"}},
+                "required": ["enabled"]
+            })),
+            None,
+            None,
+            None,
+        )
+        .expect_err("schema that invalidates current data should fail");
+    assert!(invalid_schema_err.to_string().contains("does not satisfy schema"));
+
+    sdk.delete_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?;
+    assert!(sdk.crdt_get_document(data_doc_uuid, "thing_markdown")?.is_none());
+    assert!(sdk.crdt_get_document(schema_doc_uuid, "thing_markdown")?.is_none());
+
+    Ok(())
+}
