@@ -597,6 +597,22 @@ pub struct ChatSessionUpdate {
     pub message_count: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreferenceRecord {
+    pub key: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub value_type: String,
+    pub value_json: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalKvRecord {
+    pub key: String,
+    pub value: String,
+}
+
 mod event_timestamp {
     use super::*;
     use serde::de::{Error as DeError, Visitor};

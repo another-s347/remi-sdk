@@ -1,3 +1,8 @@
+use crate::archive::{
+    ArchivePayload, ArchivedCrdtDocument, ArchivedInternalKvEntry, ArchivedPreferenceEntry,
+    ArchivedTrigger, ArchivedTriggerBinding, DataArchiveCounts, DataArchiveImportMode,
+    DataArchiveImportReport, DataArchiveManifest,
+};
 use crate::context_prompt;
 use crate::events_events::EventsEvent;
 use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
@@ -25,6 +30,8 @@ use rule_trigger_engine::{
 };
 use serde_json::{Value, json};
 use serde_json::to_string;
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -42,9 +49,37 @@ fn default_timezone() -> FixedOffset {
     })
 }
 
+fn local_timezone() -> FixedOffset {
+    FixedOffset::from_str(&local_timezone_offset_string()).unwrap_or_else(|_| default_timezone())
+}
+
 fn local_timezone_offset_string() -> String {
     let seconds = Local::now().offset().local_minus_utc();
     format_offset_seconds(seconds)
+}
+
+pub(crate) fn format_timestamp_in_local_timezone(timestamp: DateTime<Utc>) -> String {
+    timestamp.with_timezone(&local_timezone()).to_rfc3339()
+}
+
+#[derive(serde::Serialize)]
+struct EventToolPayload {
+    #[serde(rename = "type")]
+    event_type: String,
+    timestamp: i64,
+    timestamp_local: String,
+    metadata: Value,
+}
+
+impl From<EventPayload> for EventToolPayload {
+    fn from(value: EventPayload) -> Self {
+        Self {
+            event_type: value.event_type,
+            timestamp: value.timestamp.timestamp(),
+            timestamp_local: format_timestamp_in_local_timezone(value.timestamp),
+            metadata: value.metadata,
+        }
+    }
 }
 
 fn format_offset_seconds(total_seconds: i32) -> String {
@@ -65,8 +100,7 @@ fn parse_event_query_datetime(input: &str, end_of_day: bool) -> Result<DateTime<
         return Ok(parsed.with_timezone(&Utc));
     }
 
-    let local_offset = FixedOffset::from_str(&local_timezone_offset_string())
-        .unwrap_or_else(|_| default_timezone());
+    let local_offset = local_timezone();
 
     if let Ok(parsed) = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d") {
         let naive = if end_of_day {
@@ -332,7 +366,11 @@ impl TriggerSdk {
         let events = self
             .storage
             .list_events_between_utc(start.timestamp(), end.timestamp())?;
-        let payloads: Vec<EventPayload> = events.into_iter().map(EventPayload::from).collect();
+        let payloads: Vec<EventToolPayload> = events
+            .into_iter()
+            .map(EventPayload::from)
+            .map(EventToolPayload::from)
+            .collect();
         to_string(&payloads).context("Failed to serialize events")
     }
 
@@ -343,14 +381,19 @@ impl TriggerSdk {
             counts: std::collections::BTreeMap<String, u32>,
         }
 
+        let local_tz = local_timezone();
+
         // For now, read all events and bucket by UTC hour.
         // If needed, we can optimize with SQL aggregation.
         let events = self.storage.list_events(None, 0)?;
         let mut buckets: std::collections::BTreeMap<String, Bucket> =
             std::collections::BTreeMap::new();
+        let mut local_labels: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
 
         for ev in events {
             let dt = ev.timestamp;
+            let local_dt = dt.with_timezone(&local_tz);
             let hour_key = format!(
                 "{:04}-{:02}-{:02} {:02}:00",
                 dt.year(),
@@ -358,6 +401,14 @@ impl TriggerSdk {
                 dt.day(),
                 dt.hour()
             );
+            local_labels.entry(hour_key.clone()).or_insert_with(|| {
+                local_dt
+                    .with_minute(0)
+                    .and_then(|value| value.with_second(0))
+                    .and_then(|value| value.with_nanosecond(0))
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| local_dt.to_rfc3339())
+            });
 
             let bucket = buckets.entry(hour_key).or_default();
             bucket.total += 1;
@@ -376,6 +427,7 @@ impl TriggerSdk {
                 .collect();
             hours_json.push(json!({
                 "hour": hour,
+                "hour_local": local_labels.get(&hour).cloned().unwrap_or(hour.clone()),
                 "total_events": bucket.total,
                 "top_types": top_types,
             }));
@@ -4018,6 +4070,254 @@ impl TriggerSdk {
         serde_json::to_string_pretty(&bundle).context("Failed to serialize chat session bundle")
     }
 
+    pub fn export_all_data_archive(&self, device_id: &str) -> Result<Vec<u8>> {
+        let things = self.things_list_snapshot(device_id)?;
+        let raw_triggers = self.storage.list_triggers()?;
+        let mut deduped_triggers = BTreeMap::new();
+        for trigger in raw_triggers {
+            deduped_triggers.entry(trigger.trigger_id.clone()).or_insert_with(|| ArchivedTrigger {
+                registration: TriggerRegistration {
+                    trigger_uuid: trigger.trigger_id,
+                    name: trigger.name,
+                    version: trigger.version,
+                    precondition: trigger.precondition,
+                    condition: trigger.condition,
+                },
+                is_paused: trigger.is_paused,
+            });
+        }
+        let triggers: Vec<ArchivedTrigger> = deduped_triggers.into_values().collect();
+        let trigger_bindings = self
+            .storage
+            .list_trigger_bindings()?
+            .into_iter()
+            .map(|(trigger_uuid, entity_type, entity_uuid)| ArchivedTriggerBinding {
+                trigger_uuid,
+                entity_type,
+                entity_uuid,
+            })
+            .collect::<Vec<_>>();
+        let events = self
+            .storage
+            .list_events(None, 0)?
+            .into_iter()
+            .map(EventPayload::from)
+            .collect::<Vec<_>>();
+        let preferences = self
+            .storage
+            .list_preferences()?
+            .into_iter()
+            .map(ArchivedPreferenceEntry::from)
+            .collect::<Vec<_>>();
+        let internal_kv = self
+            .storage
+            .list_internal_kv_entries()?
+            .into_iter()
+            .map(ArchivedInternalKvEntry::from)
+            .collect::<Vec<_>>();
+        let crdt_documents = self
+            .storage
+            .list_all_crdt_documents()?
+            .into_iter()
+            .map(ArchivedCrdtDocument::from)
+            .collect::<Vec<_>>();
+        let chat_sessions = self
+            .list_chat_sessions(None)?
+            .into_iter()
+            .map(|session| self.export_chat_session_bundle(&session.session_id))
+            .collect::<Result<Vec<_>>>()?;
+
+        let manifest = DataArchiveManifest::new(
+            device_id,
+            DataArchiveCounts {
+                collections: things.collections.len(),
+                things: things.things.len(),
+                triggers: triggers.len(),
+                trigger_bindings: trigger_bindings.len(),
+                chat_sessions: chat_sessions.len(),
+                events: events.len(),
+                preferences: preferences.len(),
+                crdt_documents: crdt_documents.len(),
+            },
+        );
+
+        crate::archive::write_archive(&ArchivePayload {
+            manifest,
+            things,
+            triggers,
+            trigger_bindings,
+            events,
+            preferences,
+            internal_kv,
+            crdt_documents,
+            chat_sessions,
+        })
+    }
+
+    pub fn export_all_data_archive_to_path(
+        &self,
+        device_id: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<DataArchiveManifest> {
+        let archive_bytes = self.export_all_data_archive(device_id)?;
+        let manifest = crate::archive::read_manifest(&archive_bytes)?;
+        fs::write(path.as_ref(), archive_bytes)
+            .with_context(|| format!("Failed to write archive to {}", path.as_ref().display()))?;
+        Ok(manifest)
+    }
+
+    pub fn inspect_data_archive(&self, archive_bytes: &[u8]) -> Result<DataArchiveManifest> {
+        crate::archive::read_manifest(archive_bytes)
+    }
+
+    pub fn inspect_data_archive_from_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<DataArchiveManifest> {
+        let archive_bytes = fs::read(path.as_ref())
+            .with_context(|| format!("Failed to read archive {}", path.as_ref().display()))?;
+        self.inspect_data_archive(&archive_bytes)
+    }
+
+    pub fn import_all_data_archive(
+        &self,
+        device_id: &str,
+        archive_bytes: &[u8],
+        mode: DataArchiveImportMode,
+    ) -> Result<DataArchiveImportReport> {
+        let payload = crate::archive::read_archive_payload(archive_bytes)?;
+
+        if matches!(mode, DataArchiveImportMode::Restore) {
+            self.wipe_all_data_and_notify()?;
+        }
+
+        let mut report = DataArchiveImportReport::default();
+
+        for preference in payload.preferences {
+            let preference_key = preference.key.clone();
+            self.storage
+                .upsert_preference_record(&preference.into())
+                .with_context(|| format!("Failed to import preference {preference_key}"))?;
+            report.preferences_imported += 1;
+        }
+
+        for item in payload.internal_kv {
+            self.storage
+                .set_internal_kv(&item.key, &item.value)
+                .with_context(|| format!("Failed to import internal kv {}", item.key))?;
+        }
+
+        for trigger in &payload.triggers {
+            self.register_trigger_inner(trigger.registration.clone())?;
+            self.storage
+                .set_trigger_paused(&trigger.registration.trigger_uuid, trigger.is_paused)?;
+            report.triggers_imported += 1;
+        }
+
+        let (collections_imported, things_imported) =
+            self.import_archive_things_snapshot(device_id, &payload.things)?;
+        report.collections_imported = collections_imported;
+        report.things_imported = things_imported;
+
+        for binding in payload.trigger_bindings {
+            self.storage.upsert_trigger_binding(
+                &binding.trigger_uuid,
+                &binding.entity_type,
+                &binding.entity_uuid,
+            )?;
+            report.trigger_bindings_imported += 1;
+        }
+
+        let mut existing_events = HashSet::new();
+        if matches!(mode, DataArchiveImportMode::Merge) {
+            for event in self.storage.list_events(None, 0)? {
+                let payload = EventPayload::from(event);
+                existing_events.insert(serde_json::to_string(&payload)?);
+            }
+        }
+        for event in payload.events {
+            let event_key = serde_json::to_string(&event)?;
+            if matches!(mode, DataArchiveImportMode::Merge) && existing_events.contains(&event_key) {
+                continue;
+            }
+            self.storage.insert_event(&event)?;
+            existing_events.insert(event_key);
+            report.events_imported += 1;
+        }
+
+        for session in payload.chat_sessions {
+            self.storage.upsert_chat_session(&session.session)?;
+            report.chat_sessions_imported += 1;
+            for message in session.messages {
+                let message_json = serde_json::to_string(&message)?;
+                self.storage.upsert_chat_message_json(
+                    &session.session.session_id,
+                    &message.id,
+                    message.timestamp_ms,
+                    &message_json,
+                )?;
+                report.chat_messages_imported += 1;
+            }
+            let protocol_state_json = serde_json::to_string(&session.protocol_state)
+                .context("Failed to serialize imported protocol state")?;
+            self.storage.upsert_chat_runtime_state_json(
+                &session.session.session_id,
+                &protocol_state_json,
+            )?;
+        }
+
+        Ok(report)
+    }
+
+    pub fn import_all_data_archive_from_path(
+        &self,
+        device_id: &str,
+        path: impl AsRef<Path>,
+        mode: DataArchiveImportMode,
+    ) -> Result<DataArchiveImportReport> {
+        let archive_bytes = fs::read(path.as_ref())
+            .with_context(|| format!("Failed to read archive {}", path.as_ref().display()))?;
+        self.import_all_data_archive(device_id, &archive_bytes, mode)
+    }
+
+    fn import_archive_things_snapshot(
+        &self,
+        device_id: &str,
+        snapshot: &ThingsSnapshotState,
+    ) -> Result<(usize, usize)> {
+        for collection in &snapshot.collections {
+            self.things_upsert_collection(
+                device_id,
+                ThingCollectionUpsert {
+                    uuid: collection.uuid.clone(),
+                    title: collection.title.clone(),
+                    trigger_uuid: collection.trigger_uuid.clone(),
+                    created_at: Some(collection.created_at.clone()),
+                    updated_at: Some(collection.updated_at.clone()),
+                },
+            )?;
+        }
+
+        for thing in sort_archive_things_for_import(&snapshot.things)? {
+            self.things_upsert_thing(
+                device_id,
+                ThingUpsert {
+                    uuid: thing.uuid.clone(),
+                    title: thing.title.clone(),
+                    datatype: thing.datatype.clone(),
+                    data: Some(thing.data.clone()),
+                    collection_uuid: thing.collection_uuid.clone(),
+                    trigger_uuid: thing.trigger_uuid.clone(),
+                    parent_uuid: thing.parent_uuid.clone(),
+                    created_at: Some(thing.created_at.clone()),
+                    updated_at: Some(thing.updated_at.clone()),
+                },
+            )?;
+        }
+
+        Ok((snapshot.collections.len(), snapshot.things.len()))
+    }
+
     /// Delete chat messages for a session (keeps the session record).
     pub fn delete_chat_messages(&self, session_id: &str) -> Result<()> {
         self.storage.delete_chat_messages(session_id)
@@ -4047,8 +4347,12 @@ impl TriggerSdk {
 #[cfg(test)]
 mod db_observability_tests {
     use super::TriggerSdk;
+    use crate::archive::DataArchiveImportMode;
+    use crate::chat_types::{CachedMessage, ChatProtocolSessionState, ProtocolHistoryMessage};
     use crate::storage::{test_sqlite_counters_get, test_sqlite_counters_reset};
     use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
+    use crate::types::{EventPayload, PreferenceRecord, TriggerRegistration, TriggerRule};
+    use chrono::Utc;
     use std::time::Instant;
     use tempfile::tempdir;
 
@@ -4227,6 +4531,208 @@ mod db_observability_tests {
         // V3: Multiple documents may be saved, so we just check that operations succeed
         // The exact count depends on the v3 implementation
     }
+
+    #[test]
+    fn full_data_archive_round_trips_restore_mode() {
+        let dir = tempdir().expect("tempdir");
+        let source_path = dir.path().join("source.sqlite3");
+        let target_path = dir.path().join("target.sqlite3");
+
+        let source = TriggerSdk::initialize(&source_path).expect("source sdk init");
+        let target = TriggerSdk::initialize(&target_path).expect("target sdk init");
+        let device_id = "device-archive";
+        let collection_id = "collection-archive";
+        let thing_id = "thing-archive";
+        let trigger_id = "trigger-archive";
+        let session_id = "session-archive";
+
+        source
+            .storage
+            .upsert_preference_record(&PreferenceRecord {
+                key: "theme".to_string(),
+                display_name: Some("Theme".to_string()),
+                description: Some("Preferred theme".to_string()),
+                value_type: "string".to_string(),
+                value_json: "\"sunset\"".to_string(),
+                updated_at: 123,
+            })
+            .expect("seed preference");
+        source
+            .storage
+            .set_internal_kv("archive.test", "ok")
+            .expect("seed internal kv");
+
+        source
+            .things_upsert_collection(
+                device_id,
+                ThingCollectionUpsert {
+                    uuid: collection_id.to_string(),
+                    title: "Inbox".to_string(),
+                    trigger_uuid: Some(trigger_id.to_string()),
+                    created_at: None,
+                    updated_at: None,
+                },
+            )
+            .expect("seed collection");
+        source
+            .things_upsert_thing(
+                device_id,
+                ThingUpsert {
+                    uuid: thing_id.to_string(),
+                    title: "Buy milk".to_string(),
+                    datatype: ThingDatatype::Markdown,
+                    data: Some(serde_json::json!({
+                        "markdown": "- milk",
+                        "entries": [
+                            {
+                                "id": "entry-1",
+                                "title": "Context",
+                                "order": 0.0,
+                                "payload": { "type": "json_object", "value": { "source": "archive-test" } }
+                            }
+                        ]
+                    })),
+                    collection_uuid: collection_id.to_string(),
+                    trigger_uuid: Some(trigger_id.to_string()),
+                    parent_uuid: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+            )
+            .expect("seed thing");
+
+        source
+            .register_trigger(TriggerRegistration {
+                trigger_uuid: trigger_id.to_string(),
+                name: "Morning check".to_string(),
+                version: "v1".to_string(),
+                precondition: vec![TriggerRule {
+                    rule: "cron('0 9 * * *')".to_string(),
+                    description: "Every morning".to_string(),
+                }],
+                condition: vec![TriggerRule {
+                    rule: "true".to_string(),
+                    description: "Always fire".to_string(),
+                }],
+            })
+            .expect("seed trigger");
+        source
+            .upsert_trigger_binding(trigger_id, "thing", thing_id)
+            .expect("seed trigger binding");
+        source
+            .set_trigger_paused(trigger_id, true)
+            .expect("pause trigger");
+
+        source
+            .record_event(EventPayload {
+                event_type: "Connectivity".to_string(),
+                timestamp: Utc::now(),
+                metadata: serde_json::json!({"status": "wifi"}),
+            })
+            .expect("seed event");
+
+        source
+            .upsert_chat_session(session_id.to_string(), Some("Archive Session".to_string()), 1)
+            .expect("seed chat session");
+        let cached = CachedMessage::user(
+            "msg-1".to_string(),
+            "hello archive".to_string(),
+            1_717_171_717,
+        );
+        source
+            .upsert_chat_message_json(
+                session_id.to_string(),
+                cached.id.clone(),
+                cached.timestamp_ms,
+                serde_json::to_string(&cached).expect("cached message json"),
+            )
+            .expect("seed chat message");
+        let protocol_state = ChatProtocolSessionState {
+            history: vec![ProtocolHistoryMessage {
+                id: "hist-1".to_string(),
+                role: "user".to_string(),
+                content: serde_json::json!("hello archive"),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            latest_state: Some(serde_json::json!({"step": "seeded"})),
+            pending_tool_execution: None,
+        };
+        source
+            .upsert_chat_runtime_state_json(
+                session_id.to_string(),
+                serde_json::to_string(&protocol_state).expect("protocol state json"),
+            )
+            .expect("seed runtime state");
+
+        let archive_bytes = source
+            .export_all_data_archive(device_id)
+            .expect("export archive");
+        let manifest = source
+            .inspect_data_archive(&archive_bytes)
+            .expect("inspect archive");
+        assert_eq!(manifest.version, crate::archive::DATA_ARCHIVE_VERSION);
+        assert_eq!(manifest.counts.collections, 1);
+        assert_eq!(manifest.counts.things, 1);
+        assert_eq!(manifest.counts.triggers, 1);
+        assert_eq!(manifest.counts.chat_sessions, 1);
+
+        let report = target
+            .import_all_data_archive(device_id, &archive_bytes, DataArchiveImportMode::Restore)
+            .expect("import archive");
+        assert_eq!(report.collections_imported, 1);
+        assert_eq!(report.things_imported, 1);
+        assert_eq!(report.triggers_imported, 1);
+        assert_eq!(report.chat_sessions_imported, 1);
+        assert_eq!(report.preferences_imported, 1);
+
+        let snapshot = target
+            .things_list_snapshot(device_id)
+            .expect("things snapshot after import");
+        assert_eq!(snapshot.collections.len(), 1);
+        assert_eq!(snapshot.things.len(), 1);
+        assert_eq!(snapshot.collections[0].title, "Inbox");
+        assert_eq!(snapshot.things[0].title, "Buy milk");
+
+        let triggers = target.list_triggers().expect("list triggers after import");
+        assert_eq!(triggers.len(), 1);
+        assert!(triggers[0].is_paused);
+        assert_eq!(triggers[0].bind_uuid.as_deref(), Some(thing_id));
+
+        let events = target
+            .storage
+            .list_events(None, 0)
+            .expect("events after import");
+        assert_eq!(events.len(), 1);
+
+        let sessions = target.list_chat_sessions(None).expect("sessions after import");
+        assert_eq!(sessions.len(), 1);
+        let messages = target
+            .list_chat_messages_json(session_id, None, 0)
+            .expect("messages after import");
+        assert_eq!(messages.len(), 1);
+        let runtime_state = target
+            .get_chat_runtime_state_json(session_id)
+            .expect("runtime state after import")
+            .expect("runtime state exists");
+        let imported_protocol_state: ChatProtocolSessionState =
+            serde_json::from_str(&runtime_state).expect("parse imported runtime state");
+        assert_eq!(imported_protocol_state.history.len(), 1);
+
+        let preferences = target
+            .storage
+            .list_preferences()
+            .expect("preferences after import");
+        assert_eq!(preferences.len(), 1);
+        assert_eq!(preferences[0].key, "theme");
+
+        let internal_kv = target
+            .storage
+            .list_internal_kv_entries()
+            .expect("internal kv after import");
+        assert!(internal_kv.iter().any(|entry| entry.key == "archive.test" && entry.value == "ok"));
+    }
 }
 
 fn parse_cached_message_storage_json(message_json: &str) -> Result<CachedMessage> {
@@ -4388,10 +4894,24 @@ mod tests {
         let output = sdk
             .events_list_between_json("2026-04-02 09:00:00", "2026-04-02 09:30:00")
             .expect("events between");
-        let events: Vec<EventPayload> = serde_json::from_str(&output).expect("parse events json");
+        let events: serde_json::Value = serde_json::from_str(&output).expect("parse events json");
+        let items = events.as_array().expect("events array");
 
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "DesktopAppFocus");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("type").and_then(serde_json::Value::as_str),
+            Some("DesktopAppFocus")
+        );
+        assert_eq!(
+            items[0].get("timestamp").and_then(serde_json::Value::as_i64),
+            Some(timestamp.timestamp())
+        );
+        assert_eq!(
+            items[0]
+                .get("timestamp_local")
+                .and_then(serde_json::Value::as_str),
+            Some(format_timestamp_in_local_timezone(timestamp).as_str())
+        );
     }
 
     #[test]
@@ -4426,6 +4946,19 @@ mod tests {
             .map(|hour| hour.get("total_events").and_then(|value| value.as_u64()).unwrap_or(0))
             .sum::<u64>();
         assert_eq!(total_events, 2);
+        assert_eq!(
+            hours[0].get("hour").and_then(serde_json::Value::as_str),
+            Some("2026-04-02 01:00")
+        );
+        let expected_local_hour = format_timestamp_in_local_timezone(
+            Utc.with_ymd_and_hms(2026, 4, 2, 1, 0, 0)
+                .single()
+                .expect("hour timestamp"),
+        );
+        assert_eq!(
+            hours[0].get("hour_local").and_then(serde_json::Value::as_str),
+            Some(expected_local_hour.as_str())
+        );
     }
 
     #[test]
@@ -4905,4 +5438,42 @@ fn replay_stashed_thing_into_document_set(
     }
 
     Ok(())
+}
+
+fn sort_archive_things_for_import<'a>(things: &'a [ThingEntry]) -> Result<Vec<&'a ThingEntry>> {
+    let mut pending = things.iter().collect::<Vec<_>>();
+    let mut imported = HashSet::new();
+    let mut sorted = Vec::with_capacity(things.len());
+
+    while !pending.is_empty() {
+        let mut ready = pending
+            .iter()
+            .copied()
+            .filter(|thing| {
+                thing.parent_uuid
+                    .as_ref()
+                    .map(|parent_uuid| imported.contains(parent_uuid))
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        ready.sort_by(|left, right| left.uuid.cmp(&right.uuid));
+
+        if ready.is_empty() {
+            let unresolved = pending
+                .iter()
+                .map(|thing| thing.uuid.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("Unable to order imported things by parent hierarchy: {unresolved}");
+        }
+
+        let ready_ids = ready.iter().map(|thing| thing.uuid.as_str()).collect::<HashSet<_>>();
+        pending.retain(|thing| !ready_ids.contains(thing.uuid.as_str()));
+        for thing in ready {
+            imported.insert(thing.uuid.clone());
+            sorted.push(thing);
+        }
+    }
+
+    Ok(sorted)
 }

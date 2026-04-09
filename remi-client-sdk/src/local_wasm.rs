@@ -1004,6 +1004,9 @@ fn build_start_metadata(
     metadata_obj
         .entry("reporting_consent".to_string())
 		.or_insert_with(|| JsonValue::String(config.tracing.reporting_enabled.to_string()));
+    metadata_obj
+        .entry("thinking_enabled".to_string())
+        .or_insert_with(|| JsonValue::String(config.thinking_enabled.to_string()));
 
     if let ChatRuntimeBackend::LocalWasm(local) = &config.backend {
         if !local.api_key.trim().is_empty() {

@@ -389,7 +389,6 @@ impl ExternalToolHandler for CollectionRemovedHandler {
         self.sdk
             .things_delete_collection(&self.device_id, uuid)
             .map_err(|e| format!("Failed to delete collection: {}", e))?;
-
         tracing::info!(uuid, "Collection removed via interrupt");
 
         Ok(json!({
@@ -731,6 +730,21 @@ mod tests {
                 .and_then(JsonValue::as_str),
             Some("2026-04-02T01:15:00+00:00")
         );
+        let expected_local = crate::runtime::format_timestamp_in_local_timezone(timestamp);
+        assert_eq!(
+            result
+                .get("available_time_range")
+                .and_then(|value| value.get("start_time_local"))
+                .and_then(JsonValue::as_str),
+            Some(expected_local.as_str())
+        );
+        assert_eq!(
+            result
+                .get("available_time_range")
+                .and_then(|value| value.get("end_time_local"))
+                .and_then(JsonValue::as_str),
+            Some(expected_local.as_str())
+        );
         assert!(
             result
                 .get("message")
@@ -1005,6 +1019,8 @@ impl ExternalToolHandler for EventsRetrieveRequestHandler {
                         if let Ok(Some((start, end))) = self.sdk.event_time_range() {
                             let start_time = start.to_rfc3339();
                             let end_time = end.to_rfc3339();
+                            let start_time_local = crate::runtime::format_timestamp_in_local_timezone(start);
+                            let end_time_local = crate::runtime::format_timestamp_in_local_timezone(end);
                             return Ok(json!({
                                 "events": [],
                                 "message": format!(
@@ -1016,7 +1032,9 @@ impl ExternalToolHandler for EventsRetrieveRequestHandler {
                                 },
                                 "available_time_range": {
                                     "start_time": start_time,
+                                    "start_time_local": start_time_local,
                                     "end_time": end_time,
+                                    "end_time_local": end_time_local,
                                 },
                             }));
                         }

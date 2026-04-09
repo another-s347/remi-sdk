@@ -266,7 +266,7 @@ fn test_trigger() -> JsonValue {
 fn retrieve_events() -> JsonValue {
     tool(
         "retrieve_events",
-        "Retrieve telemetry events within an explicit time window. If the requested window is empty but the device has recorded events, the result may include available_time_range with the earliest and latest recorded event timestamps.",
+        "Retrieve telemetry events within an explicit time window. Each returned event includes both a unix timestamp and a local RFC3339 timestamp string. If the requested window is empty but the device has recorded events, the result may include available_time_range with the earliest and latest recorded event timestamps plus local RFC3339 strings.",
         obj(
             json!({
                 "start_time": str_prop("ISO-8601 start timestamp."),
@@ -293,7 +293,7 @@ fn ls_tool() -> JsonValue {
 fn abstract_events() -> JsonValue {
     tool(
         "abstract_events",
-        "Create an hourly abstract of telemetry events with totals and top event types.",
+        "Create an hourly abstract of telemetry events with totals and top event types. Each hour bucket includes the original hour key and a local RFC3339 hour string.",
         obj(
             json!({
                 "top_n": int_prop("Number of top event types per hour to include (default 3).")

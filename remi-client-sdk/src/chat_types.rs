@@ -108,6 +108,8 @@ pub enum CachedUiElement {
         tool_name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         arguments_json: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i64>,
     },
     ToolResult {
         tool_name: String,
@@ -186,6 +188,8 @@ pub struct CachedMessage {
     pub attachments: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_session: Option<CachedSubSession>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_duration_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui_elements: Vec<CachedUiElement>,
 }
@@ -204,6 +208,7 @@ impl CachedMessage {
             references: None,
             attachments: None,
             sub_session: None,
+            tool_duration_ms: None,
             ui_elements: Vec::new(),
         }
     }
@@ -221,6 +226,7 @@ impl CachedMessage {
             references: None,
             attachments: None,
             sub_session: None,
+            tool_duration_ms: None,
             ui_elements: Vec::new(),
         }
     }
@@ -238,12 +244,46 @@ impl CachedMessage {
             references: None,
             attachments: None,
             sub_session: None,
+            tool_duration_ms: None,
             ui_elements: Vec::new(),
         }
     }
 
     pub fn refresh_ui_elements(&mut self) {
         self.ui_elements = derive_ui_elements(self);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatTurnMetrics {
+    pub message_id: String,
+    pub started_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<String>,
+}
+
+impl ChatTurnMetrics {
+    pub fn new(message_id: String, started_at_ms: i64) -> Self {
+        Self {
+            message_id,
+            started_at_ms,
+            ttft_ms: None,
+            total_duration_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            terminal_state: None,
+        }
     }
 }
 
@@ -310,6 +350,7 @@ fn derive_ui_elements(message: &CachedMessage) -> Vec<CachedUiElement> {
         elements.push(CachedUiElement::ToolCall {
             tool_name: tool_name.clone(),
             arguments_json: parse_tool_call_arguments(&message.content),
+            duration_ms: message.tool_duration_ms,
         });
         if let Some(sub_session) = message.sub_session.clone() {
             elements.push(CachedUiElement::SubSession { data: sub_session });
@@ -533,6 +574,9 @@ pub enum ChatRuntimeEvent {
     /// Message cache updated
     CacheUpdated { session_id: String, version: u64 },
 
+    /// Runtime-only metrics for the current assistant turn/message.
+    MetricsUpdated { session_id: String, metrics: ChatTurnMetrics },
+
     /// Pending interrupt for UI
     InterruptPending {
         session_id: String,
@@ -557,6 +601,8 @@ pub enum ChatRuntimeEvent {
 pub struct ChatRuntimeConfig {
     /// Device ID for things operations
     pub device_id: String,
+    /// Whether model thinking/reasoning events should be surfaced to clients.
+    pub thinking_enabled: bool,
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
     /// Maximum auto-resume attempts (prevents infinite loops)
@@ -610,6 +656,7 @@ impl Default for ChatRuntimeConfig {
     fn default() -> Self {
         Self {
             device_id: String::new(),
+            thinking_enabled: true,
             request_timeout_secs: 120,
             max_auto_resumes: 16,
             backend: ChatRuntimeBackend::RemoteServer,

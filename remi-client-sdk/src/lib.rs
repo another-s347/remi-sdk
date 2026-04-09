@@ -1,5 +1,6 @@
 pub mod app_keys_client;
 pub mod app_update;
+pub mod archive;
 pub mod auth;
 mod chat_agent;
 pub mod chat_client;
@@ -37,6 +38,11 @@ pub mod uri_resolver;
 pub mod url_handlers;
 
 pub use app_keys_client::AppKeysClient;
+pub use archive::{
+    ArchivedCrdtDocument, ArchivedInternalKvEntry, ArchivedPreferenceEntry,
+    ArchivedTrigger, ArchivedTriggerBinding, DataArchiveImportMode,
+    DataArchiveImportReport, DataArchiveManifest,
+};
 pub use auth::{AuthClient, AuthCredentials, SecureSessionStore, SdkBearerAuthMode};
 pub use chat_client::{
     ChatClient, ChatHistoryMessage, ChatInputMessage, ChatStreamEvent, ChatToolCall,

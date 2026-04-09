@@ -1,8 +1,9 @@
 use crate::types::{
     ChatSession, ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow, EventPayload,
-    LocationCacheEntry, NotificationEntry, NotificationGroup, NotificationSource, StoredEvent,
-    StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, TriggerInfo,
-    TriggerLogEntry, TriggerLogLevel, TriggerRegistration, TriggerRunType,
+    InternalKvRecord, LocationCacheEntry, NotificationEntry, NotificationGroup,
+    NotificationSource, PreferenceRecord, StoredEvent, StoredTrigger, ThingsChangeLogEntry,
+    ThingsContentSnapshot, ThingsOperationType, TriggerInfo, TriggerLogEntry, TriggerLogLevel,
+    TriggerRegistration, TriggerRunType,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -596,6 +597,68 @@ impl Storage {
     pub fn delete_internal_kv(&self, key: &str) -> Result<()> {
         let conn = self.connection()?;
         conn.execute("DELETE FROM internal_kv WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    pub fn list_internal_kv_entries(&self) -> Result<Vec<InternalKvRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare("SELECT key, value FROM internal_kv ORDER BY key ASC")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(InternalKvRecord {
+                    key: row.get(0)?,
+                    value: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list internal kv entries")?;
+        Ok(rows)
+    }
+
+    pub fn list_preferences(&self) -> Result<Vec<PreferenceRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT key, display_name, description, value_type, value_json, updated_at
+               FROM preferences
+               ORDER BY key ASC"#,
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PreferenceRecord {
+                    key: row.get(0)?,
+                    display_name: row.get(1)?,
+                    description: row.get(2)?,
+                    value_type: row.get(3)?,
+                    value_json: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list preferences")?;
+        Ok(rows)
+    }
+
+    pub fn upsert_preference_record(&self, preference: &PreferenceRecord) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"INSERT INTO preferences (key, display_name, description, value_type, value_json, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(key) DO UPDATE SET
+                   display_name = excluded.display_name,
+                   description = excluded.description,
+                   value_type = excluded.value_type,
+                   value_json = excluded.value_json,
+                   updated_at = excluded.updated_at"#,
+            params![
+                preference.key,
+                preference.display_name,
+                preference.description,
+                preference.value_type,
+                preference.value_json,
+                preference.updated_at,
+            ],
+        )
+        .context("Failed to upsert preference record")?;
         Ok(())
     }
 
@@ -1507,6 +1570,36 @@ impl Storage {
             })?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to get crdt documents by type")?;
+        Ok(rows)
+    }
+
+    pub fn list_all_crdt_documents(&self) -> Result<Vec<CrdtDocumentRow>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT uuid, data_type, automerge_doc, sync_state, dirty, last_sync_at, created_at, updated_at
+               FROM crdt_documents
+               ORDER BY CASE data_type
+                   WHEN 'root' THEN 0
+                   WHEN 'collection' THEN 1
+                   WHEN 'thing_markdown' THEN 2
+                   ELSE 3
+               END, uuid ASC"#,
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CrdtDocumentRow {
+                    uuid: row.get(0)?,
+                    data_type: row.get(1)?,
+                    automerge_doc: row.get(2)?,
+                    sync_state: row.get(3)?,
+                    dirty: row.get::<_, i64>(4)? != 0,
+                    last_sync_at: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list all crdt documents")?;
         Ok(rows)
     }
 

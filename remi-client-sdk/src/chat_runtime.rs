@@ -68,10 +68,62 @@ struct SessionState {
     tool_call_args: HashMap<String, BTreeMap<i32, String>>,
     /// Best-known tool name by tool_call_id
     tool_call_name: HashMap<String, String>,
+    /// First observed timestamp for each tool call.
+    tool_call_started_at_ms: HashMap<String, i64>,
+    /// Finalized duration for each tool call.
+    tool_call_duration_ms: HashMap<String, i64>,
     /// Accumulated tool result content by tool_call_id
     tool_result_content: HashMap<String, String>,
     /// Structured sub-session drafts keyed by parent tool_call_id.
     sub_sessions: HashMap<String, ProtocolSubSessionDraft>,
+    /// Runtime-only metrics for the currently active assistant turn.
+    active_turn_metrics: Option<ChatTurnMetrics>,
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn start_turn_metrics(
+    session: &mut SessionState,
+    assistant_id: &str,
+    started_at_ms: i64,
+) -> ChatTurnMetrics {
+    let metrics = ChatTurnMetrics::new(assistant_id.to_string(), started_at_ms);
+    session.active_turn_metrics = Some(metrics.clone());
+    metrics
+}
+
+fn finalize_active_turn_metrics(
+    session: &mut SessionState,
+    terminal_state: &str,
+    finished_at_ms: i64,
+) -> Option<ChatTurnMetrics> {
+    let metrics = session.active_turn_metrics.as_mut()?;
+    metrics.total_duration_ms = Some(finished_at_ms.saturating_sub(metrics.started_at_ms));
+    metrics.terminal_state = Some(terminal_state.to_string());
+    let snapshot = metrics.clone();
+    session.active_turn_metrics = None;
+    Some(snapshot)
+}
+
+fn update_active_turn_metrics(
+    session: &mut SessionState,
+    assistant_id: &str,
+    now_ms: i64,
+    mark_visible: bool,
+) -> Option<ChatTurnMetrics> {
+    let metrics = session.active_turn_metrics.as_mut()?;
+    if metrics.message_id != assistant_id {
+        metrics.message_id = assistant_id.to_string();
+    }
+    if mark_visible && metrics.ttft_ms.is_none() {
+        metrics.ttft_ms = Some(now_ms.saturating_sub(metrics.started_at_ms));
+    }
+    Some(metrics.clone())
 }
 
 impl SessionState {
@@ -301,6 +353,30 @@ fn combined_tool_call_arguments(session: &SessionState, tool_call_id: &str) -> O
     }
 }
 
+fn ensure_tool_call_started(session: &mut SessionState, tool_call_id: &str, started_at_ms: i64) {
+    session
+        .tool_call_started_at_ms
+        .entry(tool_call_id.to_string())
+        .or_insert(started_at_ms);
+}
+
+fn finalize_tool_call_duration(
+    session: &mut SessionState,
+    tool_call_id: &str,
+    finished_at_ms: i64,
+) -> Option<i64> {
+    if let Some(duration) = session.tool_call_duration_ms.get(tool_call_id).copied() {
+        return Some(duration);
+    }
+
+    let started_at_ms = session.tool_call_started_at_ms.get(tool_call_id).copied()?;
+    let duration_ms = finished_at_ms.saturating_sub(started_at_ms);
+    session
+        .tool_call_duration_ms
+        .insert(tool_call_id.to_string(), duration_ms);
+    Some(duration_ms)
+}
+
 fn build_tool_call_message(session: &SessionState, tool_call_id: &str, now_ms: i64) -> CachedMessage {
     let tool_name = session
         .tool_call_name
@@ -315,6 +391,7 @@ fn build_tool_call_message(session: &SessionState, tool_call_id: &str, now_ms: i
         None => format!("Tool call: `{}`", tool_name),
     };
     message.tool_name = Some(tool_name);
+    message.tool_duration_ms = session.tool_call_duration_ms.get(tool_call_id).copied();
     message.sub_session = session
         .sub_sessions
         .get(tool_call_id)
@@ -1927,22 +2004,23 @@ async fn handle_send_message(
     // The model may emit multiple assistant messages (different message IDs),
     // and pre-creating a single placeholder causes UI to look like it only
     // ever updates one bubble.
-    let (cache_version, previous_cancel, run_id) = {
+    let (cache_version, previous_cancel, run_id, initial_metrics) = {
         let mut s = state.write().await;
         let run_id = s.next_run_id();
         let mut previous_cancel = None;
-        let version = {
+        let (version, initial_metrics) = {
             let sess = s.get_or_create_session(&session_id);
             previous_cancel = sess.cancel_tx.take();
             sess.current_run_id = Some(run_id);
             sess.run_state = ChatRunState::Running;
             sess.last_error = None;
             sess.pending_interrupt = None;
+            let initial_metrics = start_turn_metrics(sess, &assistant_id, now_ms);
             let mut m = CachedMessage::user(user_id.clone(), message.clone(), now_ms);
             m.references = references.clone();
             m.attachments = attachments.clone();
             sess.upsert(m);
-            sess.version
+            (sess.version, initial_metrics)
         };
         s.emit_session_status(&session_id);
         STATUS_VERSION.fetch_add(1, Ordering::SeqCst);
@@ -1950,9 +2028,13 @@ async fn handle_send_message(
             session_id: session_id.clone(),
             version,
         });
-        (version, previous_cancel, run_id)
+        s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+            session_id: session_id.clone(),
+            metrics: initial_metrics.clone(),
+        });
+        (version, previous_cancel, run_id, initial_metrics)
     };
-    let _ = cache_version; // silence unused warning
+    let _ = (cache_version, initial_metrics); // silence unused warning
 
     if let Some(tx) = previous_cancel {
         let _ = tx.send(()).await;
@@ -2123,7 +2205,13 @@ async fn handle_send_message(
             if should_handle_result {
                 match result {
                     Ok(StreamResult::Completed) => {
+                        let mut final_metrics = None;
                         if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            final_metrics = finalize_active_turn_metrics(
+                                session,
+                                "completed",
+                                current_time_ms(),
+                            );
                             session.current_run_id = None;
                             session.cancel_tx = None;
                             session.run_state = ChatRunState::Idle;
@@ -2131,16 +2219,34 @@ async fn handle_send_message(
                             session.pending_interrupt = None;
                         }
                         s.emit_session_status(&session_id_clone);
+                        if let Some(metrics) = final_metrics {
+                            s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                                session_id: session_id_clone.clone(),
+                                metrics,
+                            });
+                        }
                         should_persist = true;
                     }
                     Ok(StreamResult::WaitingForUser(pending)) => {
+                        let mut final_metrics = None;
                         if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            final_metrics = finalize_active_turn_metrics(
+                                session,
+                                "waiting_for_user",
+                                current_time_ms(),
+                            );
                             session.cancel_tx = None;
                             session.run_state = ChatRunState::WaitingForUser;
                             session.last_error = None;
                             session.pending_interrupt = Some(pending.clone());
                         }
                         s.emit_session_status(&session_id_clone);
+                        if let Some(metrics) = final_metrics {
+                            s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                                session_id: session_id_clone.clone(),
+                                metrics,
+                            });
+                        }
                         s.emit_event(ChatRuntimeEvent::InterruptPending {
                             session_id: session_id_clone.clone(),
                             interrupt_id: pending.interrupt_id,
@@ -2150,7 +2256,13 @@ async fn handle_send_message(
                         should_persist = true;
                     }
                     Err(e) => {
+                        let mut final_metrics = None;
                         if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            final_metrics = finalize_active_turn_metrics(
+                                session,
+                                "error",
+                                current_time_ms(),
+                            );
                             session.current_run_id = None;
                             session.cancel_tx = None;
                             session.run_state = ChatRunState::Error;
@@ -2158,6 +2270,12 @@ async fn handle_send_message(
                             session.pending_interrupt = None;
                         }
                         s.emit_session_status(&session_id_clone);
+                        if let Some(metrics) = final_metrics {
+                            s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                                session_id: session_id_clone.clone(),
+                                metrics,
+                            });
+                        }
 
                         // Mark the last assistant message as error (best-effort).
                         let mut version_opt: Option<u64> = None;
@@ -2214,7 +2332,7 @@ async fn handle_resume(
     ensure_protocol_state_loaded(&state, &session_id).await?;
 
     // Verify we're in WaitingForUser state
-    let (access_token, config, backend, assistant_id, resume_input, previous_cancel, run_id) = {
+    let (access_token, config, backend, assistant_id, resume_input, previous_cancel, run_id, initial_metrics) = {
         let mut s = state.write().await;
         let assistant_id = format!("assistant_{}", chrono::Utc::now().timestamp_millis());
         let run_id = s.next_run_id();
@@ -2258,7 +2376,12 @@ async fn handle_resume(
         session.run_state = ChatRunState::Running;
         session.last_error = None;
         session.pending_interrupt = None;
+        let initial_metrics = start_turn_metrics(session, &assistant_id, current_time_ms());
         s.emit_session_status(&session_id);
+        s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+            session_id: session_id.clone(),
+            metrics: initial_metrics.clone(),
+        });
         STATUS_VERSION.fetch_add(1, Ordering::SeqCst);
 
         (
@@ -2269,8 +2392,10 @@ async fn handle_resume(
             resume_input,
             previous_cancel,
             run_id,
+            initial_metrics,
         )
     };
+    let _ = initial_metrics;
 
     if let Some(tx) = previous_cancel {
         let _ = tx.send(()).await;
@@ -2320,7 +2445,13 @@ async fn handle_resume(
             if should_handle_result {
                 match result {
                     Ok(StreamResult::Completed) => {
+                        let mut final_metrics = None;
                         if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            final_metrics = finalize_active_turn_metrics(
+                                session,
+                                "completed",
+                                current_time_ms(),
+                            );
                             session.current_run_id = None;
                             session.cancel_tx = None;
                             session.run_state = ChatRunState::Idle;
@@ -2328,16 +2459,34 @@ async fn handle_resume(
                             session.pending_interrupt = None;
                         }
                         s.emit_session_status(&session_id_clone);
+                        if let Some(metrics) = final_metrics {
+                            s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                                session_id: session_id_clone.clone(),
+                                metrics,
+                            });
+                        }
                         should_persist = true;
                     }
                     Ok(StreamResult::WaitingForUser(pending)) => {
+                        let mut final_metrics = None;
                         if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            final_metrics = finalize_active_turn_metrics(
+                                session,
+                                "waiting_for_user",
+                                current_time_ms(),
+                            );
                             session.cancel_tx = None;
                             session.run_state = ChatRunState::WaitingForUser;
                             session.last_error = None;
                             session.pending_interrupt = Some(pending.clone());
                         }
                         s.emit_session_status(&session_id_clone);
+                        if let Some(metrics) = final_metrics {
+                            s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                                session_id: session_id_clone.clone(),
+                                metrics,
+                            });
+                        }
                         s.emit_event(ChatRuntimeEvent::InterruptPending {
                             session_id: session_id_clone.clone(),
                             interrupt_id: pending.interrupt_id,
@@ -2347,7 +2496,13 @@ async fn handle_resume(
                         should_persist = true;
                     }
                     Err(e) => {
+                        let mut final_metrics = None;
                         if let Some(session) = s.sessions.get_mut(&session_id_clone) {
+                            final_metrics = finalize_active_turn_metrics(
+                                session,
+                                "error",
+                                current_time_ms(),
+                            );
                             session.current_run_id = None;
                             session.cancel_tx = None;
                             session.run_state = ChatRunState::Error;
@@ -2355,6 +2510,12 @@ async fn handle_resume(
                             session.pending_interrupt = None;
                         }
                         s.emit_session_status(&session_id_clone);
+                        if let Some(metrics) = final_metrics {
+                            s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                                session_id: session_id_clone.clone(),
+                                metrics,
+                            });
+                        }
 
                         // Mark the last assistant message as error (best-effort).
                         let mut version_opt: Option<u64> = None;
@@ -2494,13 +2655,29 @@ async fn run_stream_loop(
 
                             if should_rotate_assistant_after_tool_phase(&turn_state, &event) {
                                 let mut s = state.write().await;
-                                if let Some(session) = s.sessions.get_mut(&session_id) {
-                                    turn_state.flush_phase_into_history(session, &current_assistant_id);
-                                }
-                                current_assistant_id = format!(
+                                let mut metrics_event = None;
+                                let next_assistant_id = format!(
                                     "assistant_{}_post_tool",
                                     chrono::Utc::now().timestamp_millis()
                                 );
+                                if let Some(session) = s.sessions.get_mut(&session_id) {
+                                    if let Some(metrics) = update_active_turn_metrics(
+                                        session,
+                                        &next_assistant_id,
+                                        current_time_ms(),
+                                        false,
+                                    ) {
+                                        metrics_event = Some(ChatRuntimeEvent::MetricsUpdated {
+                                            session_id: session_id.clone(),
+                                            metrics,
+                                        });
+                                    }
+                                    turn_state.flush_phase_into_history(session, &current_assistant_id);
+                                }
+                                if let Some(event) = metrics_event {
+                                    s.emit_event(event);
+                                }
+                                current_assistant_id = next_assistant_id;
                             }
 
                             if let Some(chat_stream_event::Event::Interrupt(interrupt_event)) = event.event.as_ref() {
@@ -2601,30 +2778,35 @@ async fn process_stream_event(
             }
 
             turn_state.record_delta(&delta.content);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
+            let now_ms = current_time_ms();
 
             let mut s = state.write().await;
-            let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+            let (version_opt, metrics_opt) = if let Some(session) = s.sessions.get_mut(session_id) {
                 session
                     .assistant_content
                     .insert(assistant_id.to_string(), turn_state.assistant_content.clone());
+
+                let metrics_opt = update_active_turn_metrics(session, assistant_id, now_ms, true);
 
                 let mut message = CachedMessage::assistant(assistant_id.to_string(), now_ms);
                 message.content = turn_state.assistant_content.clone();
                 message.thinking = session.assistant_thinking.get(assistant_id).cloned();
                 session.upsert(message);
-                Some(session.version)
+                (Some(session.version), metrics_opt)
             } else {
-                None
+                (None, None)
             };
 
             if let Some(version) = version_opt {
                 s.emit_event(ChatRuntimeEvent::CacheUpdated {
                     session_id: session_id.to_string(),
                     version,
+                });
+            }
+            if let Some(metrics) = metrics_opt {
+                s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                    session_id: session_id.to_string(),
+                    metrics,
                 });
             }
             Ok(StreamControl::Continue)
@@ -2638,10 +2820,11 @@ async fn process_stream_event(
                 .as_millis() as i64;
 
             let mut s = state.write().await;
-            let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+            let (version_opt, metrics_opt) = if let Some(session) = s.sessions.get_mut(session_id) {
                 session
                     .assistant_thinking
                     .insert(assistant_id.to_string(), thinking.content.clone());
+                let metrics_opt = update_active_turn_metrics(session, assistant_id, now_ms, true);
 
                 let mut message = CachedMessage::assistant(assistant_id.to_string(), now_ms);
                 message.content = session
@@ -2651,15 +2834,21 @@ async fn process_stream_event(
                     .unwrap_or_default();
                 message.thinking = Some(thinking.content.clone());
                 session.upsert(message);
-                Some(session.version)
+                (Some(session.version), metrics_opt)
             } else {
-                None
+                (None, None)
             };
 
             if let Some(version) = version_opt {
                 s.emit_event(ChatRuntimeEvent::CacheUpdated {
                     session_id: session_id.to_string(),
                     version,
+                });
+            }
+            if let Some(metrics) = metrics_opt {
+                s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                    session_id: session_id.to_string(),
+                    metrics,
                 });
             }
             Ok(StreamControl::Continue)
@@ -2672,21 +2861,29 @@ async fn process_stream_event(
                 .as_millis() as i64;
 
             let mut s = state.write().await;
-            let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+            let (version_opt, metrics_opt) = if let Some(session) = s.sessions.get_mut(session_id) {
                 session
                     .tool_call_name
                     .insert(tool_call.id.clone(), tool_call.tool_name.clone());
+                ensure_tool_call_started(session, &tool_call.id, now_ms);
+                let metrics_opt = update_active_turn_metrics(session, assistant_id, now_ms, true);
                 let message = build_tool_call_message(session, &tool_call.id, now_ms);
                 session.upsert(message);
-                Some(session.version)
+                (Some(session.version), metrics_opt)
             } else {
-                None
+                (None, None)
             };
 
             if let Some(version) = version_opt {
                 s.emit_event(ChatRuntimeEvent::CacheUpdated {
                     session_id: session_id.to_string(),
                     version,
+                });
+            }
+            if let Some(metrics) = metrics_opt {
+                s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                    session_id: session_id.to_string(),
+                    metrics,
                 });
             }
             Ok(StreamControl::Continue)
@@ -2699,7 +2896,8 @@ async fn process_stream_event(
                 .as_millis() as i64;
 
             let mut s = state.write().await;
-            let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+            let (version_opt, metrics_opt) = if let Some(session) = s.sessions.get_mut(session_id) {
+                ensure_tool_call_started(session, &tool_call.id, now_ms);
                 let entry = session
                     .tool_call_args
                     .entry(tool_call.id.clone())
@@ -2713,17 +2911,24 @@ async fn process_stream_event(
                 if !turn_state.tool_calls.iter().any(|call| call.id == tool_call.id) {
                     turn_state.record_tool_call_start(&tool_call.id, "(unknown)");
                 }
+                let metrics_opt = update_active_turn_metrics(session, assistant_id, now_ms, true);
                 let message = build_tool_call_message(session, &tool_call.id, now_ms);
                 session.upsert(message);
-                Some(session.version)
+                (Some(session.version), metrics_opt)
             } else {
-                None
+                (None, None)
             };
 
             if let Some(version) = version_opt {
                 s.emit_event(ChatRuntimeEvent::CacheUpdated {
                     session_id: session_id.to_string(),
                     version,
+                });
+            }
+            if let Some(metrics) = metrics_opt {
+                s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                    session_id: session_id.to_string(),
+                    metrics,
                 });
             }
             Ok(StreamControl::Continue)
@@ -2735,12 +2940,13 @@ async fn process_stream_event(
                 .as_millis() as i64;
 
             let mut s = state.write().await;
-            let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+            let (version_opt, metrics_opt) = if let Some(session) = s.sessions.get_mut(session_id) {
                 if !tool_delta.tool_name.trim().is_empty() {
                     session
                         .tool_call_name
                         .insert(tool_delta.id.clone(), tool_delta.tool_name.clone());
                 }
+                let metrics_opt = update_active_turn_metrics(session, assistant_id, now_ms, true);
 
                 let combined = {
                     let entry = session
@@ -2764,15 +2970,21 @@ async fn process_stream_event(
                     now_ms,
                 );
                 session.upsert(message);
-                Some(session.version)
+                (Some(session.version), metrics_opt)
             } else {
-                None
+                (None, None)
             };
 
             if let Some(version) = version_opt {
                 s.emit_event(ChatRuntimeEvent::CacheUpdated {
                     session_id: session_id.to_string(),
                     version,
+                });
+            }
+            if let Some(metrics) = metrics_opt {
+                s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                    session_id: session_id.to_string(),
+                    metrics,
                 });
             }
             Ok(StreamControl::Continue)
@@ -2793,12 +3005,15 @@ async fn process_stream_event(
                 .as_millis() as i64;
 
             let mut s = state.write().await;
-            let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+            let (version_opt, metrics_opt) = if let Some(session) = s.sessions.get_mut(session_id) {
                 if !tool_result.tool_name.trim().is_empty() {
                     session
                         .tool_call_name
                         .insert(tool_result.id.clone(), tool_result.tool_name.clone());
                 }
+                ensure_tool_call_started(session, &tool_result.id, now_ms);
+                finalize_tool_call_duration(session, &tool_result.id, now_ms);
+                let metrics_opt = update_active_turn_metrics(session, assistant_id, now_ms, true);
                 session
                     .tool_result_content
                     .insert(tool_result.id.clone(), tool_result.result.clone());
@@ -2816,15 +3031,23 @@ async fn process_stream_event(
                     now_ms,
                 );
                 session.upsert(message);
-                Some(session.version)
+                let tool_call_message = build_tool_call_message(session, &tool_result.id, now_ms);
+                session.upsert(tool_call_message);
+                (Some(session.version), metrics_opt)
             } else {
-                None
+                (None, None)
             };
 
             if let Some(version) = version_opt {
                 s.emit_event(ChatRuntimeEvent::CacheUpdated {
                     session_id: session_id.to_string(),
                     version,
+                });
+            }
+            if let Some(metrics) = metrics_opt {
+                s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                    session_id: session_id.to_string(),
+                    metrics,
                 });
             }
             Ok(StreamControl::Continue)
@@ -2967,9 +3190,30 @@ async fn process_stream_event(
         }
         Some(chat_stream_event::Event::RunStart(_))
         | Some(chat_stream_event::Event::TurnStart(_))
-        | Some(chat_stream_event::Event::Usage(_))
         | Some(chat_stream_event::Event::Custom(_))
         | Some(chat_stream_event::Event::Interrupt(_)) => Ok(StreamControl::Continue),
+        Some(chat_stream_event::Event::Usage(usage)) => {
+            let mut s = state.write().await;
+            let metrics_opt = if let Some(session) = s.sessions.get_mut(session_id) {
+                session.active_turn_metrics.as_mut().map(|metrics| {
+                    metrics.prompt_tokens = Some(usage.prompt_tokens);
+                    metrics.completion_tokens = Some(usage.completion_tokens);
+                    metrics.total_tokens = Some(
+                        usage.prompt_tokens.saturating_add(usage.completion_tokens),
+                    );
+                    metrics.clone()
+                })
+            } else {
+                None
+            };
+            if let Some(metrics) = metrics_opt {
+                s.emit_event(ChatRuntimeEvent::MetricsUpdated {
+                    session_id: session_id.to_string(),
+                    metrics,
+                });
+            }
+            Ok(StreamControl::Continue)
+        }
         None => Ok(StreamControl::Continue),
     }
 }
@@ -3023,8 +3267,19 @@ async fn handle_need_tool_execution_event(
         turn_state.record_tool_result_message(outcome);
     }
 
+    let now_ms = current_time_ms();
     let mut s = state.write().await;
     if let Some(session) = s.sessions.get_mut(session_id) {
+        for tool_call in &event.tool_calls {
+            ensure_tool_call_started(session, &tool_call.id, now_ms);
+        }
+        for outcome in completed_results.iter().chain(execution_plan.resolved_results.iter()) {
+            ensure_tool_call_started(session, &outcome.tool_call_id, now_ms);
+            if finalize_tool_call_duration(session, &outcome.tool_call_id, now_ms).is_some() {
+                let message = build_tool_call_message(session, &outcome.tool_call_id, now_ms);
+                session.upsert(message);
+            }
+        }
         session.protocol_state.latest_state = Some(normalized_state.clone());
         if execution_plan.pending_calls.is_empty() {
             turn_state.commit_completed(session, assistant_id);
@@ -3181,6 +3436,10 @@ fn build_chat_start_metadata(
     metadata.insert(
         "reporting_consent".to_string(),
         JsonValue::String(config.tracing.reporting_enabled.to_string()),
+    );
+    metadata.insert(
+        "thinking_enabled".to_string(),
+        JsonValue::String(config.thinking_enabled.to_string()),
     );
 
     if config.tracing.reporting_enabled {
@@ -3394,6 +3653,63 @@ mod tests {
         assert!(prompt.contains("create_tool with type=\"image\""));
         assert!(prompt.contains("remi://remote/a.png?type=image%2Fpng"));
         assert!(prompt.contains("/collection/<collection_uuid>/things/<thing_uuid>"));
+    }
+
+    #[test]
+    fn start_and_finalize_turn_metrics_capture_runtime_fields() {
+        let mut session = SessionState::default();
+
+        let started = start_turn_metrics(&mut session, "assistant-1", 1_000);
+        assert_eq!(started.message_id, "assistant-1");
+        assert_eq!(started.started_at_ms, 1_000);
+        assert_eq!(session.active_turn_metrics.as_ref().map(|item| item.message_id.as_str()), Some("assistant-1"));
+
+        session.active_turn_metrics.as_mut().expect("active metrics").ttft_ms = Some(250);
+        session.active_turn_metrics.as_mut().expect("active metrics").prompt_tokens = Some(12);
+        session.active_turn_metrics.as_mut().expect("active metrics").completion_tokens = Some(18);
+        session.active_turn_metrics.as_mut().expect("active metrics").total_tokens = Some(30);
+
+        let finished = finalize_active_turn_metrics(&mut session, "completed", 2_550)
+            .expect("finished metrics");
+        assert_eq!(finished.ttft_ms, Some(250));
+        assert_eq!(finished.total_duration_ms, Some(1_550));
+        assert_eq!(finished.total_tokens, Some(30));
+        assert_eq!(finished.terminal_state.as_deref(), Some("completed"));
+        assert!(session.active_turn_metrics.is_none());
+    }
+
+    #[test]
+    fn finalize_turn_metrics_is_none_without_active_turn() {
+        let mut session = SessionState::default();
+        assert!(finalize_active_turn_metrics(&mut session, "completed", 1_000).is_none());
+    }
+
+    #[test]
+    fn update_active_turn_metrics_rebinds_message_and_preserves_ttft() {
+        let mut session = SessionState::default();
+        start_turn_metrics(&mut session, "assistant-1", 1_000);
+
+        let first_visible = update_active_turn_metrics(&mut session, "assistant-1", 1_250, true)
+            .expect("metrics after first visible event");
+        assert_eq!(first_visible.message_id, "assistant-1");
+        assert_eq!(first_visible.ttft_ms, Some(250));
+
+        let rebound = update_active_turn_metrics(&mut session, "assistant-2", 2_000, false)
+            .expect("metrics after post-tool rebind");
+        assert_eq!(rebound.message_id, "assistant-2");
+        assert_eq!(rebound.ttft_ms, Some(250));
+        assert_eq!(rebound.started_at_ms, 1_000);
+    }
+
+    #[test]
+    fn finalize_tool_call_duration_uses_first_observed_start() {
+        let mut session = SessionState::default();
+
+        ensure_tool_call_started(&mut session, "call-1", 1_500);
+        ensure_tool_call_started(&mut session, "call-1", 2_000);
+
+        assert_eq!(finalize_tool_call_duration(&mut session, "call-1", 2_350), Some(850));
+        assert_eq!(finalize_tool_call_duration(&mut session, "call-1", 3_000), Some(850));
     }
 }
 
