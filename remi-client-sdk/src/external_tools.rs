@@ -1,6 +1,7 @@
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::chat_types::{
@@ -85,9 +86,12 @@ impl ExternalToolExecutor {
             tracing::info!(
                 tool_call_id = %tool_call.tool_call_id,
                 tool_kind = %tool_kind,
+                tool_name = %tool_call.tool_name,
+                uri = handler_uri_hint(&display_data),
                 "[ExternalToolExecutor] Executing local tool handler"
             );
 
+            let started_at = Instant::now();
             let resume_value = match handler.handle_rich(&tool_call.tool_call_id, &display_data).await {
                 Ok(result) => result,
                 Err(error) => RichHandlerResult::Json(json!({
@@ -95,6 +99,14 @@ impl ExternalToolExecutor {
                     "tool_kind": tool_kind,
                 })),
             };
+            tracing::info!(
+                tool_call_id = %tool_call.tool_call_id,
+                tool_kind = %tool_kind,
+                tool_name = %tool_call.tool_name,
+                uri = handler_uri_hint(&display_data),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "[ExternalToolExecutor] Local tool handler finished"
+            );
 
             let outcome = raw_resume_value_to_outcome(&pending_call, resume_value);
             if tool_kind == "trigger_rule_published" && outcome.error.is_none() {
@@ -179,8 +191,8 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
             "type": "events_abstract_request",
             "top_n": arguments.get("top_n").cloned().unwrap_or_else(|| json!(3)),
         }),
-        "resolve_uri" => json!({
-            "type": "resolve_uri",
+        "fetch" | "resolve_uri" => json!({
+            "type": "fetch_request",
             "uri": arguments.get("uri").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
         }),
         _ => json!({
@@ -414,11 +426,11 @@ mod tests {
     #[tokio::test]
     async fn resolve_calls_auto_resumes_registered_tools() {
         let mut executor = ExternalToolExecutor::new();
-        executor.register("resolve_uri", EchoHandler);
+        executor.register("fetch_request", EchoHandler);
 
         let plan = executor.resolve_calls([ExternalToolCallRequest {
-            tool_call_id: "resolve_uri:0".to_string(),
-            tool_name: "resolve_uri".to_string(),
+            tool_call_id: "fetch:0".to_string(),
+            tool_name: "fetch".to_string(),
             arguments: json!({ "uri": "https://example.com" }),
         }]).await;
 
@@ -426,8 +438,16 @@ mod tests {
         assert_eq!(plan.resolved_results.len(), 1);
         assert_eq!(
             plan.resolved_results[0].result.as_deref(),
-            Some("{\"type\":\"resolve_uri\",\"uri\":\"https://example.com\"}")
+            Some("{\"type\":\"fetch_request\",\"uri\":\"https://example.com\"}")
         );
+    }
+
+    #[test]
+    fn resolve_uri_payload_is_aliased_to_fetch_handler_shape() {
+        let payload = tool_call_display_payload("resolve_uri", &json!({ "uri": "https://example.com" }));
+
+        assert_eq!(payload.get("type").and_then(JsonValue::as_str), Some("fetch_request"));
+        assert_eq!(payload.get("uri").and_then(JsonValue::as_str), Some("https://example.com"));
     }
 
     #[test]
@@ -584,4 +604,17 @@ mod tests {
             Some("{\"path\":\"/collection/c1\",\"type\":\"virtual_fs_ls_request\"}")
         );
     }
+}
+
+fn handler_uri_hint(payload: &JsonValue) -> &str {
+    payload
+        .get("uri")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            payload
+                .get("arguments")
+                .and_then(|value| value.get("uri"))
+                .and_then(JsonValue::as_str)
+        })
+        .unwrap_or("")
 }

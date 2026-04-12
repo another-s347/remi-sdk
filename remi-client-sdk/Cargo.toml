@@ -10,7 +10,9 @@ remi-agentloop-wasm = { git = "https://github.com/another-s347/remi-agentloop.gi
 remi-things-crdt = { path = "../remi-things-crdt" }
 rule-trigger-engine = { path = "../rule-trigger-engine" }
 anyhow = "1.0"
+anytomd = "1.2.1"
 base64 = "0.22"
+kamadak-exif = "0.6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 croner = "3.0.1"
 futures = "0.3"
@@ -38,8 +40,10 @@ tonic-prost = "0.14"
 tracing = "0.1"
 automerge = "0.7.2"
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "reqwest", "rustls"], optional = true }
+unpdf = "0.2.4"
 uuid = { version = "1.10", features = ["v4"] }
 async-trait = "0.1"
+rquickjs-core = { version = "0.8.1", default-features = false, features = ["bindgen", "rust-alloc"], optional = true }
 
 [features]
 default = []
@@ -47,6 +51,7 @@ sentry-integration = ["sentry"]
 # Enables Cranelift JIT compilation in the WASM runtime.
 # Required for File/Bytes WASM loading (desktop). Omit for Android.
 local-wasm-compiler = ["remi-agentloop-wasm/compiler"]
+quickjs = ["dep:rquickjs-core"]
 
 [build-dependencies]
 protoc-bin-vendored = "3.0"
@@ -55,3 +60,8 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "sdk_agent_tools"
+harness = false

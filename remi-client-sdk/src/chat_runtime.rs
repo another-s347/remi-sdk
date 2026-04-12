@@ -1057,16 +1057,26 @@ fn tool_outcome_to_proto(outcome: &ToolExecutionOutcome) -> Option<chat_proto::C
         // Multimodal: encode each image part into proto ChatContentPart
         let proto_parts = parts
             .iter()
-            .map(|img| chat_proto::ChatContentPart {
-                r#type: "image".to_string(),
-                value: Some(chat_proto::chat_content_part::Value::ImageUrl(
-                    chat_proto::ChatImageContent {
-                        url: String::new(),
-                        detail: String::new(),
-                        data: img.data.clone(),
-                        media_type: img.media_type.clone(),
-                    },
-                )),
+            .flat_map(|img| {
+                let mut content_parts = Vec::new();
+                if let Some(text) = image_part_exif_text(img.exif.as_ref()) {
+                    content_parts.push(chat_proto::ChatContentPart {
+                        r#type: "text".to_string(),
+                        value: Some(chat_proto::chat_content_part::Value::Text(text)),
+                    });
+                }
+                content_parts.push(chat_proto::ChatContentPart {
+                    r#type: "image".to_string(),
+                    value: Some(chat_proto::chat_content_part::Value::ImageUrl(
+                        chat_proto::ChatImageContent {
+                            url: String::new(),
+                            detail: String::new(),
+                            data: img.data.clone(),
+                            media_type: img.media_type.clone(),
+                        },
+                    )),
+                });
+                content_parts
             })
             .collect();
         Some(chat_proto::chat_tool_call_outcome::Outcome::Parts(
@@ -1099,16 +1109,22 @@ fn proto_tool_outcome_to_runtime(outcome: &chat_proto::ChatToolCallOutcome) -> O
             error: None,
         }),
         chat_proto::chat_tool_call_outcome::Outcome::Parts(parts_msg) => {
+            let mut pending_exif = None;
             let images = parts_msg
                 .parts
                 .iter()
                 .filter_map(|part| match &part.value {
+                    Some(chat_proto::chat_content_part::Value::Text(text)) => {
+                        pending_exif = parse_image_exif_text(text);
+                        None
+                    }
                     Some(chat_proto::chat_content_part::Value::ImageUrl(img))
                         if !img.data.is_empty() =>
                     {
                         Some(crate::chat_types::ToolImagePart {
                             media_type: img.media_type.clone(),
                             data: img.data.clone(),
+                            exif: pending_exif.take(),
                         })
                     }
                     _ => None,
@@ -1147,14 +1163,22 @@ fn outcome_to_protocol_tool_message(outcome: &ToolExecutionOutcome) -> ProtocolH
     let content = if let Some(parts) = &outcome.result_parts {
         let parts_json: Vec<JsonValue> = parts
             .iter()
-            .map(|img| {
+            .flat_map(|img| {
+                let mut content_parts = Vec::new();
+                if let Some(text) = image_part_exif_text(img.exif.as_ref()) {
+                    content_parts.push(json!({
+                        "type": "text",
+                        "text": text,
+                    }));
+                }
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&img.data);
-                json!({
+                content_parts.push(json!({
                     "type": "image_url",
                     "image_url": {
                         "url": format!("data:{};base64,{}", img.media_type, b64)
                     }
-                })
+                }));
+                content_parts
             })
             .collect();
         JsonValue::Array(parts_json)
@@ -1176,6 +1200,21 @@ fn outcome_to_protocol_tool_message(outcome: &ToolExecutionOutcome) -> ProtocolH
         tool_call_id: Some(outcome.tool_call_id.clone()),
         reasoning_content: None,
     }
+}
+
+const IMAGE_EXIF_TEXT_PREFIX: &str = "Image EXIF:\n";
+
+fn image_part_exif_text(exif: Option<&JsonValue>) -> Option<String> {
+    let exif = exif?;
+    let json = serde_json::to_string_pretty(exif)
+        .or_else(|_| serde_json::to_string(exif))
+        .ok()?;
+    Some(format!("{IMAGE_EXIF_TEXT_PREFIX}{json}"))
+}
+
+fn parse_image_exif_text(text: &str) -> Option<JsonValue> {
+    let json = text.strip_prefix(IMAGE_EXIF_TEXT_PREFIX)?;
+    serde_json::from_str(json).ok()
 }
 
 fn cached_message_storage_json(session_id: &str, message: &CachedMessage) -> String {
@@ -3257,6 +3296,36 @@ mod tests {
     use super::*;
     use crate::chat_types::{ChatLocalWasmConfig, ChatRuntimeBackend, ChatTracingConfig};
     use std::sync::Arc;
+
+    #[test]
+    fn tool_outcome_proto_round_trip_preserves_image_exif() {
+        let expected_exif = json!({
+            "fields": [
+                {"ifd": "PRIMARY", "tag": "Orientation", "value": 6}
+            ]
+        });
+        let outcome = ToolExecutionOutcome {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "fetch".to_string(),
+            result: None,
+            result_parts: Some(vec![crate::chat_types::ToolImagePart {
+                media_type: "image/jpeg".to_string(),
+                data: vec![1, 2, 3],
+                exif: Some(expected_exif.clone()),
+            }]),
+            error: None,
+        };
+
+        let proto = tool_outcome_to_proto(&outcome).expect("tool outcome proto");
+        let round_trip = proto_tool_outcome_to_runtime(&proto).expect("runtime outcome");
+        let part = round_trip
+            .result_parts
+            .and_then(|parts| parts.into_iter().next())
+            .expect("image part");
+
+        assert_eq!(part.media_type, "image/jpeg");
+        assert_eq!(part.exif, Some(expected_exif));
+    }
 
     #[test]
     fn build_chat_start_metadata_uses_string_values() {

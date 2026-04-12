@@ -1992,6 +1992,7 @@ async fn load_image_part(uri: &str) -> Result<ToolImagePart, String> {
                 Ok(ToolImagePart {
                     media_type: parsed.mime_type,
                     data: bytes,
+                    exif: None,
                 })
             }
             RemiUriLocation::Local => Err(format!(
@@ -2007,7 +2008,11 @@ async fn load_image_part(uri: &str) -> Result<ToolImagePart, String> {
     let bytes = tokio::fs::read(uri)
         .await
         .map_err(|error| format!("Failed to read local image {uri}: {error}"))?;
-    Ok(ToolImagePart { media_type, data: bytes })
+    Ok(ToolImagePart {
+        media_type,
+        data: bytes,
+        exif: None,
+    })
 }
 
 async fn fetch_http_image(url: &str) -> Result<ToolImagePart, String> {
@@ -2027,5 +2032,6 @@ async fn fetch_http_image(url: &str) -> Result<ToolImagePart, String> {
     Ok(ToolImagePart {
         media_type,
         data: bytes.to_vec(),
+        exif: None,
     })
 }

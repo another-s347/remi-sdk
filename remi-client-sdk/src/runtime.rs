@@ -17,12 +17,14 @@ use crate::types::{
     TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, TimeZone, Timelike, Utc};
 use croner::Cron;
 use jsonschema::JSONSchema;
 use rule_trigger_engine::{
     EvaluationContext, MonitoringEvent, PreconditionPolicy, Rule as EngineRule, TriggerConfig,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use serde_json::to_string;
 use std::path::Path;
@@ -35,6 +37,24 @@ mod path_tools;
 pub(crate) use path_tools::VirtualFsCatResult;
 
 const DEFAULT_TIMEZONE_OFFSET: &str = "+08:00";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BootstrapStashedDocument {
+    uuid: String,
+    data_type: String,
+    automerge_doc_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BootstrapStashPayload {
+    version: u8,
+    documents: Vec<BootstrapStashedDocument>,
+}
+
+enum BootstrapReplaySource {
+    Documents(Vec<BootstrapStashedDocument>),
+    LegacySnapshot(ThingsSnapshot),
+}
 
 fn default_timezone() -> FixedOffset {
     FixedOffset::from_str(DEFAULT_TIMEZONE_OFFSET).unwrap_or_else(|_| {
@@ -668,8 +688,40 @@ impl TriggerSdk {
         &self,
         device_id: &str,
     ) -> Result<crate::things_crdt::ThingsDocumentSet> {
+        let namespace = self.storage.cache_namespace();
+        let revision = self.storage.get_crdt_documents_revision()?;
+        if let Some(doc_set) =
+            crate::crdt_cache::get(&namespace, device_id, revision)
+        {
+            return Ok(doc_set);
+        }
+
+        const MAX_REVISION_STABILITY_RETRIES: usize = 4;
         let persistence = crate::things_crdt::DocumentPersistence::new(&self.storage);
-        persistence.load_or_init_document_set(device_id)
+
+        for _attempt in 0..MAX_REVISION_STABILITY_RETRIES {
+            let revision_before = self.storage.get_crdt_documents_revision()?;
+            if let Some(doc_set) = crate::crdt_cache::get(&namespace, device_id, revision_before) {
+                return Ok(doc_set);
+            }
+
+            let doc_set = persistence.load_or_init_document_set(device_id)?;
+            let revision_after = self.storage.get_crdt_documents_revision()?;
+            if revision_before == revision_after {
+                crate::crdt_cache::put(
+                    namespace.clone(),
+                    device_id.to_string(),
+                    revision_after,
+                    doc_set.clone(),
+                );
+                return Ok(doc_set);
+            }
+        }
+
+        anyhow::bail!(
+            "CRDT document set changed repeatedly while loading for device '{}'",
+            device_id
+        )
     }
 
     fn resolve_thing_collection_uuid(
@@ -818,11 +870,13 @@ impl TriggerSdk {
         // V3: Update collection metadata
         let trigger =
             crate::things_crdt::trigger_update_from_tri_state(upsert.trigger_uuid.as_deref());
-        let events = doc_set.update_collection_meta(
+        let events = doc_set.update_collection_meta_with_timestamps(
             &upsert.uuid,
             Some(upsert.title.clone()),
             None,
             trigger,
+            upsert.created_at.clone(),
+            upsert.updated_at.clone(),
         )?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
 
@@ -1047,7 +1101,7 @@ impl TriggerSdk {
         let trigger =
             crate::things_crdt::trigger_update_from_tri_state(upsert.trigger_uuid.as_deref());
         let mut events = move_events;
-        events.extend(doc_set.upsert_thing_meta(
+        events.extend(doc_set.upsert_thing_meta_with_timestamps(
             &upsert.collection_uuid,
             &upsert.uuid,
             Some(upsert.datatype.clone()),
@@ -1055,6 +1109,8 @@ impl TriggerSdk {
             Some(upsert.title.clone()),
             upsert.parent_uuid.clone(),
             trigger,
+            upsert.created_at.clone(),
+            upsert.updated_at.clone(),
         )?);
 
         // V3: If data is provided, update thing markdown document
@@ -1062,6 +1118,11 @@ impl TriggerSdk {
             events.extend(doc_set.set_thing_content_from_payload(
                 &upsert.uuid,
                 &upsert.datatype,
+                data,
+            )?);
+            events.extend(doc_set.sync_content_entries_from_snapshot_payload(
+                &upsert.collection_uuid,
+                &upsert.uuid,
                 data,
             )?);
         }
@@ -1855,9 +1916,27 @@ impl TriggerSdk {
         };
 
         let entry_id = entry.id.clone();
+        let logged_data_doc_uuid = match &entry.payload {
+            ContentEntryPayload::JsonObject(field) => field.data_doc_uuid.clone(),
+            _ => unreachable!("json object entry payload must stay json object"),
+        };
+        let logged_schema_doc_uuid = match &entry.payload {
+            ContentEntryPayload::JsonObject(field) => field.schema_doc_uuid.clone(),
+            _ => unreachable!("json object entry payload must stay json object"),
+        };
         let events = doc_set.add_content_entry(&collection_uuid, thing_uuid, entry)?;
         doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
         self.emit_document_events(device_id, events);
+        tracing::info!(
+            device_id,
+            thing_uuid,
+            collection_uuid,
+            entry_id,
+            title = title.unwrap_or(""),
+            data_doc_uuid = %logged_data_doc_uuid,
+            schema_doc_uuid = ?logged_schema_doc_uuid,
+            "Created json_object content entry"
+        );
         Ok(entry_id)
     }
 
@@ -1871,7 +1950,17 @@ impl TriggerSdk {
         let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
         let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
         let field = Self::resolve_json_object_entry_field(&entries, entry_id)?;
-        doc_set.get_thing_json_content(&field.data_doc_uuid, thing_uuid)
+        let result = doc_set.get_thing_json_content(&field.data_doc_uuid, thing_uuid)?;
+        tracing::debug!(
+            device_id,
+            thing_uuid,
+            collection_uuid,
+            entry_id,
+            data_doc_uuid = %field.data_doc_uuid,
+            found = result.is_some(),
+            "Loaded json_object entry data"
+        );
+        Ok(result)
     }
 
     pub fn things_get_json_object_entry_schema(
@@ -1885,9 +1974,26 @@ impl TriggerSdk {
         let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
         let field = Self::resolve_json_object_entry_field(&entries, entry_id)?;
         let Some(schema_doc_uuid) = field.schema_doc_uuid else {
+            tracing::debug!(
+                device_id,
+                thing_uuid,
+                collection_uuid,
+                entry_id,
+                "Json object entry has no schema doc"
+            );
             return Ok(None);
         };
-        doc_set.get_thing_json_content(&schema_doc_uuid, thing_uuid)
+        let result = doc_set.get_thing_json_content(&schema_doc_uuid, thing_uuid)?;
+        tracing::debug!(
+            device_id,
+            thing_uuid,
+            collection_uuid,
+            entry_id,
+            schema_doc_uuid,
+            found = result.is_some(),
+            "Loaded json_object entry schema"
+        );
+        Ok(result)
     }
 
     pub fn things_set_json_object_entry_data(
@@ -1991,6 +2097,95 @@ impl TriggerSdk {
         Ok(())
     }
 
+    pub fn things_update_json_object_entry(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        entry_id: &str,
+        title: Option<Option<String>>,
+        data: &Value,
+        schema: Option<&Value>,
+    ) -> Result<()> {
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let mut field = Self::resolve_json_object_entry_field(&entries, entry_id)?;
+
+        Self::validate_json_object_data(schema, data)?;
+
+        let mut payload_changed = false;
+
+        match schema {
+            Some(schema_value) => {
+                let schema_doc_uuid = field
+                    .schema_doc_uuid
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                doc_set.set_thing_json_content(
+                    &schema_doc_uuid,
+                    thing_uuid,
+                    "json_object_schema",
+                    schema_value,
+                )?;
+                if field.schema_doc_uuid.as_deref() != Some(schema_doc_uuid.as_str()) {
+                    field.schema_doc_uuid = Some(schema_doc_uuid);
+                    payload_changed = true;
+                }
+            }
+            None => {
+                if let Some(schema_doc_uuid) = field.schema_doc_uuid.take() {
+                    let schema_key = crate::things_crdt::DocumentKey::thing_content(&schema_doc_uuid);
+                    doc_set.remove_document(&schema_key);
+                    let _ = self.storage.delete_crdt_document(&schema_doc_uuid, "thing_markdown");
+                    payload_changed = true;
+                }
+            }
+        }
+
+        doc_set.set_thing_json_content(&field.data_doc_uuid, thing_uuid, "json_object_data", data)?;
+
+        let title_changed = title.is_some();
+        let logged_data_doc_uuid = field.data_doc_uuid.clone();
+        let logged_schema_doc_uuid = field.schema_doc_uuid.clone();
+
+        let mut events = if title.is_some() || payload_changed {
+            doc_set.update_content_entry(
+                &collection_uuid,
+                thing_uuid,
+                entry_id,
+                title,
+                None,
+                payload_changed.then_some(ContentEntryPayload::JsonObject(field)),
+            )?
+        } else {
+            Vec::new()
+        };
+
+        if events.is_empty() {
+            events.push(ThingsDocumentEvent::content_entry(
+                ThingsDocumentChangeKind::Updated,
+                &collection_uuid,
+                thing_uuid,
+                entry_id,
+            ));
+        }
+
+        doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
+        tracing::info!(
+            device_id,
+            thing_uuid,
+            collection_uuid,
+            entry_id,
+            data_doc_uuid = %logged_data_doc_uuid,
+            schema_doc_uuid = ?logged_schema_doc_uuid,
+            title_changed,
+            payload_changed,
+            "Updated json_object content entry"
+        );
+        Ok(())
+    }
+
     /// Get all content entries of a thing.
     pub fn things_get_content_entries(
         &self,
@@ -1999,8 +2194,29 @@ impl TriggerSdk {
     ) -> Result<Vec<ContentEntry>> {
         let doc_set = self.get_or_init_document_set(device_id)?;
         let collection_uuid = Self::resolve_thing_collection_uuid(&doc_set, thing_uuid)?;
-
-        doc_set.get_content_entries(&collection_uuid, thing_uuid)
+        let entries = doc_set.get_content_entries(&collection_uuid, thing_uuid)?;
+        let json_object_entries: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                ContentEntryPayload::JsonObject(field) => Some(format!(
+                    "{}:{}:{:?}",
+                    entry.id,
+                    field.data_doc_uuid,
+                    field.schema_doc_uuid
+                )),
+                _ => None,
+            })
+            .collect();
+        tracing::debug!(
+            device_id,
+            thing_uuid,
+            collection_uuid,
+            entry_count = entries.len(),
+            json_object_entry_count = json_object_entries.len(),
+            json_object_entries = ?json_object_entries,
+            "Loaded content entries for thing"
+        );
+        Ok(entries)
     }
 
     /// V3: Replace state after sync - this needs to be rewritten for multi-doc
@@ -2757,6 +2973,11 @@ impl TriggerSdk {
         self.storage.get_dirty_crdt_documents()
     }
 
+    /// List all CRDT documents with payloads.
+    pub fn crdt_list_documents(&self) -> Result<Vec<crate::types::CrdtDocumentRow>> {
+        self.storage.list_crdt_documents()
+    }
+
     /// List all CRDT document keys (uuid, data_type).
     pub fn crdt_list_document_keys(&self) -> Result<Vec<(String, String)>> {
         self.storage.list_crdt_document_keys()
@@ -2883,35 +3104,37 @@ impl TriggerSdk {
 
     pub fn things_bootstrap_stash_local_snapshot_if_needed(&self, device_id: &str) -> Result<bool> {
         const STASH_KEY: &str = "things.bootstrap.stash_snapshot_json";
-        const DONE_KEY: &str = "things.bootstrap.done";
-
-        if self
-            .storage
-            .get_internal_kv(DONE_KEY)?
-            .as_deref()
-            .unwrap_or("")
-            == "1"
-        {
-            return Ok(false);
-        }
 
         if self.storage.get_internal_kv(STASH_KEY)?.is_some() {
+            tracing::debug!(device_id, "Bootstrap stash already exists; skipping new stash");
             return Ok(false);
         }
 
-        let doc_set = self.get_or_init_document_set(device_id)?;
-        if !doc_set.has_pending_changes() {
+        let dirty_documents = self
+            .storage
+            .get_dirty_crdt_documents()
+            .context("Failed to load dirty CRDT documents for bootstrap stash")?;
+        if dirty_documents.is_empty() {
+            tracing::debug!(device_id, "No dirty CRDT documents found for bootstrap stash");
             return Ok(false);
         }
 
-        let snapshot = doc_set
-            .extract_snapshot()
-            .context("Failed to extract local things snapshot for bootstrap stash")?;
-        let payload = serde_json::to_string(&snapshot)
-            .context("Failed to serialize bootstrap stash snapshot")?;
+        let dirty_document_keys: Vec<String> = dirty_documents
+            .iter()
+            .map(|doc| format!("{}:{}", doc.uuid, doc.data_type))
+            .collect();
+
+        let payload = serialize_bootstrap_stash_documents(&dirty_documents)
+            .context("Failed to serialize bootstrap stash CRDT documents")?;
         self.storage
             .set_internal_kv(STASH_KEY, &payload)
             .context("Failed to persist bootstrap stash snapshot")?;
+        tracing::info!(
+            device_id,
+            dirty_doc_count = dirty_document_keys.len(),
+            dirty_document_keys = ?dirty_document_keys,
+            "Persisted bootstrap stash from dirty CRDT documents"
+        );
         Ok(true)
     }
 
@@ -2943,14 +3166,36 @@ impl TriggerSdk {
             .storage
             .get_internal_kv(STASH_KEY)?
             .ok_or_else(|| anyhow::anyhow!("No bootstrap stash found"))?;
+        let stash = parse_bootstrap_replay_source(&stash_json)?;
 
-        let stash: crate::things_crdt::ThingsSnapshot = serde_json::from_str(&stash_json)
-            .context("Failed to parse bootstrap stash snapshot")?;
+        tracing::info!(device_id, "Replaying bootstrap stash onto fresh local documents");
 
         // Clear all existing V3 documents from storage
         self.storage
             .delete_all_crdt_documents()
             .context("Failed to clear existing CRDT documents")?;
+
+        if let BootstrapReplaySource::Documents(documents) = stash {
+            let stashed_document_keys: Vec<String> = documents
+                .iter()
+                .map(|doc| format!("{}:{}", doc.uuid, doc.data_type))
+                .collect();
+            restore_stashed_documents(&self.storage, &documents)
+                .context("Failed to restore bootstrap-stashed CRDT documents")?;
+            self.storage.set_internal_kv(DONE_KEY, "1")?;
+            self.storage.delete_internal_kv(STASH_KEY)?;
+            tracing::info!(
+                device_id,
+                stashed_doc_count = stashed_document_keys.len(),
+                stashed_document_keys = ?stashed_document_keys,
+                "Restored bootstrap-stashed CRDT documents onto fresh storage"
+            );
+            return Ok(());
+        }
+
+        let BootstrapReplaySource::LegacySnapshot(stash) = parse_bootstrap_replay_source(&stash_json)? else {
+            unreachable!("document stash handled above")
+        };
 
         // Get a fresh document set (mutable)
         let mut doc_set = self.get_or_init_document_set(device_id)?;
@@ -2962,11 +3207,13 @@ impl TriggerSdk {
             let trigger = crate::things_crdt::trigger_update_from_tri_state(
                 collection.trigger_uuid.as_deref(),
             );
-            doc_set.update_collection_meta(
+            doc_set.update_collection_meta_with_timestamps(
                 &collection.uuid,
                 Some(collection.title.clone()),
                 None, // status
                 trigger,
+                Some(collection.created_at.clone()),
+                Some(collection.updated_at.clone()),
             )?;
         }
 
@@ -3003,9 +3250,29 @@ impl TriggerSdk {
             .storage
             .get_internal_kv(STASH_KEY)?
             .ok_or_else(|| anyhow::anyhow!("No bootstrap stash found"))?;
+        let stash = parse_bootstrap_replay_source(&stash_json)?;
 
-        let stash: crate::things_crdt::ThingsSnapshot = serde_json::from_str(&stash_json)
-            .context("Failed to parse bootstrap stash snapshot")?;
+        if let BootstrapReplaySource::Documents(documents) = stash {
+            let stashed_document_keys: Vec<String> = documents
+                .iter()
+                .map(|doc| format!("{}:{}", doc.uuid, doc.data_type))
+                .collect();
+            merge_stashed_documents_onto_current_documents(&self.storage, &documents)
+                .context("Failed to merge bootstrap-stashed CRDT documents")?;
+            self.storage.set_internal_kv(DONE_KEY, "1")?;
+            self.storage.delete_internal_kv(STASH_KEY)?;
+            tracing::info!(
+                device_id,
+                stashed_doc_count = stashed_document_keys.len(),
+                stashed_document_keys = ?stashed_document_keys,
+                "Merged bootstrap-stashed CRDT documents onto current storage"
+            );
+            return Ok(());
+        }
+
+        let BootstrapReplaySource::LegacySnapshot(stash) = parse_bootstrap_replay_source(&stash_json)? else {
+            unreachable!("document stash handled above")
+        };
 
         let mut doc_set = self.get_or_init_document_set(device_id)?;
 
@@ -3014,11 +3281,13 @@ impl TriggerSdk {
             let trigger = crate::things_crdt::trigger_update_from_tri_state(
                 collection.trigger_uuid.as_deref(),
             );
-            doc_set.update_collection_meta(
+            doc_set.update_collection_meta_with_timestamps(
                 &collection.uuid,
                 Some(collection.title.clone()),
                 None,
                 trigger,
+                Some(collection.created_at.clone()),
+                Some(collection.updated_at.clone()),
             )?;
         }
 
@@ -4240,8 +4509,45 @@ fn parse_cached_message_storage_json(message_json: &str) -> Result<CachedMessage
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use crate::things_crdt::ThingDatatype;
     use std::str::FromStr;
     use tempfile::tempdir;
+
+    fn seed_markdown_thing(
+        sdk: &TriggerSdk,
+        device_id: &str,
+        collection_id: &str,
+        thing_id: &str,
+        markdown: &str,
+    ) {
+        sdk.things_upsert_collection(
+            device_id,
+            ThingCollectionUpsert {
+                uuid: collection_id.to_string(),
+                title: "Test Collection".to_string(),
+                trigger_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .expect("seed collection");
+
+        sdk.things_upsert_thing(
+            device_id,
+            ThingUpsert {
+                uuid: thing_id.to_string(),
+                title: "Test Thing".to_string(),
+                datatype: ThingDatatype::Markdown,
+                data: Some(json!({"markdown": markdown})),
+                collection_uuid: collection_id.to_string(),
+                trigger_uuid: None,
+                parent_uuid: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .expect("seed thing");
+    }
 
     #[test]
     fn test_extract_cron_from_preconditions() {
@@ -4508,6 +4814,433 @@ mod tests {
             .expect("serialize bundle");
         assert!(json.contains("Debug session"));
         assert!(json.contains("Hi there"));
+    }
+
+    #[test]
+    fn document_set_cache_returns_fresh_result_after_same_sdk_write() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+        let content_path = format!("/collection/{collection_id}/things/{thing_id}/content.md");
+
+        seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
+
+        let initial = sdk
+            .read_virtual_path(device_id, &content_path)
+            .expect("initial read");
+        assert_eq!(initial.content, "before");
+
+        sdk.things_edit_content(
+            device_id,
+            thing_id,
+            "overwrite",
+            None,
+            Some("after"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("edit content");
+
+        let updated = sdk
+            .read_virtual_path(device_id, &content_path)
+            .expect("updated read");
+        assert_eq!(updated.content, "after");
+    }
+
+    #[test]
+    fn document_set_cache_invalidates_after_external_sdk_write() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk_reader = TriggerSdk::initialize(&db_path).expect("reader sdk init");
+        let sdk_writer = TriggerSdk::initialize(&db_path).expect("writer sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+        let content_path = format!("/collection/{collection_id}/things/{thing_id}/content.md");
+
+        seed_markdown_thing(&sdk_reader, device_id, collection_id, thing_id, "before");
+
+        let initial = sdk_reader
+            .read_virtual_path(device_id, &content_path)
+            .expect("initial read");
+        assert_eq!(initial.content, "before");
+
+        sdk_writer
+            .things_edit_content(
+                device_id,
+                thing_id,
+                "overwrite",
+                None,
+                Some("after"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("writer edit content");
+
+        let updated = sdk_reader
+            .read_virtual_path(device_id, &content_path)
+            .expect("updated read");
+        assert_eq!(updated.content, "after");
+    }
+
+    #[test]
+    fn json_object_cache_returns_fresh_result_after_same_sdk_write_and_delete() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+        let thing_path = format!("/collection/{collection_id}/things/{thing_id}");
+
+        seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
+
+        let created = sdk
+            .create_virtual_path(
+                device_id,
+                &thing_path,
+                "json_object",
+                Some("Config"),
+                Some(r#"{"enabled":true,"count":1}"#),
+                None,
+                None,
+                None,
+            )
+            .expect("create json_object");
+        let entry_path = created
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("entry path")
+            .to_string();
+        let data_path = format!("{entry_path}.data.json");
+        let schema_path = format!("{entry_path}.schema.json");
+
+        let initial = sdk
+            .read_virtual_path(device_id, &data_path)
+            .expect("initial data read");
+        assert_eq!(
+            serde_json::from_str::<Value>(&initial.content).expect("parse initial json"),
+            json!({
+                "enabled": true,
+                "count": 1
+            })
+        );
+
+        sdk.edit_virtual_path(
+            device_id,
+            &schema_path,
+            "overwrite",
+            Some(&json!({
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean" },
+                    "count": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["enabled", "count"]
+            })),
+            None,
+            None,
+            None,
+        )
+        .expect("write schema");
+
+        sdk.edit_virtual_path(
+            device_id,
+            &data_path,
+            "overwrite",
+            Some(&json!({
+                "enabled": false,
+                "count": 2
+            })),
+            None,
+            None,
+            None,
+        )
+        .expect("write data");
+
+        let updated = sdk
+            .read_virtual_path(device_id, &data_path)
+            .expect("updated data read");
+        assert_eq!(
+            serde_json::from_str::<Value>(&updated.content).expect("parse updated json"),
+            json!({
+                "enabled": false,
+                "count": 2
+            })
+        );
+
+        let schema = sdk
+            .read_virtual_path(device_id, &schema_path)
+            .expect("schema read");
+        assert_eq!(
+            serde_json::from_str::<Value>(&schema.content).expect("parse schema json"),
+            json!({
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean" },
+                    "count": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["enabled", "count"]
+            })
+        );
+
+        sdk.delete_virtual_path(device_id, &entry_path)
+            .expect("delete json object entry");
+        assert!(sdk.read_virtual_path(device_id, &data_path).is_err());
+        assert!(sdk.read_virtual_path(device_id, &schema_path).is_err());
+    }
+
+    #[test]
+    fn json_object_cache_invalidates_after_external_sdk_write_and_delete() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk_reader = TriggerSdk::initialize(&db_path).expect("reader sdk init");
+        let sdk_writer = TriggerSdk::initialize(&db_path).expect("writer sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+        let thing_path = format!("/collection/{collection_id}/things/{thing_id}");
+
+        seed_markdown_thing(&sdk_reader, device_id, collection_id, thing_id, "before");
+
+        let created = sdk_reader
+            .create_virtual_path(
+                device_id,
+                &thing_path,
+                "json_object",
+                Some("Config"),
+                Some(r#"{"enabled":true}"#),
+                None,
+                None,
+                None,
+            )
+            .expect("create json_object");
+        let entry_path = created
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("entry path")
+            .to_string();
+        let data_path = format!("{entry_path}.data.json");
+
+        let initial = sdk_reader
+            .read_virtual_path(device_id, &data_path)
+            .expect("initial read");
+        assert_eq!(
+            serde_json::from_str::<Value>(&initial.content).expect("parse initial json"),
+            json!({ "enabled": true })
+        );
+
+        sdk_writer
+            .edit_virtual_path(
+                device_id,
+                &data_path,
+                "overwrite",
+                Some(&json!({
+                    "enabled": false,
+                    "source": "writer"
+                })),
+                None,
+                None,
+                None,
+            )
+            .expect("writer overwrite data");
+
+        let updated = sdk_reader
+            .read_virtual_path(device_id, &data_path)
+            .expect("reader updated read");
+        assert_eq!(
+            serde_json::from_str::<Value>(&updated.content).expect("parse updated json"),
+            json!({
+                "enabled": false,
+                "source": "writer"
+            })
+        );
+
+        sdk_writer
+            .delete_virtual_path(device_id, &entry_path)
+            .expect("writer delete entry");
+
+        assert!(sdk_reader.read_virtual_path(device_id, &data_path).is_err());
+    }
+
+    #[test]
+    fn things_upsert_thing_restores_json_object_entries_from_snapshot_payload() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+
+        seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
+
+        let entry_id = sdk
+            .things_add_json_object_content_entry(
+                device_id,
+                thing_id,
+                Some("Config"),
+                Some(&json!({
+                    "enabled": true,
+                    "count": 1
+                })),
+                None,
+            )
+            .expect("add json object entry");
+
+        let snapshot = sdk.things_list_snapshot(device_id).expect("snapshot before delete");
+        let thing_snapshot = snapshot
+            .things
+            .into_iter()
+            .find(|thing| thing.uuid == thing_id)
+            .expect("thing in snapshot");
+
+        sdk.things_delete_thing(device_id, collection_id, thing_id)
+            .expect("delete thing");
+
+        sdk.things_upsert_thing(
+            device_id,
+            ThingUpsert {
+                uuid: thing_snapshot.uuid.clone(),
+                title: thing_snapshot.title.clone(),
+                datatype: thing_snapshot.datatype.clone(),
+                data: Some(thing_snapshot.data.clone()),
+                collection_uuid: thing_snapshot.collection_uuid.clone(),
+                trigger_uuid: thing_snapshot.trigger_uuid.clone(),
+                parent_uuid: thing_snapshot.parent_uuid.clone(),
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .expect("restore thing from snapshot payload");
+
+        let restored_entries = sdk
+            .things_get_content_entries(device_id, thing_id)
+            .expect("restored content entries");
+        assert_eq!(restored_entries.len(), 1);
+        assert_eq!(restored_entries[0].id, entry_id);
+        match &restored_entries[0].payload {
+            ContentEntryPayload::JsonObject(_) => {}
+            other => panic!("expected json_object payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_stash_round_trip_preserves_json_object_content_docs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+
+        seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
+
+        let entry_id = sdk
+            .things_add_json_object_content_entry(
+                device_id,
+                thing_id,
+                Some("Config"),
+                Some(&json!({
+                    "enabled": true,
+                    "count": 1
+                })),
+                Some(&json!({
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "count": { "type": "integer" }
+                    }
+                })),
+            )
+            .expect("add json object entry");
+
+        assert!(sdk
+            .things_bootstrap_stash_local_snapshot_if_needed(device_id)
+            .expect("stash local docs"));
+
+        sdk.things_bootstrap_from_server_snapshot_and_replay_stash(device_id, Vec::new(), None)
+            .expect("replay stashed docs");
+
+        let restored_data = sdk
+            .things_get_json_object_entry_data(device_id, thing_id, &entry_id)
+            .expect("load restored json data")
+            .expect("json data should exist after replay");
+        assert_eq!(restored_data, json!({
+            "enabled": true,
+            "count": 1
+        }));
+
+        let restored_schema = sdk
+            .things_get_json_object_entry_schema(device_id, thing_id, &entry_id)
+            .expect("load restored json schema")
+            .expect("json schema should exist after replay");
+        assert_eq!(restored_schema, json!({
+            "type": "object",
+            "properties": {
+                "enabled": { "type": "boolean" },
+                "count": { "type": "integer" }
+            }
+        }));
+    }
+
+    #[test]
+    fn bootstrap_stash_still_runs_after_done_flag_when_new_local_docs_exist() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+
+        seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
+
+        sdk.storage
+            .set_internal_kv("things.bootstrap.done", "1")
+            .expect("set bootstrap done flag");
+
+        let entry_id = sdk
+            .things_add_json_object_content_entry(
+                device_id,
+                thing_id,
+                Some("Config"),
+                Some(&json!({
+                    "enabled": true,
+                    "count": 2
+                })),
+                Some(&json!({
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "count": { "type": "integer" }
+                    }
+                })),
+            )
+            .expect("add json object entry after bootstrap done");
+
+        assert!(sdk
+            .things_bootstrap_stash_local_snapshot_if_needed(device_id)
+            .expect("stash should still run after done flag"));
+
+        sdk.things_bootstrap_from_server_snapshot_and_replay_stash(device_id, Vec::new(), None)
+            .expect("replay stashed docs");
+
+        let restored_data = sdk
+            .things_get_json_object_entry_data(device_id, thing_id, &entry_id)
+            .expect("load restored json data")
+            .expect("json data should exist after replay");
+        assert_eq!(restored_data, json!({
+            "enabled": true,
+            "count": 2
+        }));
     }
 }
 
@@ -4886,7 +5619,7 @@ fn replay_stashed_thing_into_document_set(
     let content_registry = crate::things_crdt::ContentTypeRegistry::new();
     let (markdown, content_entries) = content_registry.extract_thing_snapshot_parts(&thing.data)?;
     let trigger = crate::things_crdt::trigger_update_from_tri_state(thing.trigger_uuid.as_deref());
-    doc_set.upsert_thing_meta(
+    doc_set.upsert_thing_meta_with_timestamps(
         &thing.collection_uuid,
         &thing.uuid,
         Some(thing.datatype.clone()),
@@ -4894,6 +5627,8 @@ fn replay_stashed_thing_into_document_set(
         Some(thing.title.clone()),
         thing.parent_uuid.clone(),
         trigger,
+        Some(thing.created_at.clone()),
+        Some(thing.updated_at.clone()),
     )?;
 
     if let Some(markdown) = markdown {
@@ -4905,4 +5640,121 @@ fn replay_stashed_thing_into_document_set(
     }
 
     Ok(())
+}
+
+fn serialize_bootstrap_stash_documents(
+    dirty_documents: &[crate::types::CrdtDocumentRow],
+) -> Result<String> {
+    let payload = BootstrapStashPayload {
+        version: 1,
+        documents: dirty_documents
+            .iter()
+            .map(|row| BootstrapStashedDocument {
+                uuid: row.uuid.clone(),
+                data_type: row.data_type.clone(),
+                automerge_doc_base64: base64::engine::general_purpose::STANDARD
+                    .encode(&row.automerge_doc),
+            })
+            .collect(),
+    };
+
+    serde_json::to_string(&payload).context("Failed to encode bootstrap stash payload")
+}
+
+fn parse_bootstrap_replay_source(stash_json: &str) -> Result<BootstrapReplaySource> {
+    if let Ok(payload) = serde_json::from_str::<BootstrapStashPayload>(stash_json) {
+        return Ok(BootstrapReplaySource::Documents(payload.documents));
+    }
+
+    let snapshot = serde_json::from_str::<crate::things_crdt::ThingsSnapshot>(stash_json)
+        .context("Failed to parse bootstrap stash payload")?;
+    Ok(BootstrapReplaySource::LegacySnapshot(snapshot))
+}
+
+fn restore_stashed_documents(
+    storage: &Storage,
+    documents: &[BootstrapStashedDocument],
+) -> Result<()> {
+    let mut sorted_documents = documents.to_vec();
+    sorted_documents.sort_by_key(|doc| (bootstrap_data_type_sort_key(&doc.data_type), doc.uuid.clone()));
+
+    for document in sorted_documents {
+        let automerge_doc = base64::engine::general_purpose::STANDARD
+            .decode(&document.automerge_doc_base64)
+            .context("Failed to decode stashed CRDT document")?;
+        storage
+            .save_crdt_document(
+                &document.uuid,
+                &document.data_type,
+                &automerge_doc,
+                &[],
+                true,
+                None,
+            )
+            .context("Failed to restore stashed CRDT document")?;
+    }
+
+    Ok(())
+}
+
+fn merge_stashed_documents_onto_current_documents(
+    storage: &Storage,
+    documents: &[BootstrapStashedDocument],
+) -> Result<()> {
+    let mut sorted_documents = documents.to_vec();
+    sorted_documents.sort_by_key(|doc| (bootstrap_data_type_sort_key(&doc.data_type), doc.uuid.clone()));
+
+    for document in sorted_documents {
+        let incoming_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&document.automerge_doc_base64)
+            .context("Failed to decode stashed CRDT document")?;
+
+        if let Some(existing) = storage
+            .get_crdt_document(&document.uuid, &document.data_type)
+            .context("Failed to load current CRDT document during bootstrap replay")?
+        {
+            let mut merged = automerge::AutoCommit::load(&existing.automerge_doc)
+                .context("Failed to load current CRDT document")?;
+            let mut incoming = automerge::AutoCommit::load(&incoming_bytes)
+                .context("Failed to load stashed CRDT document")?;
+            merged
+                .merge(&mut incoming)
+                .context("Failed to merge stashed CRDT document")?;
+            let merged_bytes = merged.save();
+
+            storage
+                .save_crdt_document(
+                    &document.uuid,
+                    &document.data_type,
+                    &merged_bytes,
+                    &existing.sync_state,
+                    true,
+                    existing.last_sync_at.as_deref(),
+                )
+                .context("Failed to save merged CRDT document")?;
+            continue;
+        }
+
+        storage
+            .save_crdt_document(
+                &document.uuid,
+                &document.data_type,
+                &incoming_bytes,
+                &[],
+                true,
+                None,
+            )
+            .context("Failed to restore missing stashed CRDT document")?;
+    }
+
+    Ok(())
+}
+
+fn bootstrap_data_type_sort_key(data_type: &str) -> u8 {
+    match data_type {
+        "root" => 0,
+        "collection" => 1,
+        "thing_markdown" => 2,
+        _ => 3,
+    }
 }

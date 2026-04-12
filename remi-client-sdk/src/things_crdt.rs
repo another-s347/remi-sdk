@@ -45,6 +45,129 @@ use remi_things_crdt::{
     needs_compaction,
 };
 
+const INTERNAL_CREATED_AT_ATTR_KEY: &str = "__remi_created_at";
+const INTERNAL_UPDATED_AT_ATTR_KEY: &str = "__remi_updated_at";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EntityTimestamps {
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+fn normalize_timestamp_value(value: Option<String>) -> Option<String> {
+    value.and_then(|item| {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn now_timestamp_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn extract_entity_timestamps(attrs: Option<&Value>) -> EntityTimestamps {
+    let Some(Value::Object(map)) = attrs else {
+        return EntityTimestamps::default();
+    };
+
+    EntityTimestamps {
+        created_at: normalize_timestamp_value(
+            map.get(INTERNAL_CREATED_AT_ATTR_KEY)
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        ),
+        updated_at: normalize_timestamp_value(
+            map.get(INTERNAL_UPDATED_AT_ATTR_KEY)
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        ),
+    }
+}
+
+fn strip_internal_timestamp_attrs(attrs: Option<&Value>) -> Option<Value> {
+    match attrs {
+        Some(Value::Object(map)) => {
+            let filtered = map
+                .iter()
+                .filter(|(key, _)| {
+                    *key != INTERNAL_CREATED_AT_ATTR_KEY && *key != INTERNAL_UPDATED_AT_ATTR_KEY
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<serde_json::Map<String, Value>>();
+
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(Value::Object(filtered))
+            }
+        }
+        Some(other) => Some(other.clone()),
+        None => None,
+    }
+}
+
+fn merge_entity_timestamps_into_attrs(
+    attrs: Option<&Value>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+) -> Result<String> {
+    let mut map = match attrs {
+        Some(Value::Object(existing)) => existing.clone(),
+        Some(_) => serde_json::Map::new(),
+        None => serde_json::Map::new(),
+    };
+
+    match normalize_timestamp_value(created_at) {
+        Some(value) => {
+            map.insert(INTERNAL_CREATED_AT_ATTR_KEY.to_string(), Value::String(value));
+        }
+        None => {
+            map.remove(INTERNAL_CREATED_AT_ATTR_KEY);
+        }
+    }
+
+    match normalize_timestamp_value(updated_at) {
+        Some(value) => {
+            map.insert(INTERNAL_UPDATED_AT_ATTR_KEY.to_string(), Value::String(value));
+        }
+        None => {
+            map.remove(INTERNAL_UPDATED_AT_ATTR_KEY);
+        }
+    }
+
+    serde_json::to_string(&Value::Object(map)).context("Failed to encode timestamp attrs")
+}
+
+fn resolve_entity_timestamps(
+    existing_attrs: Option<&Value>,
+    provided_created_at: Option<String>,
+    provided_updated_at: Option<String>,
+    existed: bool,
+) -> EntityTimestamps {
+    let existing = extract_entity_timestamps(existing_attrs);
+    let fallback_now = now_timestamp_rfc3339();
+
+    let created_at = normalize_timestamp_value(provided_created_at)
+        .or(existing.created_at)
+        .unwrap_or_else(|| fallback_now.clone());
+    let updated_at = normalize_timestamp_value(provided_updated_at).unwrap_or_else(|| {
+        if existed {
+            fallback_now.clone()
+        } else {
+            created_at.clone()
+        }
+    });
+
+    EntityTimestamps {
+        created_at: Some(created_at),
+        updated_at: Some(updated_at),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotOptions {
     /// If false, omit thing `data.content` from the snapshot (and avoid extracting content when paired with ExtractOptions).
@@ -159,6 +282,30 @@ pub struct ThingsSnapshotState {
     pub things: Vec<ThingEntry>,
     pub dirty: bool,
     pub last_sync_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeCollectionData {
+    pub uuid: String,
+    pub title: String,
+    pub trigger_uuid: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeThingData {
+    pub uuid: String,
+    pub title: String,
+    pub status: String,
+    pub trigger_uuid: Option<String>,
+    pub collection_uuid: String,
+    pub parent_uuid: Option<String>,
+    pub entries: Vec<ContentEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThingsTreeData {
+    pub collections: Vec<TreeCollectionData>,
+    pub things: Vec<TreeThingData>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -309,7 +456,10 @@ impl ContentTypeRegistry {
         let mut obj = serde_json::Map::new();
         obj.insert("status".to_string(), json!(meta.status));
         obj.insert("datatype".to_string(), json!(meta.datatype));
-        obj.insert("attrs".to_string(), json!(meta.attrs));
+        obj.insert(
+            "attrs".to_string(),
+            json!(strip_internal_timestamp_attrs(meta.attrs.as_ref())),
+        );
         if options.include_content {
             obj.insert("content".to_string(), json!(content));
         }
@@ -910,12 +1060,13 @@ pub fn snapshot_from_view_with_options(
             continue;
         }
         let trigger_uuid = desired_trigger_uuid(deleted, &c.trigger);
+        let timestamps = extract_entity_timestamps(c.attrs.as_ref());
         collections.push(ThingCollectionEntry {
             uuid: c.id.clone(),
             title: c.title.clone(),
             trigger_uuid,
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
+            created_at: timestamps.created_at.unwrap_or_default(),
+            updated_at: timestamps.updated_at.unwrap_or_default(),
             actor_type: None,
             actor_app_id: None,
             actor_display_name: None,
@@ -929,6 +1080,7 @@ pub fn snapshot_from_view_with_options(
             continue;
         }
         let trigger_uuid = desired_trigger_uuid(deleted, &t.trigger);
+        let timestamps = extract_entity_timestamps(t.attrs.as_ref());
         things.push(ThingEntry {
             uuid: t.id.clone(),
             title: t.title.clone().unwrap_or_default(),
@@ -937,8 +1089,8 @@ pub fn snapshot_from_view_with_options(
             collection_uuid: t.collection_id.clone(),
             trigger_uuid,
             parent_uuid: t.parent_id.clone(),
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
+            created_at: timestamps.created_at.unwrap_or_default(),
+            updated_at: timestamps.updated_at.unwrap_or_default(),
             status: t.status.as_storage_str().to_string(),
             status_timestamp_ms: t.status.timestamp_ms(),
             actor_type: None,
@@ -1496,8 +1648,28 @@ impl<'a> ThingsDomainReader<'a> {
         let mut things = Vec::new();
         let content_registry = ContentTypeRegistry::new();
 
-        for coll_uuid in &self.collection_uuids_from_documents()? {
-            let coll_view = self.collection_view(coll_uuid)?;
+        let mut collection_views = Vec::new();
+        for (key, state) in self.store.iter() {
+            if key.data_type != CrdtDataType::Collection {
+                continue;
+            }
+
+            let coll_view = extract_collection_doc_view(&state.automerge_doc, &key.uuid)?;
+            let deleted = coll_view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false);
+            if deleted {
+                continue;
+            }
+
+            collection_views.push((key.uuid.clone(), coll_view));
+        }
+        collection_views.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (coll_uuid, coll_view) in collection_views {
 
             let deleted = coll_view
                 .meta
@@ -1510,12 +1682,13 @@ impl<'a> ThingsDomainReader<'a> {
             }
 
             let trigger_uuid = desired_trigger_uuid(deleted, &coll_view.meta.trigger);
+            let collection_timestamps = extract_entity_timestamps(coll_view.meta.attrs.as_ref());
             collections.push(ThingCollectionEntry {
                 uuid: coll_view.meta.id.clone(),
                 title: coll_view.meta.title.clone(),
                 trigger_uuid,
-                created_at: String::new(),
-                updated_at: String::new(),
+                created_at: collection_timestamps.created_at.unwrap_or_default(),
+                updated_at: collection_timestamps.updated_at.unwrap_or_default(),
                 actor_type: None,
                 actor_app_id: None,
                 actor_display_name: None,
@@ -1532,6 +1705,7 @@ impl<'a> ThingsDomainReader<'a> {
                 }
 
                 let thing_trigger = desired_trigger_uuid(thing_deleted, &thing_meta.trigger);
+                let thing_timestamps = extract_entity_timestamps(thing_meta.attrs.as_ref());
                 let content = if options.include_content {
                     let md_view = self.thing_markdown_view(&thing_meta.id)?;
                     md_view.content
@@ -1552,8 +1726,8 @@ impl<'a> ThingsDomainReader<'a> {
                     collection_uuid: coll_uuid.clone(),
                     trigger_uuid: thing_trigger,
                     parent_uuid: thing_meta.parent_id.clone(),
-                    created_at: String::new(),
-                    updated_at: String::new(),
+                    created_at: thing_timestamps.created_at.unwrap_or_default(),
+                    updated_at: thing_timestamps.updated_at.unwrap_or_default(),
                     status: thing_meta.status.as_storage_str().to_string(),
                     status_timestamp_ms: thing_meta.status.timestamp_ms(),
                     actor_type: None,
@@ -1805,6 +1979,7 @@ impl<'a> ThingsDomainWriter<'a> {
         title: Option<String>,
         status: Option<String>,
         trigger: TriggerUpdate,
+        attrs_json: Option<String>,
     ) -> Result<()> {
         self.apply_collection_update(
             collection_uuid,
@@ -1812,7 +1987,7 @@ impl<'a> ThingsDomainWriter<'a> {
                 title,
                 status,
                 trigger,
-                attrs_json: None,
+                attrs_json,
             },
         )
     }
@@ -1849,6 +2024,7 @@ impl<'a> ThingsDomainWriter<'a> {
         title: Option<String>,
         parent_uuid: Option<String>,
         trigger: TriggerUpdate,
+        attrs_json: Option<String>,
     ) -> Result<()> {
         self.ensure_live_collection_exists(collection_uuid)?;
         self.apply_collection_update(
@@ -1862,7 +2038,7 @@ impl<'a> ThingsDomainWriter<'a> {
                 parent_id: parent_uuid,
                 trigger,
                 built_in: None,
-                attrs_json: None,
+                attrs_json,
             },
         )
     }
@@ -2235,9 +2411,44 @@ impl ThingsDocumentSet {
         status: Option<String>,
         trigger: TriggerUpdate,
     ) -> Result<Vec<ThingsDocumentEvent>> {
+        self.update_collection_meta_with_timestamps(
+            collection_uuid,
+            title,
+            status,
+            trigger,
+            None,
+            None,
+        )
+    }
+
+    pub fn update_collection_meta_with_timestamps(
+        &mut self,
+        collection_uuid: &str,
+        title: Option<String>,
+        status: Option<String>,
+        trigger: TriggerUpdate,
+        created_at: Option<String>,
+        updated_at: Option<String>,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
         let existed = self.collection_is_live(collection_uuid)?;
+        let existing_attrs = if existed {
+            Some(self.collection_view(collection_uuid)?.meta.attrs)
+        } else {
+            None
+        };
+        let timestamps = resolve_entity_timestamps(
+            existing_attrs.as_ref().and_then(|attrs| attrs.as_ref()),
+            created_at,
+            updated_at,
+            existed,
+        );
+        let attrs_json = merge_entity_timestamps_into_attrs(
+            existing_attrs.as_ref().and_then(|attrs| attrs.as_ref()),
+            timestamps.created_at,
+            timestamps.updated_at,
+        )?;
         self.domain_writer()
-            .update_collection_meta(collection_uuid, title, status, trigger)?;
+            .update_collection_meta(collection_uuid, title, status, trigger, Some(attrs_json))?;
 
         let mut events = Vec::new();
         if !existed {
@@ -2265,7 +2476,52 @@ impl ThingsDocumentSet {
         parent_uuid: Option<String>,
         trigger: TriggerUpdate,
     ) -> Result<Vec<ThingsDocumentEvent>> {
+        self.upsert_thing_meta_with_timestamps(
+            collection_uuid,
+            thing_uuid,
+            datatype,
+            status,
+            title,
+            parent_uuid,
+            trigger,
+            None,
+            None,
+        )
+    }
+
+    pub fn upsert_thing_meta_with_timestamps(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        datatype: Option<ThingDatatype>,
+        status: Option<String>,
+        title: Option<String>,
+        parent_uuid: Option<String>,
+        trigger: TriggerUpdate,
+        created_at: Option<String>,
+        updated_at: Option<String>,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
         let existed = self.thing_is_live_in_collection(collection_uuid, thing_uuid)?;
+        let existing_attrs = if existed {
+            self.collection_view(collection_uuid)?
+                .things
+                .into_iter()
+                .find(|thing| thing.id == thing_uuid)
+                .and_then(|thing| thing.attrs)
+        } else {
+            None
+        };
+        let timestamps = resolve_entity_timestamps(
+            existing_attrs.as_ref(),
+            created_at,
+            updated_at,
+            existed,
+        );
+        let attrs_json = merge_entity_timestamps_into_attrs(
+            existing_attrs.as_ref(),
+            timestamps.created_at,
+            timestamps.updated_at,
+        )?;
         self.domain_writer().upsert_thing_meta(
             collection_uuid,
             thing_uuid,
@@ -2274,6 +2530,7 @@ impl ThingsDocumentSet {
             title,
             parent_uuid,
             trigger,
+            Some(attrs_json),
         )?;
 
         Ok(vec![ThingsDocumentEvent::thing(
@@ -2496,6 +2753,75 @@ impl ThingsDocumentSet {
         )])
     }
 
+    /// Reconcile built-in content entries from a snapshot-style payload.
+    ///
+    /// If the payload does not include `built_in.content_entries`, this is a no-op.
+    pub fn sync_content_entries_from_snapshot_payload(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        payload: &Value,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let Some(entries_value) = payload
+            .get("built_in")
+            .and_then(|built_in| built_in.get("content_entries"))
+        else {
+            return Ok(Vec::new());
+        };
+
+        if !entries_value.is_array() {
+            anyhow::bail!("built_in.content_entries must be an array when present");
+        }
+
+        let desired_entries = ContentTypeRegistry::new().extract_content_entries_from_snapshot_data(payload)?;
+        let existing_entries = self.get_content_entries(collection_uuid, thing_uuid)?;
+        let existing_by_id = existing_entries
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.clone()))
+            .collect::<HashMap<_, _>>();
+        let desired_ids = desired_entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<HashSet<_>>();
+
+        let mut events = Vec::new();
+
+        for existing_entry in &existing_entries {
+            if !desired_ids.contains(&existing_entry.id) {
+                events.extend(self.delete_content_entry(collection_uuid, thing_uuid, &existing_entry.id)?);
+            }
+        }
+
+        for desired_entry in desired_entries {
+            match existing_by_id.get(&desired_entry.id) {
+                Some(existing_entry) => {
+                    let title = (existing_entry.title != desired_entry.title)
+                        .then_some(desired_entry.title.clone());
+                    let order = (existing_entry.order != desired_entry.order)
+                        .then_some(desired_entry.order);
+                    let payload = (existing_entry.payload != desired_entry.payload)
+                        .then_some(desired_entry.payload.clone());
+
+                    if title.is_some() || order.is_some() || payload.is_some() {
+                        events.extend(self.update_content_entry(
+                            collection_uuid,
+                            thing_uuid,
+                            &desired_entry.id,
+                            title,
+                            order,
+                            payload,
+                        )?);
+                    }
+                }
+                None => {
+                    events.extend(self.add_content_entry(collection_uuid, thing_uuid, desired_entry)?);
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
     /// Set plain markdown text on a thing using the default markdown payload shape.
     pub fn set_thing_markdown_text(
         &mut self,
@@ -2577,6 +2903,74 @@ impl ThingsDocumentSet {
                     .and_then(|block| block.text)
             })
         }))
+    }
+
+    pub fn extract_tree_data(&self) -> Result<ThingsTreeData> {
+        let mut collections = Vec::new();
+        let mut things = Vec::new();
+
+        let mut collection_views = Vec::new();
+        for (key, state) in self.documents.iter() {
+            if key.data_type != CrdtDataType::Collection {
+                continue;
+            }
+
+            let view = extract_collection_doc_view(&state.automerge_doc, &key.uuid)?;
+            let deleted = view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false);
+            if deleted {
+                continue;
+            }
+
+            collection_views.push((key.uuid.clone(), view));
+        }
+
+        collection_views.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (collection_uuid, coll_view) in collection_views {
+            let deleted = coll_view
+                .meta
+                .tombstone
+                .as_ref()
+                .map(|t| t.deleted)
+                .unwrap_or(false);
+            if deleted {
+                continue;
+            }
+
+            collections.push(TreeCollectionData {
+                uuid: collection_uuid.clone(),
+                title: coll_view.meta.title.clone(),
+                trigger_uuid: desired_trigger_uuid(deleted, &coll_view.meta.trigger),
+            });
+
+            for thing_meta in coll_view.things {
+                let thing_deleted = thing_meta
+                    .tombstone
+                    .as_ref()
+                    .map(|t| t.deleted)
+                    .unwrap_or(false);
+                if thing_deleted {
+                    continue;
+                }
+
+                things.push(TreeThingData {
+                    uuid: thing_meta.id.clone(),
+                    title: thing_meta.title.clone().unwrap_or_default(),
+                    status: thing_meta.status.as_storage_str().to_string(),
+                    trigger_uuid: desired_trigger_uuid(thing_deleted, &thing_meta.trigger),
+                    collection_uuid: collection_uuid.clone(),
+                    parent_uuid: thing_meta.parent_id.clone(),
+                    entries: thing_meta.built_in.content_entries.clone(),
+                });
+            }
+        }
+
+        Ok(ThingsTreeData { collections, things })
     }
 
     // ===== Snapshot Generation =====
@@ -2666,14 +3060,16 @@ mod tests_v3 {
     fn test_document_set_snapshot() {
         let mut docs = ThingsDocumentSet::new("test-device");
         docs.get_or_init_collection("coll-1").unwrap();
-        docs.update_collection_meta(
+        docs.update_collection_meta_with_timestamps(
             "coll-1",
             Some("My Collection".to_string()),
             None,
             TriggerUpdate::Noop,
+            Some("2026-01-01T00:00:00Z".to_string()),
+            Some("2026-01-02T00:00:00Z".to_string()),
         )
         .unwrap();
-        docs.upsert_thing_meta(
+        docs.upsert_thing_meta_with_timestamps(
             "coll-1",
             "thing-1",
             Some(ThingDatatype::Markdown),
@@ -2681,6 +3077,8 @@ mod tests_v3 {
             Some("Task 1".to_string()),
             None,
             TriggerUpdate::Noop,
+            Some("2026-01-03T00:00:00Z".to_string()),
+            Some("2026-01-04T00:00:00Z".to_string()),
         )
         .unwrap();
 
@@ -2691,8 +3089,48 @@ mod tests_v3 {
             .unwrap();
         assert_eq!(snapshot.collections.len(), 1);
         assert_eq!(snapshot.collections[0].title, "My Collection");
+        assert_eq!(snapshot.collections[0].created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(snapshot.collections[0].updated_at, "2026-01-02T00:00:00Z");
         assert_eq!(snapshot.things.len(), 1);
         assert_eq!(snapshot.things[0].title, "Task 1");
+        assert_eq!(snapshot.things[0].created_at, "2026-01-03T00:00:00Z");
+        assert_eq!(snapshot.things[0].updated_at, "2026-01-04T00:00:00Z");
+        assert_eq!(snapshot.things[0].data.get("attrs"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn test_document_set_preserves_created_at_across_updates() {
+        let mut docs = ThingsDocumentSet::new("test-device");
+        docs.get_or_init_collection("coll-1").unwrap();
+        docs.upsert_thing_meta_with_timestamps(
+            "coll-1",
+            "thing-1",
+            Some(ThingDatatype::Markdown),
+            Some("none".to_string()),
+            Some("Task 1".to_string()),
+            None,
+            TriggerUpdate::Noop,
+            Some("2026-01-03T00:00:00Z".to_string()),
+            Some("2026-01-04T00:00:00Z".to_string()),
+        )
+        .unwrap();
+        docs.upsert_thing_meta_with_timestamps(
+            "coll-1",
+            "thing-1",
+            Some(ThingDatatype::Markdown),
+            Some("none".to_string()),
+            Some("Task 1 renamed".to_string()),
+            None,
+            TriggerUpdate::Noop,
+            None,
+            Some("2026-01-05T00:00:00Z".to_string()),
+        )
+        .unwrap();
+
+        let snapshot = docs.extract_snapshot().unwrap();
+        assert_eq!(snapshot.things.len(), 1);
+        assert_eq!(snapshot.things[0].created_at, "2026-01-03T00:00:00Z");
+        assert_eq!(snapshot.things[0].updated_at, "2026-01-05T00:00:00Z");
     }
 
     #[test]
@@ -3040,6 +3478,7 @@ mod tests_v3 {
 // ============================================================================
 
 pub trait CrdtDocumentRepository {
+    fn list_crdt_documents(&self) -> Result<Vec<crate::types::CrdtDocumentRow>>;
     fn list_crdt_document_keys(&self) -> Result<Vec<(String, String)>>;
     fn get_crdt_document(
         &self,
@@ -3059,6 +3498,10 @@ pub trait CrdtDocumentRepository {
 }
 
 impl CrdtDocumentRepository for crate::storage::Storage {
+    fn list_crdt_documents(&self) -> Result<Vec<crate::types::CrdtDocumentRow>> {
+        self.list_crdt_documents()
+    }
+
     fn list_crdt_document_keys(&self) -> Result<Vec<(String, String)>> {
         self.list_crdt_document_keys()
     }
@@ -3096,6 +3539,10 @@ impl CrdtDocumentRepository for crate::storage::Storage {
 }
 
 impl CrdtDocumentRepository for crate::TriggerSdk {
+    fn list_crdt_documents(&self) -> Result<Vec<crate::types::CrdtDocumentRow>> {
+        self.crdt_list_documents()
+    }
+
     fn list_crdt_document_keys(&self) -> Result<Vec<(String, String)>> {
         self.crdt_list_document_keys()
     }
@@ -3153,38 +3600,32 @@ impl<'a, R: CrdtDocumentRepository + ?Sized> DocumentPersistence<'a, R> {
     pub fn load_document_set(&self, device_id: &str) -> Result<ThingsDocumentSet> {
         let mut doc_set = ThingsDocumentSet::new(device_id);
 
-        let keys = self
+        let rows = self
             .repository
-            .list_crdt_document_keys()
-            .context("Failed to list CRDT document keys")?;
+            .list_crdt_documents()
+            .context("Failed to list CRDT documents")?;
 
-        for (uuid, data_type_str) in keys {
-            let data_type: CrdtDataType = match data_type_str.as_str() {
+        for row in rows {
+            let data_type: CrdtDataType = match row.data_type.as_str() {
                 "root" => CrdtDataType::Root,
                 "collection" => CrdtDataType::Collection,
                 "thing_markdown" => CrdtDataType::ThingMarkdown,
                 _ => continue,
             };
 
-            if let Some(row) = self
-                .repository
-                .get_crdt_document(&uuid, &data_type_str)
-                .context("Failed to get CRDT document")?
-            {
-                let key = DocumentKey {
-                    uuid: uuid.clone(),
-                    data_type,
-                };
-                doc_set.set(
-                    key,
-                    DocumentState {
-                        automerge_doc: row.automerge_doc,
-                        sync_state: row.sync_state,
-                        dirty: row.dirty,
-                        last_sync_at: row.last_sync_at,
-                    },
-                );
-            }
+            let key = DocumentKey {
+                uuid: row.uuid,
+                data_type,
+            };
+            doc_set.set(
+                key,
+                DocumentState {
+                    automerge_doc: row.automerge_doc,
+                    sync_state: row.sync_state,
+                    dirty: row.dirty,
+                    last_sync_at: row.last_sync_at,
+                },
+            );
         }
 
         Ok(doc_set)

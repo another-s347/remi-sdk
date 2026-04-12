@@ -1410,7 +1410,7 @@ fn normalize_external_tool_call(call: &JsonValue) -> Option<(String, JsonValue)>
         "TestTrigger" => "test_trigger",
         "RetrieveEvents" => "retrieve_events",
         "AbstractEvents" => "abstract_events",
-        "ResolveUri" => "resolve_uri",
+        "Fetch" | "ResolveUri" => "fetch",
         "HandoffToDeepAgent" => "handoff_to_deep_agent",
         _ => return None,
     };
@@ -1746,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_need_tool_execution_maps_resolve_uri() {
+    fn custom_need_tool_execution_maps_resolve_uri_to_fetch() {
         let event = ProtocolEvent::Custom {
             event_type: "remi_agent".to_string(),
             extra: json!({
@@ -1772,7 +1772,7 @@ mod tests {
         };
 
         assert_eq!(need_tool.tool_calls.len(), 1);
-        assert_eq!(need_tool.tool_calls[0].tool_name, "resolve_uri");
+        assert_eq!(need_tool.tool_calls[0].tool_name, "fetch");
     }
 
     #[test]

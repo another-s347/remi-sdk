@@ -581,6 +581,21 @@ pub struct VirtualFsReadResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualFsProfileStep {
+    pub name: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualFsProfileResult {
+    pub operation: String,
+    pub path: String,
+    pub total_ms: u64,
+    pub output_bytes: usize,
+    pub steps: Vec<VirtualFsProfileStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
     pub session_id: String,
     pub title: Option<String>,

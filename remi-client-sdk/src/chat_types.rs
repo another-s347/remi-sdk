@@ -485,6 +485,8 @@ pub struct ToolExecutionOutcome {
 pub struct ToolImagePart {
     pub media_type: String,
     pub data: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exif: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

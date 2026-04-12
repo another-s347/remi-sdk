@@ -1,8 +1,16 @@
 use super::TriggerSdk;
-use crate::things_crdt::{ContentEntry, ContentEntryPayload, ContentEntryUpdate, ImageField, ThingCollectionUpsert, ThingDatatype, ThingUpsert};
-use crate::types::{TriggerRegistration, TriggerRule, VirtualFsNodeKind, VirtualFsReadResult};
+use crate::things_crdt::{
+    ContentEntry, ContentEntryPayload, ContentEntryUpdate, ImageField, ThingCollectionUpsert,
+    ThingDatatype, ThingUpsert,
+};
+use crate::types::{
+    TriggerRegistration, TriggerRule, VirtualFsNodeKind, VirtualFsProfileResult,
+    VirtualFsProfileStep, VirtualFsReadResult,
+};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value as JsonValue, json};
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 const ROOT_PATH: &str = "/";
 const TRIGGER_PREVIEW_LIMIT: usize = 5;
@@ -44,6 +52,77 @@ struct TreeNode {
     children: Vec<TreeNode>,
 }
 
+struct TreeIndex<'a> {
+    collections_by_uuid: HashMap<&'a str, &'a crate::things_crdt::TreeCollectionData>,
+    things_by_key: HashMap<(&'a str, &'a str), &'a crate::things_crdt::TreeThingData>,
+    child_things: HashMap<(&'a str, Option<&'a str>), Vec<&'a crate::things_crdt::TreeThingData>>,
+    parents_with_children: HashSet<(&'a str, &'a str)>,
+}
+
+impl<'a> TreeIndex<'a> {
+    fn build(tree_data: &'a crate::things_crdt::ThingsTreeData) -> Self {
+        let mut collections_by_uuid = HashMap::with_capacity(tree_data.collections.len());
+        for collection in &tree_data.collections {
+            collections_by_uuid.insert(collection.uuid.as_str(), collection);
+        }
+
+        let mut things_by_key = HashMap::with_capacity(tree_data.things.len());
+        let mut child_things: HashMap<
+            (&'a str, Option<&'a str>),
+            Vec<&'a crate::things_crdt::TreeThingData>,
+        > = HashMap::new();
+        let mut parents_with_children = HashSet::new();
+
+        for thing in &tree_data.things {
+            let collection_uuid = thing.collection_uuid.as_str();
+            let parent_uuid = thing.parent_uuid.as_deref();
+            things_by_key.insert((collection_uuid, thing.uuid.as_str()), thing);
+            child_things
+                .entry((collection_uuid, parent_uuid))
+                .or_default()
+                .push(thing);
+
+            if let Some(parent_uuid) = parent_uuid {
+                parents_with_children.insert((collection_uuid, parent_uuid));
+            }
+        }
+
+        Self {
+            collections_by_uuid,
+            things_by_key,
+            child_things,
+            parents_with_children,
+        }
+    }
+
+    fn collection(&self, collection_uuid: &str) -> Option<&'a crate::things_crdt::TreeCollectionData> {
+        self.collections_by_uuid.get(collection_uuid).copied()
+    }
+
+    fn thing(
+        &self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+    ) -> Option<&'a crate::things_crdt::TreeThingData> {
+        self.things_by_key.get(&(collection_uuid, thing_uuid)).copied()
+    }
+
+    fn child_things(
+        &self,
+        collection_uuid: &str,
+        parent_uuid: Option<&str>,
+    ) -> Vec<&'a crate::things_crdt::TreeThingData> {
+        self.child_things
+            .get(&(collection_uuid, parent_uuid))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn has_children(&self, collection_uuid: &str, thing_uuid: &str) -> bool {
+        self.parents_with_children.contains(&(collection_uuid, thing_uuid))
+    }
+}
+
 impl TreeNode {
     fn new(label: impl Into<String>) -> Self {
         Self {
@@ -72,6 +151,45 @@ impl TriggerSdk {
         Ok(render_tree(&node))
     }
 
+    pub fn profile_tree_virtual_path(
+        &self,
+        device_id: &str,
+        path: Option<&str>,
+    ) -> Result<VirtualFsProfileResult> {
+        let total_started = Instant::now();
+        let mut steps = Vec::new();
+
+        let parse_started = Instant::now();
+        let path = normalize_path(path.unwrap_or(ROOT_PATH))?;
+        let parsed = parse_virtual_path(&path)?;
+        push_profile_step(&mut steps, "normalize_parse", parse_started.elapsed());
+
+        let triggers_started = Instant::now();
+        let triggers = self.list_triggers()?;
+        push_profile_step(&mut steps, "list_triggers", triggers_started.elapsed());
+
+        let load_started = Instant::now();
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        push_profile_step(&mut steps, "load_document_set", load_started.elapsed());
+
+        let tree_data_started = Instant::now();
+        let tree_data = doc_set.extract_tree_data()?;
+        push_profile_step(&mut steps, "extract_tree_data", tree_data_started.elapsed());
+
+        let render_started = Instant::now();
+        let node = self.build_tree_node_from_tree_data(&parsed, &triggers, &tree_data)?;
+        let rendered = render_tree(&node);
+        push_profile_step(&mut steps, "render_tree", render_started.elapsed());
+
+        Ok(VirtualFsProfileResult {
+            operation: "tree_virtual_path".to_string(),
+            path,
+            total_ms: total_started.elapsed().as_millis() as u64,
+            output_bytes: rendered.len(),
+            steps,
+        })
+    }
+
     pub(crate) fn cat_virtual_path(&self, device_id: &str, path: &str) -> Result<VirtualFsCatResult> {
         let path = normalize_path(path)?;
         let parsed = parse_virtual_path(&path)?;
@@ -96,6 +214,50 @@ impl TriggerSdk {
             path,
             kind: VirtualFsNodeKind::File,
             content: read,
+        })
+    }
+
+    pub fn profile_read_virtual_path(
+        &self,
+        device_id: &str,
+        path: &str,
+    ) -> Result<VirtualFsProfileResult> {
+        let total_started = Instant::now();
+        let mut steps = Vec::new();
+
+        let parse_started = Instant::now();
+        let path = normalize_path(path)?;
+        let parsed = parse_virtual_path(&path)?;
+        push_profile_step(&mut steps, "normalize_parse", parse_started.elapsed());
+
+        let output = match &parsed {
+            VirtualPath::ThingContent {
+                collection_uuid,
+                thing_uuid,
+            } => {
+                let load_started = Instant::now();
+                let doc_set = self.get_or_init_document_set(device_id)?;
+                push_profile_step(&mut steps, "load_document_set", load_started.elapsed());
+
+                let markdown_started = Instant::now();
+                let rendered = self.render_thing_content_from_doc_set(&doc_set, collection_uuid, thing_uuid)?;
+                push_profile_step(&mut steps, "render_content_markdown", markdown_started.elapsed());
+                rendered
+            }
+            _ => {
+                let read_started = Instant::now();
+                let result = self.read_virtual_path(device_id, &path)?;
+                push_profile_step(&mut steps, "read_virtual_path_total", read_started.elapsed());
+                result.content
+            }
+        };
+
+        Ok(VirtualFsProfileResult {
+            operation: "read_virtual_path".to_string(),
+            path,
+            total_ms: total_started.elapsed().as_millis() as u64,
+            output_bytes: output.len(),
+            steps,
         })
     }
 
@@ -676,6 +838,18 @@ impl TriggerSdk {
                     .ok_or_else(|| anyhow!("Created json_object entry '{}' was not found after insertion", entry_id))?;
                 let entry_path = format!("/collection/{collection_uuid}/things/{thing_uuid}/entries.{entry_index}");
 
+                tracing::info!(
+                    device_id,
+                    thing_uuid,
+                    collection_uuid,
+                    entry_id,
+                    entry_index,
+                    entry_path,
+                    has_initial_content = content.is_some(),
+                    title = title.unwrap_or(""),
+                    "create_tool created json_object entry"
+                );
+
                 (
                     entry_path,
                     entry_id,
@@ -738,12 +912,24 @@ impl TriggerSdk {
 
     fn build_tree_node(&self, device_id: &str, path: &VirtualPath) -> Result<TreeNode> {
         let triggers = self.list_triggers()?;
-        let snapshot = self.things_list_snapshot_lite(device_id)?;
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let tree_data = doc_set.extract_tree_data()?;
+
+        self.build_tree_node_from_tree_data(path, &triggers, &tree_data)
+    }
+
+    fn build_tree_node_from_tree_data(
+        &self,
+        path: &VirtualPath,
+        triggers: &[crate::types::TriggerInfo],
+        tree_data: &crate::things_crdt::ThingsTreeData,
+    ) -> Result<TreeNode> {
+        let index = TreeIndex::build(tree_data);
 
         match path {
             VirtualPath::Root => {
-                let trigger_children = render_trigger_listing(&triggers, true);
-                let collection_children = render_collection_listing(&snapshot, None, true);
+                let trigger_children = render_trigger_listing(triggers, true);
+                let collection_children = render_collection_listing(tree_data, &index, None, true);
                 Ok(TreeNode::with_children(
                     ROOT_PATH,
                     vec![
@@ -752,7 +938,10 @@ impl TriggerSdk {
                     ],
                 ))
             }
-            VirtualPath::TriggerRoot => Ok(TreeNode::with_children("/trigger/", render_trigger_listing(&triggers, false))),
+            VirtualPath::TriggerRoot => Ok(TreeNode::with_children(
+                "/trigger/",
+                render_trigger_listing(triggers, false),
+            )),
             VirtualPath::TriggerDir { trigger_uuid } => {
                 let trigger = self.fetch_trigger_or_err(trigger_uuid, "/trigger")?;
                 Ok(TreeNode::with_children(
@@ -765,31 +954,31 @@ impl TriggerSdk {
             }
             VirtualPath::CollectionRoot => Ok(TreeNode::with_children(
                 "/collection/",
-                render_collection_listing(&snapshot, None, true),
+                render_collection_listing(tree_data, &index, None, true),
             )),
             VirtualPath::CollectionDir { collection_uuid } => Ok(TreeNode::with_children(
                 format!("/collection/{collection_uuid}/"),
-                collection_dir_children(self, device_id, &snapshot, collection_uuid)?,
+                collection_dir_children(tree_data, &index, collection_uuid)?,
             )),
             VirtualPath::CollectionThingsDir { collection_uuid } => Ok(TreeNode::with_children(
                 format!("/collection/{collection_uuid}/things/"),
-                render_collection_listing(&snapshot, Some(collection_uuid.as_str()), true),
+                render_collection_listing(tree_data, &index, Some(collection_uuid.as_str()), true),
             )),
             VirtualPath::ThingDir {
                 collection_uuid,
                 thing_uuid,
             } => Ok(TreeNode::with_children(
                 format!("/collection/{collection_uuid}/things/{thing_uuid}/"),
-                thing_dir_children(self, device_id, &snapshot, collection_uuid, thing_uuid)?,
+                thing_dir_children(tree_data, &index, collection_uuid, thing_uuid)?,
             )),
             VirtualPath::ThingChildrenDir {
                 collection_uuid,
                 thing_uuid,
             } => {
-                let children = child_things(&snapshot, collection_uuid, Some(thing_uuid));
+                let children = index.child_things(collection_uuid, Some(thing_uuid));
                 Ok(TreeNode::with_children(
                     format!("/collection/{collection_uuid}/things/{thing_uuid}/things/"),
-                    render_thing_nodes(&children, &snapshot),
+                    render_thing_nodes(&children, &index),
                 ))
             }
             _ => Err(friendly_anyhow(
@@ -1059,15 +1248,36 @@ impl TriggerSdk {
         collection_uuid: &str,
         thing_uuid: &str,
     ) -> Result<String> {
-        let markdown = self
-            .things_get_thing_markdown(device_id, thing_uuid)?
-            .unwrap_or_default();
-        let entries = self.things_get_content_entries(device_id, thing_uuid)?;
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        self.render_thing_content_from_doc_set(&doc_set, collection_uuid, thing_uuid)
+    }
+
+    fn render_thing_content_from_doc_set(
+        &self,
+        doc_set: &crate::things_crdt::ThingsDocumentSet,
+        collection_uuid: &str,
+        thing_uuid: &str,
+    ) -> Result<String> {
+        let collection = doc_set.collection_view(collection_uuid)?;
+        let thing = collection
+            .things
+            .iter()
+            .find(|thing| {
+                thing.id == thing_uuid
+                    && !thing
+                        .tombstone
+                        .as_ref()
+                        .map(|tombstone| tombstone.deleted)
+                        .unwrap_or(false)
+            })
+            .ok_or_else(|| anyhow!("Thing not found: {}", thing_uuid))?;
+
+        let markdown = doc_set.get_thing_markdown_text(thing_uuid)?.unwrap_or_default();
         Ok(rewrite_embedded_entry_references(
             &markdown,
             collection_uuid,
             thing_uuid,
-            &entries,
+            &thing.built_in.content_entries,
         ))
     }
 
@@ -1183,6 +1393,17 @@ impl TriggerSdk {
         self.register_trigger(registration)?;
         Ok(())
     }
+}
+
+fn push_profile_step(
+    steps: &mut Vec<VirtualFsProfileStep>,
+    name: &str,
+    elapsed: std::time::Duration,
+) {
+    steps.push(VirtualFsProfileStep {
+        name: name.to_string(),
+        elapsed_ms: elapsed.as_millis() as u64,
+    });
 }
 
 fn normalize_path(path: &str) -> Result<String> {
@@ -1337,11 +1558,12 @@ fn render_trigger_listing(triggers: &[crate::types::TriggerInfo], limit_preview:
 }
 
 fn render_collection_listing(
-    snapshot: &crate::things_crdt::ThingsSnapshotState,
+    tree_data: &crate::things_crdt::ThingsTreeData,
+    index: &TreeIndex<'_>,
     collection_filter: Option<&str>,
     root_only: bool,
 ) -> Vec<TreeNode> {
-    snapshot
+    tree_data
         .collections
         .iter()
         .filter(|collection| collection_filter.is_none_or(|value| value == collection.uuid))
@@ -1350,10 +1572,8 @@ fn render_collection_listing(
                 TreeNode::new(format!("name [value=\"{}\"]", collection.title)),
                 TreeNode::new(format!("trigger [value=\"{}\"]", collection.trigger_uuid.clone().unwrap_or_default())),
             ];
-            let thing_nodes = render_thing_nodes(
-                &child_things(snapshot, &collection.uuid, None),
-                snapshot,
-            );
+            let child_things = index.child_things(&collection.uuid, None);
+            let thing_nodes = render_thing_nodes(&child_things, index);
             if root_only || !thing_nodes.is_empty() {
                 children.push(TreeNode::with_children("things/", thing_nodes));
             }
@@ -1366,32 +1586,31 @@ fn render_collection_listing(
 }
 
 fn collection_dir_children(
-    sdk: &TriggerSdk,
-    device_id: &str,
-    snapshot: &crate::things_crdt::ThingsSnapshotState,
+    tree_data: &crate::things_crdt::ThingsTreeData,
+    index: &TreeIndex<'_>,
     collection_uuid: &str,
 ) -> Result<Vec<TreeNode>> {
-    let collection = snapshot
-        .collections
-        .iter()
-        .find(|item| item.uuid == collection_uuid)
+    let collection = index
+        .collection(collection_uuid)
         .ok_or_else(|| friendly_anyhow(
             &format!("/collection/{collection_uuid}"),
             "collection_not_found",
             &format!("Collection '{}' was not found.", collection_uuid),
         ))?;
 
+    let root_things = index.child_things(collection_uuid, None);
+
     Ok(vec![
         TreeNode::new(format!("name [value=\"{}\"]", collection.title)),
         TreeNode::new(format!("trigger [value=\"{}\"]", collection.trigger_uuid.clone().unwrap_or_default())),
         TreeNode::with_children(
             "things/",
-            render_thing_nodes(&child_things(snapshot, collection_uuid, None), snapshot)
+            render_thing_nodes(&root_things, index)
                 .into_iter()
                 .map(|mut node| {
                     if node.children.is_empty() {
                         if let Some(thing_uuid) = extract_uuid_from_dir_label(&node.label) {
-                            if let Ok(children) = thing_dir_children(sdk, device_id, snapshot, collection_uuid, &thing_uuid) {
+                            if let Ok(children) = thing_dir_children(tree_data, index, collection_uuid, &thing_uuid) {
                                 node.children = children;
                             }
                         }
@@ -1404,23 +1623,19 @@ fn collection_dir_children(
 }
 
 fn thing_dir_children(
-    sdk: &TriggerSdk,
-    device_id: &str,
-    snapshot: &crate::things_crdt::ThingsSnapshotState,
+    _tree_data: &crate::things_crdt::ThingsTreeData,
+    index: &TreeIndex<'_>,
     collection_uuid: &str,
     thing_uuid: &str,
 ) -> Result<Vec<TreeNode>> {
-    let thing = snapshot
-        .things
-        .iter()
-        .find(|item| item.uuid == thing_uuid && item.collection_uuid == collection_uuid)
+    let thing = index
+        .thing(collection_uuid, thing_uuid)
         .ok_or_else(|| friendly_anyhow(
             &format!("/collection/{collection_uuid}/things/{thing_uuid}"),
             "thing_not_found",
             &format!("Thing '{}' was not found in collection '{}'.", thing_uuid, collection_uuid),
         ))?;
 
-    let entries = sdk.things_get_content_entries(device_id, thing_uuid).unwrap_or_default();
     let mut children = vec![
         TreeNode::new(format!("name [value=\"{}\"]", thing.title)),
         TreeNode::new(format!("trigger [value=\"{}\"]", thing.trigger_uuid.clone().unwrap_or_default())),
@@ -1429,7 +1644,8 @@ fn thing_dir_children(
     ];
 
     children.extend(
-        entries
+        thing
+            .entries
             .iter()
             .enumerate()
             .flat_map(|(index, entry)| {
@@ -1442,36 +1658,20 @@ fn thing_dir_children(
             }),
     );
 
-    let thing_children = child_things(snapshot, collection_uuid, Some(thing_uuid));
+    let thing_children = index.child_things(collection_uuid, Some(thing_uuid));
     if !thing_children.is_empty() {
         children.push(TreeNode::with_children(
             "things/",
-            render_thing_nodes(&thing_children, snapshot),
+            render_thing_nodes(&thing_children, index),
         ));
     }
 
     Ok(children)
 }
 
-fn child_things(
-    snapshot: &crate::things_crdt::ThingsSnapshotState,
-    collection_uuid: &str,
-    parent_uuid: Option<&str>,
-) -> Vec<crate::things_crdt::ThingEntry> {
-    snapshot
-        .things
-        .iter()
-        .filter(|thing| {
-            thing.collection_uuid == collection_uuid
-                && thing.parent_uuid.as_deref() == parent_uuid
-        })
-        .cloned()
-        .collect()
-}
-
 fn render_thing_nodes(
-    things: &[crate::things_crdt::ThingEntry],
-    snapshot: &crate::things_crdt::ThingsSnapshotState,
+    things: &[&crate::things_crdt::TreeThingData],
+    index: &TreeIndex<'_>,
 ) -> Vec<TreeNode> {
     things
         .iter()
@@ -1483,10 +1683,7 @@ fn render_thing_nodes(
                 )),
                 thing_status_node(&thing.status),
             ];
-            let has_children = snapshot.things.iter().any(|candidate| {
-                candidate.collection_uuid == thing.collection_uuid
-                    && candidate.parent_uuid.as_deref() == Some(thing.uuid.as_str())
-            });
+            let has_children = index.has_children(&thing.collection_uuid, &thing.uuid);
             if has_children {
                 children.push(TreeNode::new("things/"));
             }

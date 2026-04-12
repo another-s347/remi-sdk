@@ -19,7 +19,7 @@ const MANAGED_EXTERNAL_TOOL_NAMES: &[&str] = &[
     "edit_path_tool",
     "delete_path_tool",
     "move_path_tool",
-    "resolve_uri",
+    "fetch",
     "retrieve_events",
     "abstract_events",
 ];
@@ -175,13 +175,13 @@ fn nullable_str(description: &str) -> JsonValue {
     json!({ "type": ["string", "null"], "description": description })
 }
 
-fn resolve_uri() -> JsonValue {
+fn fetch() -> JsonValue {
     tool(
-        "resolve_uri",
-        "Fetch a URL or remi:// URI and return structured metadata or image content. Supports http/https URLs and remi://file URIs.",
+        "fetch",
+        "Fetch a URL, local file path, or remi:// URI and return Markdown-first content, metadata, or direct image content.",
         obj(
             json!({
-                "uri": str_prop("URL or URI to resolve. Accepts http/https URLs and remi://file/<path>?type=<mime> URIs.")
+                "uri": str_prop("URL, local file path, file:// URL, or remi:// URI to fetch. Accepts http/https URLs, absolute or relative local paths, file:// URLs, and remi://file/<path>?type=<mime> URIs.")
             }),
             &["uri"],
         ),
@@ -364,7 +364,7 @@ fn ask_tool_definitions() -> Vec<JsonValue> {
         ls_tool(),
         cat_tool(),
         tree_tool(),
-        resolve_uri(),
+        fetch(),
         retrieve_events(),
         abstract_events(),
     ]
@@ -381,7 +381,7 @@ fn manager_tool_definitions() -> Vec<JsonValue> {
         edit_path_tool(),
         delete_path_tool(),
         move_path_tool(),
-        resolve_uri(),
+        fetch(),
         retrieve_events(),
         abstract_events(),
     ]

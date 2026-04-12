@@ -14,6 +14,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+const CRDT_DOCUMENTS_REVISION_KEY: &str = "crdt_documents_revision";
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -69,6 +71,20 @@ pub struct Storage {
 }
 
 impl Storage {
+    fn bump_internal_kv_counter_tx(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        tx.execute(
+            r#"INSERT INTO internal_kv (key, value, updated_at)
+               VALUES (?1, '1', ?2)
+               ON CONFLICT(key) DO UPDATE SET
+                 value = CAST(CAST(COALESCE(NULLIF(internal_kv.value, ''), '0') AS INTEGER) + 1 AS TEXT),
+                 updated_at = excluded.updated_at"#,
+            params![key, now],
+        )
+        .with_context(|| format!("Failed to bump internal_kv counter for key '{key}'"))?;
+        Ok(())
+    }
+
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -83,6 +99,10 @@ impl Storage {
         let conn = storage.connection()?;
         storage.bootstrap(&conn)?;
         Ok(storage)
+    }
+
+    pub(crate) fn cache_namespace(&self) -> String {
+        self.db_path.to_string_lossy().into_owned()
     }
 
     fn connection(&self) -> Result<Connection> {
@@ -591,6 +611,15 @@ impl Storage {
             params![key, value, now],
         )?;
         Ok(())
+    }
+
+    pub fn get_crdt_documents_revision(&self) -> Result<u64> {
+        match self.get_internal_kv(CRDT_DOCUMENTS_REVISION_KEY)? {
+            Some(value) => value
+                .parse::<u64>()
+                .with_context(|| format!("Invalid CRDT documents revision value: {value}")),
+            None => Ok(0),
+        }
     }
 
     pub fn delete_internal_kv(&self, key: &str) -> Result<()> {
@@ -1427,9 +1456,10 @@ impl Storage {
         #[cfg(test)]
         TEST_CRDT_DOCUMENT_SAVE.fetch_add(1, Ordering::Relaxed);
 
-        let conn = self.connection()?;
+        let mut conn = self.connection()?;
         let now = Utc::now().timestamp();
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             r#"INSERT INTO crdt_documents (uuid, data_type, automerge_doc, sync_state, dirty, last_sync_at, created_at, updated_at)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
                ON CONFLICT(uuid, data_type) DO UPDATE SET
@@ -1449,6 +1479,21 @@ impl Storage {
             ],
         )
         .context("Failed to save crdt document")?;
+        Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
+        tx.commit()?;
+        let revision = self.get_crdt_documents_revision()?;
+        let namespace = self.cache_namespace();
+        crate::crdt_cache::upsert_document(
+            &namespace,
+            revision,
+            uuid,
+            data_type,
+            automerge_doc,
+            sync_state,
+            dirty,
+            last_sync_at,
+        );
+        crate::crdt_cache::invalidate_namespace_revision_older_than(&namespace, revision);
         Ok(())
     }
 
@@ -1510,34 +1555,88 @@ impl Storage {
         Ok(rows)
     }
 
+    pub fn list_crdt_documents(&self) -> Result<Vec<CrdtDocumentRow>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT uuid, data_type, automerge_doc, sync_state, dirty, last_sync_at, created_at, updated_at
+               FROM crdt_documents"#,
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CrdtDocumentRow {
+                    uuid: row.get(0)?,
+                    data_type: row.get(1)?,
+                    automerge_doc: row.get(2)?,
+                    sync_state: row.get(3)?,
+                    dirty: row.get::<_, i64>(4)? != 0,
+                    last_sync_at: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list crdt documents")?;
+        Ok(rows)
+    }
+
     /// Mark a CRDT document as dirty
     pub fn set_crdt_document_dirty(&self, uuid: &str, data_type: &str, dirty: bool) -> Result<()> {
-        let conn = self.connection()?;
+        let mut conn = self.connection()?;
         let now = Utc::now().timestamp();
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE crdt_documents SET dirty = ?1, updated_at = ?2 WHERE uuid = ?3 AND data_type = ?4",
             params![if dirty { 1 } else { 0 }, now, uuid, data_type],
         )
         .context("Failed to set crdt document dirty")?;
+        Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
+        tx.commit()?;
+        let revision = self.get_crdt_documents_revision()?;
+        let namespace = self.cache_namespace();
+        if let Some(row) = self.get_crdt_document(uuid, data_type)? {
+            crate::crdt_cache::upsert_document(
+                &namespace,
+                revision,
+                &row.uuid,
+                &row.data_type,
+                &row.automerge_doc,
+                &row.sync_state,
+                row.dirty,
+                row.last_sync_at.as_deref(),
+            );
+        }
+        crate::crdt_cache::invalidate_namespace_revision_older_than(&namespace, revision);
         Ok(())
     }
 
     /// Delete a CRDT document
     pub fn delete_crdt_document(&self, uuid: &str, data_type: &str) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute(
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM crdt_documents WHERE uuid = ?1 AND data_type = ?2",
             params![uuid, data_type],
         )
         .context("Failed to delete crdt document")?;
+        Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
+        tx.commit()?;
+        let revision = self.get_crdt_documents_revision()?;
+        let namespace = self.cache_namespace();
+        crate::crdt_cache::remove_document(&namespace, revision, uuid, data_type);
+        crate::crdt_cache::invalidate_namespace_revision_older_than(&namespace, revision);
         Ok(())
     }
 
     /// Delete all CRDT documents (used during bootstrap reset)
     pub fn delete_all_crdt_documents(&self) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute("DELETE FROM crdt_documents", [])
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM crdt_documents", [])
             .context("Failed to delete all crdt documents")?;
+        Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
+        tx.commit()?;
+        let revision = self.get_crdt_documents_revision()?;
+        crate::crdt_cache::invalidate_namespace_revision_older_than(&self.cache_namespace(), revision);
         Ok(())
     }
 

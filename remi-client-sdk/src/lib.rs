@@ -6,6 +6,7 @@ pub mod chat_client;
 pub mod chat_runtime;
 pub mod chat_types;
 mod context_prompt;
+mod crdt_cache;
 pub mod crdt_sync;
 pub mod data_lifecycle;
 pub mod events_events;
@@ -16,6 +17,8 @@ mod local_wasm;
 pub mod location_service;
 pub mod profile;
 pub mod push_tokens;
+#[cfg(feature = "quickjs")]
+pub mod quickjs;
 pub mod realtime;
 pub mod remi_uri;
 mod runtime;
@@ -53,6 +56,11 @@ pub use external_tools::ExternalToolExecutor;
 pub use location_service::{
     LocationService, LocationServiceError, haversine_distance, is_within_range,
 };
+#[cfg(feature = "quickjs")]
+pub use quickjs::{
+    QuickJsSmokeError, QuickJsSmokeOutput, quickjs_smoke_eval,
+    register_quickjs_external_tools,
+};
 pub use profile::{AvatarUploadInfo, MediaUploadInfo, ProfileClient, ProfileInfo};
 pub use realtime::{RealtimeConfig, RemiRealtimeEvent, SupabaseRealtimeManager};
 pub use remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
@@ -66,7 +74,8 @@ pub use types::{
     ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict, ThingsUndoConflictType,
     ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption, TriggerExecutionSummary,
     TriggerLogEntry, TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule,
-    TriggerRunType, VirtualFsNodeKind, VirtualFsReadResult,
+    TriggerRunType, VirtualFsNodeKind, VirtualFsProfileResult, VirtualFsProfileStep,
+    VirtualFsReadResult,
 };
 pub use url_handlers::register_url_external_tools;
 

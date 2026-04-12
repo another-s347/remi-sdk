@@ -467,16 +467,38 @@ where
     let mut documents_pulled = 0;
     if effective_mode.allows_server_discovery() && bootstrap_state != LocalBootstrapState::HasSyncedHistory {
         let bootstrap_started_at = Instant::now();
-        let stashed_local_snapshot = sdk
-            .things_bootstrap_stash_local_snapshot_if_needed(device_id)
-            .unwrap_or(false);
+        let had_existing_bootstrap_stash = match sdk.things_bootstrap_has_stash() {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    device_id = device_id,
+                    error = %err,
+                    "Failed to check for existing bootstrap stash; assuming none"
+                );
+                false
+            }
+        };
+        let created_bootstrap_stash = match sdk.things_bootstrap_stash_local_snapshot_if_needed(device_id) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    device_id = device_id,
+                    error = %err,
+                    "Failed to persist bootstrap stash before destructive bootstrap"
+                );
+                false
+            }
+        };
+        let bootstrap_stash_ready = created_bootstrap_stash || had_existing_bootstrap_stash;
         list_keys_calls += 1;
         let server_keys = client.list_crdt_document_keys().await.unwrap_or_default();
         prefetched_server_keys = Some(server_keys.clone());
         tracing::info!(
             device_id = device_id,
             server_doc_count = server_keys.len(),
-            stashed_local_snapshot = stashed_local_snapshot,
+            had_existing_bootstrap_stash = had_existing_bootstrap_stash,
+            created_bootstrap_stash = created_bootstrap_stash,
+            bootstrap_stash_ready = bootstrap_stash_ready,
             "Fetched server keys during bootstrap discovery"
         );
 
@@ -486,6 +508,24 @@ where
                 server_doc_count = server_keys.len(),
                 "First sync detected — pulling server documents before pushing"
             );
+
+            let deleted_local_doc_keys: Vec<String> = never_synced_dirty_keys
+                .iter()
+                .map(|(uuid, data_type)| format!("{}:{}", uuid, data_type))
+                .collect();
+            tracing::info!(
+                device_id = device_id,
+                deleted_local_doc_count = deleted_local_doc_keys.len(),
+                deleted_local_doc_keys = ?deleted_local_doc_keys,
+                "Deleting never-synced local documents before bootstrap pull"
+            );
+
+            if !never_synced_dirty_keys.is_empty() && !bootstrap_stash_ready {
+                anyhow::bail!(
+                    "Refusing destructive bootstrap without a local stash; {} never-synced dirty CRDT documents would be deleted",
+                    never_synced_dirty_keys.len()
+                );
+            }
 
             // Delete never-synced auto-created local docs so that
             // `pull_missing_documents` treats them as missing and downloads
@@ -505,7 +545,7 @@ where
                     list_keys_calls += output.list_keys_calls;
                     observe_sync_timestamp(&mut last_sync_at, output.last_sync_at);
 
-                    if stashed_local_snapshot {
+                    if bootstrap_stash_ready {
                         sdk.things_bootstrap_replay_stash_onto_current_documents(device_id)
                             .context(
                                 "Failed to replay stashed local changes after first-sync bootstrap",
@@ -547,6 +587,14 @@ where
         }
     }
 
+    tracing::info!(
+        device_id = device_id,
+        dirty_root_docs = dirty_root_docs.iter().map(|doc| doc.uuid.clone()).collect::<Vec<_>>().join(","),
+        dirty_collection_docs = dirty_collection_docs.iter().map(|doc| doc.uuid.clone()).collect::<Vec<_>>().join(","),
+        dirty_markdown_docs = dirty_markdown_docs.iter().map(|doc| doc.uuid.clone()).collect::<Vec<_>>().join(","),
+        "Phase 1 dirty document batches prepared"
+    );
+
     for dirty_batch in [dirty_root_docs, dirty_collection_docs, dirty_markdown_docs] {
         let (results, batch_calls) = sync_document_rows_batch(client, device_id, dirty_batch).await;
         phase1_batch_calls += batch_calls;
@@ -554,6 +602,15 @@ where
             match result {
                 Ok(output) => {
                     synced_in_phase1.insert((doc_row.uuid.clone(), doc_row.data_type.clone()));
+                    tracing::info!(
+                        device_id = device_id,
+                        uuid = doc_row.uuid,
+                        data_type = doc_row.data_type,
+                        rpc_rounds = output.rpc_rounds,
+                        server_reply_messages = output.server_reply_messages,
+                        last_sync_at = ?output.last_sync_at,
+                        "Phase 1 synced document"
+                    );
                     sdk.crdt_save_document(
                         &doc_row.uuid,
                         &doc_row.data_type,
@@ -746,11 +803,30 @@ where
         }
 
         for receive_batch in [receive_root_docs, receive_collection_docs, receive_markdown_docs] {
+            let receive_batch_keys = receive_batch
+                .iter()
+                .map(|doc| format!("{}:{}", doc.uuid, doc.data_type))
+                .collect::<Vec<_>>();
+            tracing::info!(
+                device_id = device_id,
+                receive_doc_count = receive_batch_keys.len(),
+                receive_doc_keys = ?receive_batch_keys,
+                "Phase 1b receive batch prepared"
+            );
             let (results, batch_calls) = sync_document_rows_batch(client, device_id, receive_batch).await;
             phase1b_batch_calls += batch_calls;
             for (doc_row, result) in results {
                 match result {
                     Ok(output) => {
+                        tracing::info!(
+                            device_id = device_id,
+                            uuid = doc_row.uuid,
+                            data_type = doc_row.data_type,
+                            rpc_rounds = output.rpc_rounds,
+                            server_reply_messages = output.server_reply_messages,
+                            last_sync_at = ?output.last_sync_at,
+                            "Phase 1b received document updates"
+                        );
                         sdk.crdt_save_document(
                             &doc_row.uuid,
                             &doc_row.data_type,
