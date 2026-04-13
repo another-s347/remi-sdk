@@ -416,6 +416,8 @@ pub struct TriggerExecutionSummary {
     pub fired_at: DateTime<Utc>,
     pub result: bool,
     pub run_type: TriggerRunType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -508,6 +510,40 @@ impl FromStr for NotificationSource {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationResponseAction {
+    Ok,
+    NotRightTime,
+}
+
+impl NotificationResponseAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotificationResponseAction::Ok => "ok",
+            NotificationResponseAction::NotRightTime => "not_right_time",
+        }
+    }
+}
+
+impl fmt::Display for NotificationResponseAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NotificationResponseAction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "ok" => Ok(Self::Ok),
+            "not_right_time" => Ok(Self::NotRightTime),
+            other => Err(format!("Unsupported notification response action '{other}'")),
+        }
+    }
+}
+
 /// A single notification entry persisted in SQLite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationEntry {
@@ -520,6 +556,10 @@ pub struct NotificationEntry {
     /// Main notification body text.
     pub body: String,
     pub is_read: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_action: Option<NotificationResponseAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responded_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 

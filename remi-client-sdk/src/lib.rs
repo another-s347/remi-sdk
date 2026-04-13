@@ -70,11 +70,12 @@ pub use things_handlers::register_things_external_tools;
 pub use trigger_client::{ServerTriggerInfo, TriggerClient};
 pub use types::{
     ChatSession, ChatSessionUpdate, CoordinateSystem, EventPayload, Location, LocationCacheEntry,
-    NotificationEntry, NotificationGroup, NotificationSource, ThingsChangeLogEntry,
-    ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict, ThingsUndoConflictType,
-    ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption, TriggerExecutionSummary,
-    TriggerLogEntry, TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule,
-    TriggerRunType, VirtualFsNodeKind, VirtualFsProfileResult, VirtualFsProfileStep,
+    NotificationEntry, NotificationGroup, NotificationResponseAction, NotificationSource,
+    ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
+    ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview,
+    ThingsUndoResolutionOption, TriggerExecutionSummary, TriggerLogEntry, TriggerLogLevel,
+    TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
+    VirtualFsNodeKind, VirtualFsProfileResult, VirtualFsProfileStep,
     VirtualFsReadResult,
 };
 pub use url_handlers::register_url_external_tools;

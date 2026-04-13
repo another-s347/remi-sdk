@@ -11,10 +11,11 @@ use crate::things_crdt::{
 use crate::things_events::{ThingsDocumentChangeKind, ThingsDocumentEvent, ThingsEvent};
 use crate::trigger_events::TriggerEvent;
 use crate::types::{
-    EventPayload, NotificationSource, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
-    ThingsOperationType, ThingsUndoConflict, ThingsUndoConflictType, ThingsUndoExecution,
-    ThingsUndoPreview, ThingsUndoResolutionOption, TriggerExecutionSummary, TriggerInfo,
-    TriggerLogLevel, TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
+    EventPayload, NotificationResponseAction, NotificationSource, StoredTrigger,
+    ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
+    ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview,
+    ThingsUndoResolutionOption, TriggerExecutionSummary, TriggerInfo, TriggerLogLevel,
+    TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -3471,6 +3472,14 @@ impl TriggerSdk {
         self.storage.mark_notification_read(notification_id)
     }
 
+    pub fn record_notification_response(
+        &self,
+        notification_id: i64,
+        action: NotificationResponseAction,
+    ) -> Result<()> {
+        self.storage.record_notification_response(notification_id, &action)
+    }
+
     pub fn mark_category_notifications_read(&self, category: &str) -> Result<()> {
         self.storage.mark_category_notifications_read(category)
     }
@@ -4150,25 +4159,31 @@ impl TriggerSdk {
         let all_conditions_met = report.overall_result;
 
         // Persist a notification entry when the trigger fires successfully.
-        if all_conditions_met {
+        let notification_id = if all_conditions_met {
             let body = format!(
                 "触发器「{}」已于 {} 触发",
                 trigger.name,
                 fire_time.with_timezone(&default_timezone()).format("%H:%M")
             );
-            if let Err(e) = self.storage.insert_notification(
+            match self.storage.insert_notification(
                 &NotificationSource::Trigger,
                 &trigger.trigger_uuid,
                 &trigger.name,
                 &body,
             ) {
-                warn!(
-                    trigger_id = %trigger.trigger_uuid,
-                    error = %e,
-                    "Failed to persist notification for trigger execution"
-                );
+                Ok(notification_id) => Some(notification_id),
+                Err(e) => {
+                    warn!(
+                        trigger_id = %trigger.trigger_uuid,
+                        error = %e,
+                        "Failed to persist notification for trigger execution"
+                    );
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
 
         Ok(TriggerExecutionSummary {
             trigger_id: trigger.trigger_uuid.clone(),
@@ -4176,6 +4191,7 @@ impl TriggerSdk {
             fired_at: fire_time,
             result: all_conditions_met,
             run_type,
+            notification_id,
         })
     }
 

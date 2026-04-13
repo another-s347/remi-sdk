@@ -1,8 +1,9 @@
 use crate::types::{
     ChatSession, ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow, EventPayload,
-    LocationCacheEntry, NotificationEntry, NotificationGroup, NotificationSource, StoredEvent,
-    StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, TriggerInfo,
-    TriggerLogEntry, TriggerLogLevel, TriggerRegistration, TriggerRunType,
+    LocationCacheEntry, NotificationEntry, NotificationGroup, NotificationResponseAction,
+    NotificationSource, StoredEvent, StoredTrigger, ThingsChangeLogEntry,
+    ThingsContentSnapshot, ThingsOperationType, TriggerInfo, TriggerLogEntry, TriggerLogLevel,
+    TriggerRegistration, TriggerRunType,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -329,6 +330,8 @@ impl Storage {
                 title TEXT NOT NULL,
                 body TEXT NOT NULL,
                 is_read INTEGER NOT NULL DEFAULT 0,
+                response_action TEXT,
+                responded_at INTEGER,
                 created_at INTEGER NOT NULL
             );
 
@@ -373,6 +376,14 @@ impl Storage {
         );
         let _ = conn.execute(
             "ALTER TABLE triggers ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE notifications ADD COLUMN response_action TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE notifications ADD COLUMN responded_at INTEGER",
             [],
         );
 
@@ -963,6 +974,25 @@ impl Storage {
         Ok(conn.last_insert_rowid())
     }
 
+    pub fn record_notification_response(
+        &self,
+        notification_id: i64,
+        action: &NotificationResponseAction,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        let responded_at = Utc::now().timestamp();
+        conn.execute(
+            r#"UPDATE notifications
+               SET response_action = ?1,
+                   responded_at = ?2,
+                   is_read = 1
+               WHERE id = ?3"#,
+            params![action.as_str(), responded_at, notification_id],
+        )
+        .context("Failed to record notification response")?;
+        Ok(())
+    }
+
     /// List notifications grouped by category, ordered by latest first.
     pub fn list_notifications_grouped(&self, limit: u32) -> Result<Vec<NotificationGroup>> {
         let conn = self.connection()?;
@@ -1022,7 +1052,7 @@ impl Storage {
     ) -> Result<Vec<NotificationEntry>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            r#"SELECT id, source, category, title, body, is_read, created_at
+            r#"SELECT id, source, category, title, body, is_read, response_action, responded_at, created_at
                FROM notifications
                WHERE category = ?1
                ORDER BY created_at DESC
@@ -1045,7 +1075,7 @@ impl Storage {
     ) -> Result<Vec<NotificationEntry>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            r#"SELECT id, source, category, title, body, is_read, created_at
+            r#"SELECT id, source, category, title, body, is_read, response_action, responded_at, created_at
                FROM notifications
                ORDER BY created_at DESC
                LIMIT ?1 OFFSET ?2"#,
@@ -1064,7 +1094,7 @@ impl Storage {
         let conn = self.connection()?;
         let entry = conn
             .query_row(
-                r#"SELECT id, source, category, title, body, is_read, created_at
+                r#"SELECT id, source, category, title, body, is_read, response_action, responded_at, created_at
                    FROM notifications
                    WHERE is_read = 0
                    ORDER BY created_at DESC
@@ -1138,7 +1168,13 @@ impl Storage {
         let title: String = row.get(3)?;
         let body: String = row.get(4)?;
         let is_read: bool = row.get::<_, i64>(5)? != 0;
-        let created_ts: i64 = row.get(6)?;
+        let response_action = row
+            .get::<_, Option<String>>(6)?
+            .and_then(|value| NotificationResponseAction::from_str(&value).ok());
+        let responded_at = row
+            .get::<_, Option<i64>>(7)?
+            .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
+        let created_ts: i64 = row.get(8)?;
         let created_at = Utc
             .timestamp_opt(created_ts, 0)
             .single()
@@ -1152,6 +1188,8 @@ impl Storage {
             title,
             body,
             is_read,
+            response_action,
+            responded_at,
             created_at,
         })
     }
