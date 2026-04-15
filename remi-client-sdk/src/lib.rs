@@ -1,6 +1,7 @@
 pub mod app_keys_client;
 pub mod app_update;
 pub mod auth;
+mod action_builtin;
 mod chat_agent;
 pub mod chat_client;
 pub mod chat_runtime;
@@ -15,6 +16,7 @@ mod external_tool_schema;
 pub mod external_tools;
 mod local_wasm;
 pub mod location_service;
+pub mod notification_events;
 pub mod profile;
 pub mod push_tokens;
 #[cfg(feature = "quickjs")]
@@ -62,6 +64,7 @@ pub use quickjs::{
     register_quickjs_external_tools,
 };
 pub use profile::{AvatarUploadInfo, MediaUploadInfo, ProfileClient, ProfileInfo};
+pub use notification_events::NotificationEvent;
 pub use realtime::{RealtimeConfig, RemiRealtimeEvent, SupabaseRealtimeManager};
 pub use remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
 pub use runtime::{NotificationCallback, TriggerCallback, TriggerSdk};
@@ -69,8 +72,10 @@ pub use things_client::ThingsClient;
 pub use things_handlers::register_things_external_tools;
 pub use trigger_client::{ServerTriggerInfo, TriggerClient};
 pub use types::{
+    ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, EntityActionBinding,
     ChatSession, ChatSessionUpdate, CoordinateSystem, EventPayload, Location, LocationCacheEntry,
     NotificationEntry, NotificationGroup, NotificationResponseAction, NotificationSource,
+    ResolvedEntityActionBinding,
     ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
     ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview,
     ThingsUndoResolutionOption, TriggerExecutionSummary, TriggerLogEntry, TriggerLogLevel,

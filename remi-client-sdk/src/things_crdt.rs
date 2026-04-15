@@ -110,6 +110,16 @@ fn strip_internal_timestamp_attrs(attrs: Option<&Value>) -> Option<Value> {
     }
 }
 
+fn extract_collection_card_jsx(attrs: Option<&Value>) -> Option<String> {
+    attrs
+        .and_then(|value| value.as_object())
+        .and_then(|map| map.get("card_jsx"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn merge_entity_timestamps_into_attrs(
     attrs: Option<&Value>,
     created_at: Option<String>,
@@ -188,6 +198,8 @@ pub struct ThingCollectionEntry {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_jsx: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// "user" or "application" — populated from server-side actor metadata cache
@@ -1065,6 +1077,7 @@ pub fn snapshot_from_view_with_options(
             uuid: c.id.clone(),
             title: c.title.clone(),
             trigger_uuid,
+            card_jsx: extract_collection_card_jsx(c.attrs.as_ref()),
             created_at: timestamps.created_at.unwrap_or_default(),
             updated_at: timestamps.updated_at.unwrap_or_default(),
             actor_type: None,
@@ -1103,6 +1116,14 @@ pub fn snapshot_from_view_with_options(
         collections,
         things,
     })
+}
+
+fn normalize_entity_attrs_value(attrs: Option<Value>) -> Option<Value> {
+    match attrs {
+        Some(Value::Object(map)) if map.is_empty() => None,
+        Some(value) => Some(value),
+        None => None,
+    }
 }
 
 /// Check if document is a supported single-document format (v2 or v3 unified)
@@ -1687,6 +1708,7 @@ impl<'a> ThingsDomainReader<'a> {
                 uuid: coll_view.meta.id.clone(),
                 title: coll_view.meta.title.clone(),
                 trigger_uuid,
+                card_jsx: extract_collection_card_jsx(coll_view.meta.attrs.as_ref()),
                 created_at: collection_timestamps.created_at.unwrap_or_default(),
                 updated_at: collection_timestamps.updated_at.unwrap_or_default(),
                 actor_type: None,
@@ -2465,6 +2487,39 @@ impl ThingsDocumentSet {
         Ok(events)
     }
 
+    pub fn update_collection_attrs(
+        &mut self,
+        collection_uuid: &str,
+        attrs: Option<Value>,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let existed = self.collection_is_live(collection_uuid)?;
+        if !existed {
+            anyhow::bail!("Collection not found: {collection_uuid}");
+        }
+
+        let existing_attrs = self.collection_view(collection_uuid)?.meta.attrs;
+        let timestamps = resolve_entity_timestamps(existing_attrs.as_ref(), None, None, true);
+        let normalized_attrs = normalize_entity_attrs_value(attrs);
+        let attrs_json = merge_entity_timestamps_into_attrs(
+            normalized_attrs.as_ref(),
+            timestamps.created_at,
+            timestamps.updated_at,
+        )?;
+
+        self.domain_writer().update_collection_meta(
+            collection_uuid,
+            None,
+            None,
+            TriggerUpdate::Noop,
+            Some(attrs_json),
+        )?;
+
+        Ok(vec![ThingsDocumentEvent::collection(
+            ThingsDocumentChangeKind::Updated,
+            collection_uuid,
+        )])
+    }
+
     /// Upsert a thing in a collection
     pub fn upsert_thing_meta(
         &mut self,
@@ -2539,6 +2594,49 @@ impl ThingsDocumentSet {
             } else {
                 ThingsDocumentChangeKind::Created
             },
+            collection_uuid,
+            thing_uuid,
+        )])
+    }
+
+    pub fn update_thing_attrs(
+        &mut self,
+        collection_uuid: &str,
+        thing_uuid: &str,
+        attrs: Option<Value>,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        let existed = self.thing_is_live_in_collection(collection_uuid, thing_uuid)?;
+        if !existed {
+            anyhow::bail!("Thing not found: {thing_uuid}");
+        }
+
+        let existing_attrs = self
+            .collection_view(collection_uuid)?
+            .things
+            .into_iter()
+            .find(|thing| thing.id == thing_uuid)
+            .and_then(|thing| thing.attrs);
+        let timestamps = resolve_entity_timestamps(existing_attrs.as_ref(), None, None, true);
+        let normalized_attrs = normalize_entity_attrs_value(attrs);
+        let attrs_json = merge_entity_timestamps_into_attrs(
+            normalized_attrs.as_ref(),
+            timestamps.created_at,
+            timestamps.updated_at,
+        )?;
+
+        self.domain_writer().upsert_thing_meta(
+            collection_uuid,
+            thing_uuid,
+            None,
+            None,
+            None,
+            None,
+            TriggerUpdate::Noop,
+            Some(attrs_json),
+        )?;
+
+        Ok(vec![ThingsDocumentEvent::thing(
+            ThingsDocumentChangeKind::Updated,
             collection_uuid,
             thing_uuid,
         )])

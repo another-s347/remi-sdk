@@ -241,6 +241,8 @@ pub struct VirtualFsCreateRequest {
     #[serde(default)]
     pub type_name: String,
     #[serde(default)]
+    pub action_uuid: Option<String>,
+    #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
@@ -658,6 +660,8 @@ mod tests {
             version: "1.0".to_string(),
             precondition: Vec::new(),
             condition: Vec::new(),
+            action_uuid: None,
+            action_args: json!({}),
         })
             .expect("create trigger");
 
@@ -1376,6 +1380,7 @@ impl ExternalToolHandler for VirtualFsCreateHandler {
                 &self.device_id,
                 &req.parent_path,
                 &req.type_name,
+                req.action_uuid.as_deref(),
                 req.title.as_deref(),
                 req.content.as_deref(),
                 req.source_uri.as_deref(),
@@ -1480,6 +1485,8 @@ impl ExternalToolHandler for TriggerRulePublishedHandler {
             version,
             precondition,
             condition,
+            action_uuid: None,
+            action_args: json!({}),
         };
 
         // Bind first; if binding fails we must not register or install the trigger.

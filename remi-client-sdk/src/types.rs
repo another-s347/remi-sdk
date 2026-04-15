@@ -340,6 +340,10 @@ pub struct TriggerRegistration {
     pub version: String,
     pub precondition: Vec<TriggerRule>,
     pub condition: Vec<TriggerRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_uuid: Option<String>,
+    #[serde(default = "default_empty_object")]
+    pub action_args: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +354,112 @@ pub struct StoredTrigger {
     pub precondition_json: String,
     pub condition_json: String,
     pub next_fire: Option<DateTime<Utc>>,
+    pub action_uuid: Option<String>,
+    pub action_args_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionDefinition {
+    pub action_uuid: String,
+    pub name: String,
+    pub title: String,
+    pub description: String,
+    pub version: String,
+    pub category: String,
+    pub enabled: bool,
+    pub metadata_json: Value,
+    pub script_source: String,
+    pub input_schema_json: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema_json: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionInvocationSourceKind {
+    Trigger,
+    CollectionManual,
+    ThingManual,
+    System,
+}
+
+impl ActionInvocationSourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::CollectionManual => "collection_manual",
+            Self::ThingManual => "thing_manual",
+            Self::System => "system",
+        }
+    }
+}
+
+impl fmt::Display for ActionInvocationSourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ActionInvocationSourceKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "trigger" => Ok(Self::Trigger),
+            "collection_manual" => Ok(Self::CollectionManual),
+            "thing_manual" => Ok(Self::ThingManual),
+            "system" => Ok(Self::System),
+            other => Err(format!("Unsupported action invocation source '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionInvocationRecord {
+    pub invocation_uuid: String,
+    pub action_uuid: String,
+    pub source_kind: ActionInvocationSourceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_entity_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_entity_uuid: Option<String>,
+    pub args_json: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_json: Option<Value>,
+    pub console_logs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_json: Option<Value>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EntityActionBinding {
+    pub action_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_override: Option<String>,
+    #[serde(default = "default_empty_object")]
+    pub args_json: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedEntityActionBinding {
+    pub action_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_override: Option<String>,
+    #[serde(default = "default_empty_object")]
+    pub args_json: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_enabled: Option<bool>,
+    #[serde(default)]
+    pub action_missing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -603,6 +713,12 @@ pub struct TriggerInfo {
     /// The UUID of the entity this trigger is currently bound to, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_uuid: Option<String>,
+    /// The UUID of the action bound to this trigger, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_uuid: Option<String>,
+    /// Trigger-owned action invocation arguments.
+    #[serde(default = "default_empty_object")]
+    pub action_args: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -633,6 +749,10 @@ pub struct VirtualFsProfileResult {
     pub total_ms: u64,
     pub output_bytes: usize,
     pub steps: Vec<VirtualFsProfileStep>,
+}
+
+fn default_empty_object() -> Value {
+    Value::Object(Default::default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

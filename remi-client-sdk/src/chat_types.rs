@@ -543,6 +543,13 @@ pub enum ChatRuntimeEvent {
         display_data: JsonValue,
     },
 
+    /// Full pending external-tool execution state for UI flows that need all calls.
+    NeedToolExecution {
+        session_id: String,
+        pending_calls: Vec<PendingToolCall>,
+        pending_tool_execution: PendingToolExecutionState,
+    },
+
     /// Things were modified (for UI refresh)
     ThingsChanged,
 

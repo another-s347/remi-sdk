@@ -10,6 +10,19 @@ use serde_json::{Value as JsonValue, json};
 use crate::external_tool_handler::ExternalToolHandler;
 use crate::external_tools::ExternalToolExecutor;
 
+pub type QuickJsHostHandler = Arc<dyn Fn(JsonValue) -> Result<JsonValue, String> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct QuickJsHostBindings {
+    pub http_request: Option<QuickJsHostHandler>,
+    pub notify_send: Option<QuickJsHostHandler>,
+    pub notify_list: Option<QuickJsHostHandler>,
+    pub notify_mark_read: Option<QuickJsHostHandler>,
+    pub notify_mark_category_read: Option<QuickJsHostHandler>,
+    pub notify_mark_all_read: Option<QuickJsHostHandler>,
+    pub notify_delete_category: Option<QuickJsHostHandler>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuickJsSmokeOutput {
     pub json_result: String,
@@ -78,6 +91,13 @@ pub fn register_quickjs_external_tools(executor: &mut ExternalToolExecutor) {
 }
 
 pub fn quickjs_smoke_eval(script: &str) -> Result<QuickJsSmokeOutput, QuickJsSmokeError> {
+    quickjs_eval_with_bindings(script, QuickJsHostBindings::default())
+}
+
+pub fn quickjs_eval_with_bindings(
+    script: &str,
+    bindings: QuickJsHostBindings,
+) -> Result<QuickJsSmokeOutput, QuickJsSmokeError> {
     let started_at = Instant::now();
     tracing::info!(script_len = script.len(), "[QuickJs] Creating smoke runtime");
 
@@ -91,7 +111,7 @@ pub fn quickjs_smoke_eval(script: &str) -> Result<QuickJsSmokeOutput, QuickJsSmo
     let captured_logs = Arc::new(Mutex::new(Vec::new()));
 
     tracing::info!(script_len = script.len(), "[QuickJs] Starting smoke evaluation");
-    let result = context.with(|ctx| run_eval(ctx, script, Arc::clone(&captured_logs)));
+    let result = context.with(|ctx| run_eval(ctx, script, Arc::clone(&captured_logs), bindings.clone()));
 
     match &result {
         Ok(output) => tracing::info!(
@@ -114,8 +134,10 @@ fn run_eval(
     ctx: Ctx<'_>,
     script: &str,
     captured_logs: Arc<Mutex<Vec<String>>>,
+    bindings: QuickJsHostBindings,
 ) -> Result<QuickJsSmokeOutput, QuickJsSmokeError> {
     install_console(ctx.clone(), Arc::clone(&captured_logs))?;
+    install_host_bindings(ctx.clone(), bindings)?;
 
     let wrapped_script = wrap_smoke_script(script);
     let json_result = ctx.eval::<String, _>(wrapped_script).map_err(|error| {
@@ -160,6 +182,156 @@ fn install_console(ctx: Ctx<'_>, captured_logs: Arc<Mutex<Vec<String>>>) -> Resu
     Ok(())
 }
 
+fn install_host_bindings(ctx: Ctx<'_>, bindings: QuickJsHostBindings) -> Result<(), QuickJsSmokeError> {
+    install_json_host_function(ctx.clone(), "__remi_http_request", bindings.http_request)?;
+    install_json_host_function(ctx.clone(), "__remi_notify_send", bindings.notify_send)?;
+    install_json_host_function(ctx.clone(), "__remi_notify_list", bindings.notify_list)?;
+    install_json_host_function(
+        ctx.clone(),
+        "__remi_notify_mark_read",
+        bindings.notify_mark_read,
+    )?;
+    install_json_host_function(
+        ctx.clone(),
+        "__remi_notify_mark_category_read",
+        bindings.notify_mark_category_read,
+    )?;
+    install_json_host_function(
+        ctx.clone(),
+        "__remi_notify_mark_all_read",
+        bindings.notify_mark_all_read,
+    )?;
+    install_json_host_function(
+        ctx.clone(),
+        "__remi_notify_delete_category",
+        bindings.notify_delete_category,
+    )?;
+
+    ctx.eval::<(), _>(host_shim_script()).map_err(|error| {
+        QuickJsSmokeError::with_exception(
+            format!("failed to install QuickJS host shims: {error}"),
+            capture_exception(ctx.clone(), &error),
+        )
+    })?;
+
+    Ok(())
+}
+
+fn install_json_host_function(
+    ctx: Ctx<'_>,
+    name: &str,
+    handler: Option<QuickJsHostHandler>,
+) -> Result<(), QuickJsSmokeError> {
+    let Some(handler) = handler else {
+        return Ok(());
+    };
+
+    let globals = ctx.globals();
+    let function = Func::new(move |payload_json: String| -> String {
+        let payload = serde_json::from_str::<JsonValue>(&payload_json)
+            .map_err(|error| format!("invalid host payload JSON: {error}"))
+            .and_then(|payload| handler(payload));
+
+        match payload {
+            Ok(value) => json!({ "ok": true, "value": value }).to_string(),
+            Err(error) => json!({ "ok": false, "error": error }).to_string(),
+        }
+    });
+
+    globals.set(name, function).map_err(|error| {
+        QuickJsSmokeError::new(format!("failed to install QuickJS host function '{name}': {error}"))
+    })
+}
+
+fn host_shim_script() -> &'static str {
+    r#"
+const __remiDecodeHostResult = (raw, label) => {
+    let parsed;
+    try {
+        parsed = JSON.parse(String(raw ?? '{"ok":false,"error":"empty host result"}'));
+    } catch (error) {
+        throw new Error(`${label} returned invalid JSON: ${error?.message ?? error}`);
+    }
+
+    if (!parsed || parsed.ok !== true) {
+        throw new Error(`${label} failed: ${parsed?.error ?? 'unknown error'}`);
+    }
+
+    return parsed.value;
+};
+
+if (typeof __remi_http_request === 'function') {
+    globalThis.http = {
+        request(request) {
+            return __remiDecodeHostResult(
+                __remi_http_request(JSON.stringify(request ?? {})),
+                'http.request'
+            );
+        },
+        get(url, options = {}) {
+            return this.request({ ...options, method: 'GET', url });
+        },
+        post(url, options = {}) {
+            return this.request({ ...options, method: 'POST', url });
+        },
+        put(url, options = {}) {
+            return this.request({ ...options, method: 'PUT', url });
+        },
+        patch(url, options = {}) {
+            return this.request({ ...options, method: 'PATCH', url });
+        },
+        delete(url, options = {}) {
+            return this.request({ ...options, method: 'DELETE', url });
+        },
+        head(url, options = {}) {
+            return this.request({ ...options, method: 'HEAD', url });
+        },
+    };
+}
+
+if (typeof __remi_notify_send === 'function') {
+    globalThis.notify = {
+        send(request) {
+            return __remiDecodeHostResult(
+                __remi_notify_send(JSON.stringify(request ?? {})),
+                'notify.send'
+            );
+        },
+        list(request = {}) {
+            return __remiDecodeHostResult(
+                __remi_notify_list(JSON.stringify(request ?? {})),
+                'notify.list'
+            );
+        },
+        markRead(notificationId) {
+            return __remiDecodeHostResult(
+                __remi_notify_mark_read(JSON.stringify({ notificationId })),
+                'notify.markRead'
+            );
+        },
+        markCategoryRead(category) {
+            return __remiDecodeHostResult(
+                __remi_notify_mark_category_read(JSON.stringify({ category })),
+                'notify.markCategoryRead'
+            );
+        },
+        markAllRead() {
+            return __remiDecodeHostResult(
+                __remi_notify_mark_all_read(JSON.stringify({})),
+                'notify.markAllRead'
+            );
+        },
+        deleteCategory(category) {
+            return __remiDecodeHostResult(
+                __remi_notify_delete_category(JSON.stringify({ category })),
+                'notify.deleteCategory'
+            );
+        },
+    };
+}
+"#
+}
+
 fn wrap_smoke_script(script: &str) -> String {
     format!(
         "const __remi_result = (() => {{\n{script}\n}})();\nJSON.stringify(__remi_result ?? null);"
@@ -196,7 +368,12 @@ fn extract_script(payload: &JsonValue) -> Result<&str, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quickjs_smoke_eval, register_quickjs_external_tools};
+    use std::sync::Arc;
+
+    use super::{
+        QuickJsHostBindings, quickjs_eval_with_bindings, quickjs_smoke_eval,
+        register_quickjs_external_tools,
+    };
     use crate::external_tools::{ExternalToolCallRequest, ExternalToolExecutor};
     use serde_json::json;
 
@@ -225,6 +402,86 @@ throw new Error("boom");
 
         assert!(error.message().contains("QuickJS script evaluation failed"));
         assert!(error.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn quickjs_host_http_wrapper_exposes_sync_client() {
+        let output = quickjs_eval_with_bindings(
+            r#"
+const response = http.post("https://example.com/api", {
+    headers: { "x-test": "1" },
+    json: { ping: "pong" },
+    timeoutMs: 1500,
+});
+return {
+    ok: response.ok,
+    status: response.status,
+    echoedMethod: response.echoed.method,
+    echoedUrl: response.echoed.url,
+    echoedBody: response.echoed.json,
+};
+"#,
+            QuickJsHostBindings {
+                http_request: Some(Arc::new(|request| {
+                    Ok(json!({
+                        "ok": true,
+                        "status": 200,
+                        "echoed": request,
+                    }))
+                })),
+                ..QuickJsHostBindings::default()
+            },
+        )
+        .expect("quickjs host http eval should succeed");
+
+        assert_eq!(
+            output.json_result,
+            r#"{"ok":true,"status":200,"echoedMethod":"POST","echoedUrl":"https://example.com/api","echoedBody":{"ping":"pong"}}"#
+        );
+    }
+
+    #[test]
+    fn quickjs_host_notify_wrapper_exposes_notification_controls() {
+        let output = quickjs_eval_with_bindings(
+            r#"
+const sent = notify.send({ title: "Reminder", body: "Stretch", category: "health" });
+const listed = notify.list({ flat: true, limit: 5 });
+const marked = notify.markRead(sent.notification_id);
+const categoryMarked = notify.markCategoryRead("health");
+const allMarked = notify.markAllRead();
+const deleted = notify.deleteCategory("health");
+return { sent, listed, marked, categoryMarked, allMarked, deleted };
+"#,
+            QuickJsHostBindings {
+                notify_send: Some(Arc::new(|request| {
+                    Ok(json!({
+                        "notification_id": 77,
+                        "echoed": request,
+                    }))
+                })),
+                notify_list: Some(Arc::new(|request| {
+                    Ok(json!({
+                        "mode": if request.get("flat").and_then(|value| value.as_bool()).unwrap_or(false) {
+                            "flat"
+                        } else {
+                            "grouped"
+                        },
+                        "items": [{ "id": 77 }],
+                    }))
+                })),
+                notify_mark_read: Some(Arc::new(|request| Ok(request))),
+                notify_mark_category_read: Some(Arc::new(|request| Ok(request))),
+                notify_mark_all_read: Some(Arc::new(|_request| Ok(json!({ "read": true })))),
+                notify_delete_category: Some(Arc::new(|request| Ok(request))),
+                ..QuickJsHostBindings::default()
+            },
+        )
+        .expect("quickjs notify eval should succeed");
+
+        assert!(output.json_result.contains("\"notification_id\":77"));
+        assert!(output.json_result.contains("\"mode\":\"flat\""));
+        assert!(output.json_result.contains("\"category\":\"health\""));
+        assert!(output.json_result.contains("\"read\":true"));
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ fn build_registration(trigger_uuid: &str, name: &str, cron_expr: &str) -> Trigge
             description: "cron".to_string(),
         }],
         condition: Vec::new(),
+        action_uuid: None,
+        action_args: json!({}),
     }
 }
 
@@ -145,6 +147,7 @@ fn virtual_fs_tree_and_read_cover_root_trigger_and_thing_files() -> Result<()> {
     assert!(tree.contains("collection/"));
     assert!(tree.contains("c1/ [name=\"Inbox\"]"));
     assert!(tree.contains("trigger [value=\"tr-1\"]"));
+    assert!(tree.contains("card.jsx"));
     assert!(tree.contains("t1/ [name=\"Buy milk\", status=\"none\"]"));
     assert!(tree.contains("status [value=\"none\"]"));
 
@@ -153,6 +156,9 @@ fn virtual_fs_tree_and_read_cover_root_trigger_and_thing_files() -> Result<()> {
 
     let collection_trigger = sdk.read_virtual_path(device_id, "/collection/c1/trigger")?;
     assert_eq!(collection_trigger.content, "tr-1");
+
+    let collection_card = sdk.read_virtual_path(device_id, "/collection/c1/card.jsx")?;
+    assert_eq!(collection_card.content, "");
 
     let thing_name = sdk.read_virtual_path(device_id, "/collection/c1/things/t1/name")?;
     assert_eq!(thing_name.content, "Buy milk");
@@ -193,6 +199,7 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
 
     sdk.edit_virtual_path(device_id, "/collection/c1/name", "overwrite", Some(&json!("Inbox Renamed")), None, None, None)?;
     sdk.edit_virtual_path(device_id, "/collection/c1/trigger", "overwrite", Some(&json!("tr-3")), None, None, None)?;
+    sdk.edit_virtual_path(device_id, "/collection/c1/card.jsx", "overwrite", Some(&json!("<Card><Text>{thing.title}</Text></Card>")), None, None, None)?;
     sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/name", "overwrite", Some(&json!("Buy oat milk")), None, None, None)?;
     sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/trigger", "overwrite", Some(&json!("")), None, None, None)?;
     sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/status", "overwrite", Some(&json!("done")), None, None, None)?;
@@ -214,6 +221,7 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
 
     assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/name")?.content, "Inbox Renamed");
     assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/trigger")?.content, "tr-3");
+    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/card.jsx")?.content, "<Card><Text>{thing.title}</Text></Card>");
     assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t1/name")?.content, "Buy oat milk");
     assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t1/trigger")?.content, "");
     assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t1/status")?.content, "done");
@@ -252,13 +260,13 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
     sdk.delete_virtual_path(device_id, "/collection/c2/things/t1")?;
     assert!(sdk.things_get_thing_markdown(device_id, "t1")?.is_none());
 
-    let created_collection = sdk.create_virtual_path(device_id, "/collection", "collection", None, None, None, None, Some("c3"))?;
+    let created_collection = sdk.create_virtual_path(device_id, "/collection", "collection", None, None, None, None, None, Some("c3"))?;
     assert_eq!(created_collection["uuid"], json!("c3"));
     assert_eq!(created_collection["path"], json!("/collection/c3"));
     assert!(created_collection.get("scaffold_tree").is_none());
     assert!(created_collection.get("scaffold_paths").is_none());
 
-    let created_thing = sdk.create_virtual_path(device_id, "/collection/c1/things", "thing", Some("Draft"), Some("hello"), None, None, Some("t-new"))?;
+    let created_thing = sdk.create_virtual_path(device_id, "/collection/c1/things", "thing", None, Some("Draft"), Some("hello"), None, None, Some("t-new"))?;
     assert_eq!(created_thing["uuid"], json!("t-new"));
     assert_eq!(created_thing["path"], json!("/collection/c1/things/t-new"));
     assert!(created_thing.get("scaffold_tree").is_none());
@@ -271,6 +279,7 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
         device_id,
         "/collection/c1/things/t-new",
         "image",
+        None,
         Some("Chat Snapshot"),
         None,
         Some(chat_image_uri),
@@ -309,19 +318,19 @@ fn virtual_fs_returns_friendly_errors_for_invalid_and_unsupported_paths() -> Res
         .expect_err("missing collection should fail");
     assert!(err.to_string().contains("collection_not_found"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection/c1", "trigger", Some("Bad Parent"), None, None, None, Some("tr-bad"))
+    let err = sdk.create_virtual_path(device_id, "/collection/c1", "trigger", None, Some("Bad Parent"), None, None, None, Some("tr-bad"))
         .expect_err("trigger create should now fail at type validation");
     assert!(err.to_string().contains("invalid_type"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection", "collection", Some("Bad Bind"), None, None, Some("/collection/c1"), Some("c-bad-bind"))
+    let err = sdk.create_virtual_path(device_id, "/collection", "collection", None, Some("Bad Bind"), None, None, Some("/collection/c1"), Some("c-bad-bind"))
         .expect_err("create_tool bind_path should be rejected");
     assert!(err.to_string().contains("bind_path_unsupported"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection/c1/things/t1", "image", Some("Bad Image"), None, Some("https://example.com/foo.png"), None, Some("entry-bad-image"))
+    let err = sdk.create_virtual_path(device_id, "/collection/c1/things/t1", "image", None, Some("Bad Image"), None, Some("https://example.com/foo.png"), None, Some("entry-bad-image"))
         .expect_err("image create with non-remi uri should fail");
     assert!(err.to_string().contains("invalid_source_uri"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection/c1/things", "image", Some("Bad Parent"), None, Some("remi://remote/chat.png?type=image%2Fpng"), None, Some("entry-bad-parent"))
+    let err = sdk.create_virtual_path(device_id, "/collection/c1/things", "image", None, Some("Bad Parent"), None, Some("remi://remote/chat.png?type=image%2Fpng"), None, Some("entry-bad-parent"))
         .expect_err("image create under things directory should fail");
     assert!(err.to_string().contains("invalid_parent"));
 
@@ -366,6 +375,7 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
         device_id,
         "/collection/c-json/things/t-json",
         "json_object",
+        None,
         Some("Config Data"),
         Some(r#"{"enabled":true}"#),
         None,

@@ -1,5 +1,6 @@
 use crate::context_prompt;
 use crate::events_events::EventsEvent;
+use crate::notification_events::NotificationEvent;
 use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
 use crate::storage::Storage;
 use crate::chat_types::{CachedMessage, ChatProtocolSessionState, ChatSessionExportBundle};
@@ -11,9 +12,10 @@ use crate::things_crdt::{
 use crate::things_events::{ThingsDocumentChangeKind, ThingsDocumentEvent, ThingsEvent};
 use crate::trigger_events::TriggerEvent;
 use crate::types::{
-    EventPayload, NotificationResponseAction, NotificationSource, StoredTrigger,
-    ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
-    ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview,
+    ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, EntityActionBinding,
+    EventPayload, NotificationResponseAction, NotificationSource, ResolvedEntityActionBinding,
+    StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType,
+    ThingsUndoConflict, ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview,
     ThingsUndoResolutionOption, TriggerExecutionSummary, TriggerInfo, TriggerLogLevel,
     TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
 };
@@ -36,6 +38,81 @@ use tracing::{error, info, warn};
 
 mod path_tools;
 pub(crate) use path_tools::VirtualFsCatResult;
+
+const DEFAULT_TRIGGER_NOTIFICATION_ACTION_UUID: &str = "builtin.trigger_notification";
+
+const ENTITY_ACTION_BINDINGS_ATTR_KEY: &str = "action_bindings";
+const COLLECTION_CARD_JSX_ATTR_KEY: &str = "card_jsx";
+#[cfg(feature = "quickjs")]
+const DEFAULT_ACTION_HTTP_TIMEOUT_MS: u64 = 30_000;
+
+fn strip_internal_entity_attrs(attrs: Option<&Value>) -> Value {
+    let mut map = match attrs {
+        Some(Value::Object(existing)) => existing.clone(),
+        _ => serde_json::Map::new(),
+    };
+    map.remove("__remi_created_at");
+    map.remove("__remi_updated_at");
+    Value::Object(map)
+}
+
+fn decode_entity_action_bindings(attrs: Option<&Value>) -> Vec<EntityActionBinding> {
+    attrs
+        .and_then(|value| value.as_object())
+        .and_then(|map| map.get(ENTITY_ACTION_BINDINGS_ATTR_KEY))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<EntityActionBinding>>(value).ok())
+        .unwrap_or_default()
+}
+
+    fn decode_collection_card_jsx(attrs: Option<&Value>) -> Option<String> {
+        attrs
+        .and_then(|value| value.as_object())
+        .and_then(|map| map.get(COLLECTION_CARD_JSX_ATTR_KEY))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    }
+
+fn encode_entity_action_bindings(
+    attrs: Option<&Value>,
+    bindings: &[EntityActionBinding],
+) -> Value {
+    let mut root = match strip_internal_entity_attrs(attrs) {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+
+    if bindings.is_empty() {
+        root.remove(ENTITY_ACTION_BINDINGS_ATTR_KEY);
+    } else {
+        root.insert(
+            ENTITY_ACTION_BINDINGS_ATTR_KEY.to_string(),
+            serde_json::to_value(bindings).unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+    }
+
+    Value::Object(root)
+}
+
+fn encode_collection_card_jsx(attrs: Option<&Value>, card_jsx: Option<&str>) -> Value {
+    let mut root = match strip_internal_entity_attrs(attrs) {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+
+    if let Some(card_jsx) = card_jsx.map(str::trim).filter(|value| !value.is_empty()) {
+        root.insert(
+            COLLECTION_CARD_JSX_ATTR_KEY.to_string(),
+            Value::String(card_jsx.to_string()),
+        );
+    } else {
+        root.remove(COLLECTION_CARD_JSX_ATTR_KEY);
+    }
+
+    Value::Object(root)
+}
 
 const DEFAULT_TIMEZONE_OFFSET: &str = "+08:00";
 
@@ -74,6 +151,393 @@ fn format_offset_seconds(total_seconds: i32) -> String {
     let hours = abs / 3600;
     let minutes = (abs % 3600) / 60;
     format!("{sign}{hours:02}:{minutes:02}")
+}
+
+#[cfg(feature = "quickjs")]
+fn default_action_notification_source(
+    source_kind: &ActionInvocationSourceKind,
+) -> NotificationSource {
+    match source_kind {
+        ActionInvocationSourceKind::Trigger => NotificationSource::Trigger,
+        ActionInvocationSourceKind::CollectionManual
+        | ActionInvocationSourceKind::ThingManual
+        | ActionInvocationSourceKind::System => NotificationSource::System,
+    }
+}
+
+#[cfg(feature = "quickjs")]
+fn parse_notification_source(value: &str) -> Result<NotificationSource> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trigger" => Ok(NotificationSource::Trigger),
+        "push" => Ok(NotificationSource::Push),
+        "system" => Ok(NotificationSource::System),
+        "chat" => Ok(NotificationSource::Chat),
+        other => anyhow::bail!("Unsupported notification source '{other}'"),
+    }
+}
+
+#[cfg(feature = "quickjs")]
+fn action_http_request_handler(action_uuid: String) -> crate::quickjs::QuickJsHostHandler {
+    Arc::new(move |request| {
+        execute_action_http_request(&action_uuid, request).map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn action_notify_send_handler(
+    storage: Storage,
+    notification_event_tx: broadcast::Sender<NotificationEvent>,
+    action_uuid: String,
+    source_kind: ActionInvocationSourceKind,
+) -> crate::quickjs::QuickJsHostHandler {
+    let default_source = default_action_notification_source(&source_kind);
+    Arc::new(move |request| {
+        let result: Result<Value> = (|| {
+            let title = request
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("notify.send requires a non-empty title"))?;
+            let body = request
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+            let category = request
+            .get("category")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("action:{action_uuid}"));
+            let source = request
+            .get("source")
+            .and_then(Value::as_str)
+            .map(parse_notification_source)
+            .transpose()?
+            .unwrap_or_else(|| default_source.clone());
+
+            let notification_id = storage.insert_notification(&source, &category, title, body)?;
+            let _ = notification_event_tx.send(NotificationEvent::Added {
+                notification_id,
+                category: category.clone(),
+                source: source.clone(),
+                title: title.to_string(),
+            });
+            Ok(json!({
+                "notification_id": notification_id,
+                "source": source,
+                "category": category,
+                "title": title,
+                "body": body,
+            }))
+        })();
+
+        result.map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn action_notify_list_handler(storage: Storage) -> crate::quickjs::QuickJsHostHandler {
+    Arc::new(move |request| {
+        let result: Result<Value> = (|| {
+            let limit = request
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .min(u32::MAX as u64) as u32;
+
+            if let Some(category) = request.get("category").and_then(Value::as_str) {
+                let notifications = storage.list_notifications_by_category(category, limit)?;
+                return Ok(json!({
+                    "mode": "category",
+                    "category": category,
+                    "items": notifications,
+                }));
+            }
+
+            if request.get("flat").and_then(Value::as_bool).unwrap_or(false) {
+                let offset = request
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(u32::MAX as u64) as u32;
+                let notifications = storage.list_notifications_flat(limit, offset)?;
+                return Ok(json!({
+                    "mode": "flat",
+                    "offset": offset,
+                    "items": notifications,
+                }));
+            }
+
+            let groups = storage.list_notifications_grouped(limit)?;
+            Ok(json!({
+                "mode": "grouped",
+                "groups": groups,
+            }))
+        })();
+
+        result.map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn action_notify_mark_read_handler(
+    storage: Storage,
+    notification_event_tx: broadcast::Sender<NotificationEvent>,
+) -> crate::quickjs::QuickJsHostHandler {
+    Arc::new(move |request| {
+        let result: Result<Value> = (|| {
+            let notification_id = request
+            .get("notificationId")
+            .or_else(|| request.get("notification_id"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("notify.markRead requires notificationId"))?;
+            storage.mark_notification_read(notification_id)?;
+            let _ = notification_event_tx.send(NotificationEvent::Read { notification_id });
+            Ok(json!({ "notification_id": notification_id, "read": true }))
+        })();
+
+        result.map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn action_notify_mark_category_read_handler(
+    storage: Storage,
+    notification_event_tx: broadcast::Sender<NotificationEvent>,
+) -> crate::quickjs::QuickJsHostHandler {
+    Arc::new(move |request| {
+        let result: Result<Value> = (|| {
+            let category = request
+            .get("category")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("notify.markCategoryRead requires category"))?;
+            storage.mark_category_notifications_read(category)?;
+            let _ = notification_event_tx.send(NotificationEvent::CategoryRead {
+                category: category.to_string(),
+            });
+            Ok(json!({ "category": category, "read": true }))
+        })();
+
+        result.map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn action_notify_mark_all_read_handler(
+    storage: Storage,
+    notification_event_tx: broadcast::Sender<NotificationEvent>,
+) -> crate::quickjs::QuickJsHostHandler {
+    Arc::new(move |_request| {
+        storage.mark_all_notifications_read().map_err(|error| error.to_string())?;
+        let _ = notification_event_tx.send(NotificationEvent::AllRead);
+        Ok(json!({ "read": true }))
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn action_notify_delete_category_handler(
+    storage: Storage,
+    notification_event_tx: broadcast::Sender<NotificationEvent>,
+) -> crate::quickjs::QuickJsHostHandler {
+    Arc::new(move |request| {
+        let result: Result<Value> = (|| {
+            let category = request
+            .get("category")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("notify.deleteCategory requires category"))?;
+            storage.delete_notifications_by_category(category)?;
+            let _ = notification_event_tx.send(NotificationEvent::CategoryDeleted {
+                category: category.to_string(),
+            });
+            Ok(json!({ "category": category, "deleted": true }))
+        })();
+
+        result.map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn execute_action_http_request(action_uuid: &str, request: Value) -> Result<Value> {
+    let request_object = request
+        .as_object()
+        .ok_or_else(|| anyhow!("http.request expects an object payload"))?;
+    let method = request_object
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("GET")
+        .to_ascii_uppercase();
+    let url = request_object
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("http.request requires a non-empty url"))?;
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .with_context(|| format!("Unsupported HTTP method '{method}'"))?;
+    let timeout_ms = request_object
+        .get("timeout_ms")
+        .or_else(|| request_object.get("timeoutMs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_ACTION_HTTP_TIMEOUT_MS);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .user_agent(format!("remi-action/{action_uuid}"))
+        .build()
+        .context("Failed to build action HTTP client")?;
+
+    let mut request_builder = client.request(method.clone(), url);
+
+    if let Some(headers) = request_object.get("headers").and_then(Value::as_object) {
+        for (name, value) in headers {
+            let header_value = match value {
+                Value::String(text) => text.clone(),
+                _ => serde_json::to_string(value)
+                    .context("Failed to serialize HTTP header value")?,
+            };
+            request_builder = request_builder.header(name, header_value);
+        }
+    }
+
+    if let Some(query) = request_object.get("query") {
+        request_builder = request_builder.query(query);
+    }
+
+    let has_json_body = request_object.get("json").is_some();
+    if let Some(json_body) = request_object.get("json") {
+        request_builder = request_builder.json(json_body);
+    } else if let Some(body_base64) = request_object.get("body_base64").and_then(Value::as_str) {
+        let body_bytes = base64::engine::general_purpose::STANDARD
+            .decode(body_base64)
+            .context("Invalid base64 in http.request body_base64")?;
+        request_builder = request_builder.body(body_bytes);
+    } else if let Some(body_text) = request_object
+        .get("body_text")
+        .or_else(|| request_object.get("text"))
+        .and_then(Value::as_str)
+    {
+        request_builder = request_builder.body(body_text.to_string());
+    } else if let Some(body) = request_object.get("body") {
+        match body {
+            Value::String(text) => {
+                request_builder = request_builder.body(text.clone());
+            }
+            _ => {
+                request_builder = request_builder
+                    .body(serde_json::to_vec(body).context("Failed to serialize HTTP body")?);
+                if !has_json_body && request_object.get("headers").is_none() {
+                    request_builder = request_builder.header("content-type", "application/json");
+                }
+            }
+        }
+    }
+
+    let response = request_builder
+        .send()
+        .with_context(|| format!("HTTP request failed for {url}"))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.bytes().context("Failed to read HTTP response body")?;
+    let body_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let body_text = String::from_utf8(bytes.to_vec()).ok();
+    let body_json = body_text
+        .as_ref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+
+    let headers_json = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .map(|text| Value::String(text.to_string()))
+                    .unwrap_or_else(|_| Value::String(String::new())),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+
+    Ok(json!({
+        "ok": status.is_success(),
+        "status": status.as_u16(),
+        "status_text": status.canonical_reason().unwrap_or_default(),
+        "url": url,
+        "method": method.as_str(),
+        "headers": headers_json,
+        "body_text": body_text,
+        "body_json": body_json,
+        "body_base64": body_base64,
+        "content_length": bytes.len(),
+    }))
+}
+
+#[cfg(feature = "quickjs")]
+fn build_action_quickjs_bindings(
+    storage: &Storage,
+    notification_event_tx: &broadcast::Sender<NotificationEvent>,
+    action: &ActionDefinition,
+    execution_input: &Value,
+) -> crate::quickjs::QuickJsHostBindings {
+    let source_kind = execution_input
+        .get("source")
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        .and_then(|value| ActionInvocationSourceKind::from_str(value).ok())
+        .unwrap_or(ActionInvocationSourceKind::System);
+    let storage = storage.clone();
+
+    crate::quickjs::QuickJsHostBindings {
+        http_request: Some(action_http_request_handler(action.action_uuid.clone())),
+        notify_send: Some(action_notify_send_handler(
+            storage.clone(),
+            notification_event_tx.clone(),
+            action.action_uuid.clone(),
+            source_kind.clone(),
+        )),
+        notify_list: Some(action_notify_list_handler(storage.clone())),
+        notify_mark_read: Some(action_notify_mark_read_handler(
+            storage.clone(),
+            notification_event_tx.clone(),
+        )),
+        notify_mark_category_read: Some(action_notify_mark_category_read_handler(
+            storage.clone(),
+            notification_event_tx.clone(),
+        )),
+        notify_mark_all_read: Some(action_notify_mark_all_read_handler(
+            storage.clone(),
+            notification_event_tx.clone(),
+        )),
+        notify_delete_category: Some(action_notify_delete_category_handler(
+            storage,
+            notification_event_tx.clone(),
+        )),
+    }
+}
+
+fn default_trigger_notification_args(trigger: &StoredTrigger, fire_time: DateTime<Utc>) -> Value {
+    json!({
+        "title": trigger.name,
+        "body": format!(
+            "触发器「{}」已于 {} 触发",
+            trigger.name,
+            fire_time.with_timezone(&default_timezone()).format("%H:%M")
+        ),
+        "category": trigger.trigger_uuid,
+        "source": "trigger",
+    })
+}
+
+fn notification_id_from_action_result(result: Option<&Value>) -> Option<i64> {
+    result
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("notification_id"))
+        .and_then(Value::as_i64)
 }
 
 fn parse_event_query_datetime(input: &str, end_of_day: bool) -> Result<DateTime<Utc>> {
@@ -150,20 +614,24 @@ pub struct TriggerSdk {
     things_event_tx: broadcast::Sender<ThingsEvent>,
     trigger_event_tx: broadcast::Sender<TriggerEvent>,
     events_event_tx: broadcast::Sender<EventsEvent>,
+    notification_event_tx: broadcast::Sender<NotificationEvent>,
     realtime: Arc<SupabaseRealtimeManager>,
 }
 
 impl TriggerSdk {
     pub fn initialize(db_path: impl AsRef<Path>) -> Result<Self> {
         let storage = Storage::new(db_path)?;
+        storage.seed_builtin_actions(&crate::action_builtin::builtin_actions())?;
         let (things_event_tx, _rx) = broadcast::channel(2048);
         let (trigger_event_tx, _rx) = broadcast::channel(2048);
         let (events_event_tx, _rx) = broadcast::channel(2048);
+        let (notification_event_tx, _rx) = broadcast::channel(2048);
         Ok(Self {
             storage,
             things_event_tx,
             trigger_event_tx,
             events_event_tx,
+            notification_event_tx,
             realtime: Arc::new(SupabaseRealtimeManager::new()),
         })
     }
@@ -178,6 +646,10 @@ impl TriggerSdk {
 
     pub fn events_subscribe(&self) -> broadcast::Receiver<EventsEvent> {
         self.events_event_tx.subscribe()
+    }
+
+    pub fn notifications_subscribe(&self) -> broadcast::Receiver<NotificationEvent> {
+        self.notification_event_tx.subscribe()
     }
 
     pub fn realtime_manager(&self) -> Arc<SupabaseRealtimeManager> {
@@ -224,6 +696,11 @@ impl TriggerSdk {
         let _ = self.events_event_tx.send(event);
     }
 
+    fn emit_notification_event(&self, event: NotificationEvent) {
+        // Ignore send errors (no active subscribers).
+        let _ = self.notification_event_tx.send(event);
+    }
+
     /// Wipe all local data and broadcast DataWiped events to all streams.
     /// This is the canonical logout path — Flutter notifiers will clear
     /// in-memory state when they receive the DataWiped event.
@@ -232,6 +709,7 @@ impl TriggerSdk {
         self.emit_things_event(ThingsEvent::DataWiped);
         self.emit_trigger_event(TriggerEvent::DataWiped);
         self.emit_events_event(EventsEvent::DataWiped);
+        self.emit_notification_event(NotificationEvent::DataWiped);
         info!("Wiped all local data and notified all event streams");
         Ok(())
     }
@@ -422,6 +900,101 @@ impl TriggerSdk {
         to_string(&triggers).context("Failed to serialize triggers")
     }
 
+    pub fn list_actions(&self) -> Result<Vec<ActionDefinition>> {
+        self.storage.list_actions()
+    }
+
+    pub fn list_actions_json(&self) -> Result<String> {
+        let actions = self.list_actions()?;
+        to_string(&actions).context("Failed to serialize actions")
+    }
+
+    pub fn fetch_action(&self, action_uuid: &str) -> Result<Option<ActionDefinition>> {
+        self.storage.fetch_action(action_uuid)
+    }
+
+    pub fn fetch_action_json(&self, action_uuid: &str) -> Result<Option<String>> {
+        self.fetch_action(action_uuid)?
+            .map(|action| to_string(&action).context("Failed to serialize action"))
+            .transpose()
+    }
+
+    pub fn latest_action_invocation_json(&self, action_uuid: &str) -> Result<Option<String>> {
+        self.storage
+            .latest_action_invocation(action_uuid)?
+            .map(|record| to_string(&record).context("Failed to serialize latest action invocation"))
+            .transpose()
+    }
+
+    pub fn execute_action_now(
+        &self,
+        action_uuid: &str,
+        source_kind: ActionInvocationSourceKind,
+        source_entity_type: Option<&str>,
+        source_entity_uuid: Option<&str>,
+        args_json: Value,
+        device_id: Option<&str>,
+    ) -> Result<ActionInvocationRecord> {
+        let action = self
+            .storage
+            .fetch_action(action_uuid)?
+            .ok_or_else(|| anyhow!("Action not found: {action_uuid}"))?;
+
+        let started_at = Utc::now();
+        let invocation_uuid = uuid::Uuid::new_v4().to_string();
+        let execution_input = json!({
+            "action": {
+                "uuid": action.action_uuid,
+                "name": action.name,
+                "version": action.version,
+            },
+            "source": {
+                "kind": source_kind.as_str(),
+                "entity_type": source_entity_type,
+                "entity_uuid": source_entity_uuid,
+            },
+            "args": args_json,
+            "context": {
+                "device_id": device_id,
+            }
+        });
+
+        let execution_started = std::time::Instant::now();
+        let execution_result = self.run_action_script(&action, &execution_input);
+        let finished_at = Utc::now();
+        let duration_ms = execution_started.elapsed().as_millis() as u64;
+
+        let (result_json, console_logs, error_json) = match execution_result {
+            Ok((result_json, console_logs)) => (Some(result_json), console_logs, None),
+            Err(error) => (
+                None,
+                Vec::new(),
+                Some(json!({
+                    "message": error.to_string(),
+                })),
+            ),
+        };
+
+        let record = ActionInvocationRecord {
+            invocation_uuid,
+            action_uuid: action_uuid.to_string(),
+            source_kind,
+            source_entity_type: source_entity_type.map(|value| value.to_string()),
+            source_entity_uuid: source_entity_uuid.map(|value| value.to_string()),
+            args_json: execution_input.get("args").cloned().unwrap_or(Value::Null),
+            result_json,
+            console_logs,
+            error_json,
+            started_at,
+            finished_at,
+            duration_ms,
+            device_id: device_id.map(|value| value.to_string()),
+        };
+
+        self.storage.insert_action_invocation(&record)?;
+        Ok(record)
+    }
+
     /// Pause or resume a trigger. Returns the updated paused state.
     pub fn set_trigger_paused(&self, trigger_uuid: &str, paused: bool) -> Result<()> {
         self.storage.set_trigger_paused(trigger_uuid, paused)
@@ -596,6 +1169,157 @@ impl TriggerSdk {
         self.emit_document_events(device_id, events);
 
         Ok(())
+    }
+
+    pub fn list_collection_action_bindings(
+        &self,
+        device_id: &str,
+        collection_uuid: &str,
+    ) -> Result<Vec<EntityActionBinding>> {
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let collection = doc_set.collection_view(collection_uuid)?;
+        Ok(decode_entity_action_bindings(collection.meta.attrs.as_ref()))
+    }
+
+    pub fn list_thing_action_bindings(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+    ) -> Result<Vec<EntityActionBinding>> {
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = doc_set
+            .find_thing_collection_uuid(thing_uuid)
+            .ok_or_else(|| anyhow!("Thing not found: {thing_uuid}"))?;
+        let collection = doc_set.collection_view(&collection_uuid)?;
+        let thing = collection
+            .things
+            .into_iter()
+            .find(|item| item.id == thing_uuid)
+            .ok_or_else(|| anyhow!("Thing not found: {thing_uuid}"))?;
+        Ok(decode_entity_action_bindings(thing.attrs.as_ref()))
+    }
+
+    pub fn resolve_collection_action_bindings(
+        &self,
+        device_id: &str,
+        collection_uuid: &str,
+    ) -> Result<Vec<ResolvedEntityActionBinding>> {
+        self.resolve_entity_action_bindings(
+            self.list_collection_action_bindings(device_id, collection_uuid)?,
+        )
+    }
+
+    pub fn resolve_thing_action_bindings(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+    ) -> Result<Vec<ResolvedEntityActionBinding>> {
+        self.resolve_entity_action_bindings(self.list_thing_action_bindings(device_id, thing_uuid)?)
+    }
+
+    pub fn things_set_collection_action_bindings(
+        &self,
+        device_id: &str,
+        collection_uuid: &str,
+        bindings: &[EntityActionBinding],
+    ) -> Result<()> {
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+        let collection = doc_set.collection_view(collection_uuid)?;
+        let attrs = encode_entity_action_bindings(collection.meta.attrs.as_ref(), bindings);
+        let events = doc_set.update_collection_attrs(collection_uuid, Some(attrs))?;
+        doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
+        Ok(())
+    }
+
+    pub fn get_collection_card_jsx(
+        &self,
+        device_id: &str,
+        collection_uuid: &str,
+    ) -> Result<Option<String>> {
+        let doc_set = self.get_or_init_document_set(device_id)?;
+        let collection = doc_set.collection_view(collection_uuid)?;
+        Ok(decode_collection_card_jsx(collection.meta.attrs.as_ref()))
+    }
+
+    pub fn things_set_collection_card_jsx(
+        &self,
+        device_id: &str,
+        collection_uuid: &str,
+        card_jsx: Option<&str>,
+    ) -> Result<()> {
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+        let collection = doc_set.collection_view(collection_uuid)?;
+        let attrs = encode_collection_card_jsx(collection.meta.attrs.as_ref(), card_jsx);
+        let events = doc_set.update_collection_attrs(collection_uuid, Some(attrs))?;
+        doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
+        Ok(())
+    }
+
+    pub fn things_set_thing_action_bindings(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        bindings: &[EntityActionBinding],
+    ) -> Result<()> {
+        let mut doc_set = self.get_or_init_document_set(device_id)?;
+        let collection_uuid = doc_set
+            .find_thing_collection_uuid(thing_uuid)
+            .ok_or_else(|| anyhow!("Thing not found: {thing_uuid}"))?;
+        let collection = doc_set.collection_view(&collection_uuid)?;
+        let thing = collection
+            .things
+            .iter()
+            .find(|item| item.id == thing_uuid)
+            .ok_or_else(|| anyhow!("Thing not found: {thing_uuid}"))?;
+        let attrs = encode_entity_action_bindings(thing.attrs.as_ref(), bindings);
+        let events = doc_set.update_thing_attrs(&collection_uuid, thing_uuid, Some(attrs))?;
+        doc_set.save_dirty_to_storage_with_compaction(&self.storage)?;
+        self.emit_document_events(device_id, events);
+        Ok(())
+    }
+
+    pub fn execute_collection_action_now(
+        &self,
+        device_id: &str,
+        collection_uuid: &str,
+        action_uuid: &str,
+    ) -> Result<ActionInvocationRecord> {
+        let binding = self
+            .list_collection_action_bindings(device_id, collection_uuid)?
+            .into_iter()
+            .find(|item| item.action_uuid == action_uuid)
+            .ok_or_else(|| anyhow!("Collection '{}' is not bound to action '{}'", collection_uuid, action_uuid))?;
+        self.execute_action_now(
+            action_uuid,
+            ActionInvocationSourceKind::CollectionManual,
+            Some("collection"),
+            Some(collection_uuid),
+            binding.args_json,
+            Some(device_id),
+        )
+    }
+
+    pub fn execute_thing_action_now(
+        &self,
+        device_id: &str,
+        thing_uuid: &str,
+        action_uuid: &str,
+    ) -> Result<ActionInvocationRecord> {
+        let binding = self
+            .list_thing_action_bindings(device_id, thing_uuid)?
+            .into_iter()
+            .find(|item| item.action_uuid == action_uuid)
+            .ok_or_else(|| anyhow!("Thing '{}' is not bound to action '{}'", thing_uuid, action_uuid))?;
+        self.execute_action_now(
+            action_uuid,
+            ActionInvocationSourceKind::ThingManual,
+            Some("thing"),
+            Some(thing_uuid),
+            binding.args_json,
+            Some(device_id),
+        )
     }
 
     pub fn build_session_context(
@@ -3469,7 +4193,9 @@ impl TriggerSdk {
     }
 
     pub fn mark_notification_read(&self, notification_id: i64) -> Result<()> {
-        self.storage.mark_notification_read(notification_id)
+        self.storage.mark_notification_read(notification_id)?;
+        self.emit_notification_event(NotificationEvent::Read { notification_id });
+        Ok(())
     }
 
     pub fn record_notification_response(
@@ -3477,19 +4203,34 @@ impl TriggerSdk {
         notification_id: i64,
         action: NotificationResponseAction,
     ) -> Result<()> {
-        self.storage.record_notification_response(notification_id, &action)
+        self.storage.record_notification_response(notification_id, &action)?;
+        self.emit_notification_event(NotificationEvent::Responded {
+            notification_id,
+            action,
+        });
+        Ok(())
     }
 
     pub fn mark_category_notifications_read(&self, category: &str) -> Result<()> {
-        self.storage.mark_category_notifications_read(category)
+        self.storage.mark_category_notifications_read(category)?;
+        self.emit_notification_event(NotificationEvent::CategoryRead {
+            category: category.to_string(),
+        });
+        Ok(())
     }
 
     pub fn mark_all_notifications_read(&self) -> Result<()> {
-        self.storage.mark_all_notifications_read()
+        self.storage.mark_all_notifications_read()?;
+        self.emit_notification_event(NotificationEvent::AllRead);
+        Ok(())
     }
 
     pub fn delete_notifications_by_category(&self, category: &str) -> Result<()> {
-        self.storage.delete_notifications_by_category(category)
+        self.storage.delete_notifications_by_category(category)?;
+        self.emit_notification_event(NotificationEvent::CategoryDeleted {
+            category: category.to_string(),
+        });
+        Ok(())
     }
 
     pub fn run_due_triggers<C>(&self, callback: &C) -> Result<Vec<TriggerExecutionSummary>>
@@ -4158,32 +4899,51 @@ impl TriggerSdk {
 
         let all_conditions_met = report.overall_result;
 
-        // Persist a notification entry when the trigger fires successfully.
-        let notification_id = if all_conditions_met {
-            let body = format!(
-                "触发器「{}」已于 {} 触发",
-                trigger.name,
-                fire_time.with_timezone(&default_timezone()).format("%H:%M")
-            );
-            match self.storage.insert_notification(
-                &NotificationSource::Trigger,
-                &trigger.trigger_uuid,
-                &trigger.name,
-                &body,
-            ) {
-                Ok(notification_id) => Some(notification_id),
-                Err(e) => {
+        let notification_id = None;
+
+        if all_conditions_met {
+            let explicit_action_uuid = trigger.action_uuid.as_deref().filter(|value| !value.is_empty());
+            let action_uuid = explicit_action_uuid.unwrap_or(DEFAULT_TRIGGER_NOTIFICATION_ACTION_UUID);
+            let action_args = if explicit_action_uuid.is_some() {
+                serde_json::from_str::<Value>(&trigger.action_args_json)
+                    .unwrap_or_else(|_| Value::Object(Default::default()))
+            } else {
+                default_trigger_notification_args(trigger, fire_time)
+            };
+
+            match self.execute_action_now(
+                    action_uuid,
+                    ActionInvocationSourceKind::Trigger,
+                    Some("trigger"),
+                    Some(&trigger.trigger_uuid),
+                    action_args,
+                    None,
+                ) {
+                Ok(record) => {
+                    let notification_id = if explicit_action_uuid.is_none() {
+                        notification_id_from_action_result(record.result_json.as_ref())
+                    } else {
+                        None
+                    };
+                    return Ok(TriggerExecutionSummary {
+                        trigger_id: trigger.trigger_uuid.clone(),
+                        name: trigger.name.clone(),
+                        fired_at: fire_time,
+                        result: all_conditions_met,
+                        run_type,
+                        notification_id,
+                    });
+                }
+                Err(error) => {
                     warn!(
                         trigger_id = %trigger.trigger_uuid,
-                        error = %e,
-                        "Failed to persist notification for trigger execution"
+                        action_uuid = %action_uuid,
+                        error = %error,
+                        "Trigger fired but action execution failed"
                     );
-                    None
                 }
             }
-        } else {
-            None
-        };
+        }
 
         Ok(TriggerExecutionSummary {
             trigger_id: trigger.trigger_uuid.clone(),
@@ -4193,6 +4953,60 @@ impl TriggerSdk {
             run_type,
             notification_id,
         })
+    }
+
+    fn run_action_script(
+        &self,
+        action: &ActionDefinition,
+        execution_input: &Value,
+    ) -> Result<(Value, Vec<String>)> {
+        #[cfg(feature = "quickjs")]
+        {
+            let input_json = serde_json::to_string(execution_input)
+                .context("Failed to serialize action execution input")?;
+            let script = format!(
+                "const __remiInput = {input_json};\nconst input = __remiInput;\nconst action = input.action;\nconst source = input.source;\nconst args = input.args;\nconst context = input.context;\n{}",
+                action.script_source
+            );
+            let bindings = build_action_quickjs_bindings(
+                &self.storage,
+                &self.notification_event_tx,
+                action,
+                execution_input,
+            );
+            let output = crate::quickjs::quickjs_eval_with_bindings(&script, bindings)
+                .context("Action QuickJS execution failed")?;
+            let result_json = serde_json::from_str(&output.json_result)
+                .context("Action returned non-JSON result")?;
+            return Ok((result_json, output.console_logs));
+        }
+
+        #[cfg(not(feature = "quickjs"))]
+        {
+            let _ = action;
+            let _ = execution_input;
+            anyhow::bail!("This SDK build does not enable the quickjs feature for actions")
+        }
+    }
+
+    fn resolve_entity_action_bindings(
+        &self,
+        bindings: Vec<EntityActionBinding>,
+    ) -> Result<Vec<ResolvedEntityActionBinding>> {
+        let mut resolved = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let action = self.fetch_action(&binding.action_uuid)?;
+            resolved.push(ResolvedEntityActionBinding {
+                action_uuid: binding.action_uuid,
+                label_override: binding.label_override,
+                args_json: binding.args_json,
+                action_title: action.as_ref().map(|item| item.title.clone()),
+                action_description: action.as_ref().map(|item| item.description.clone()),
+                action_enabled: action.as_ref().map(|item| item.enabled),
+                action_missing: action.is_none(),
+            });
+        }
+        Ok(resolved)
     }
 
     // ===== Chat Session Management =====
@@ -4526,8 +5340,55 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use crate::things_crdt::ThingDatatype;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::str::FromStr;
+    use std::thread;
     use tempfile::tempdir;
+
+    fn seed_test_action(sdk: &TriggerSdk, action_uuid: &str, title: &str, script_source: &str) {
+        sdk.storage
+            .seed_builtin_actions(&[ActionDefinition {
+                action_uuid: action_uuid.to_string(),
+                name: action_uuid.replace('.', "_"),
+                title: title.to_string(),
+                description: format!("Test action for {action_uuid}"),
+                version: "v1".to_string(),
+                category: "test".to_string(),
+                enabled: true,
+                metadata_json: json!({ "builtin": false, "test": true }),
+                script_source: script_source.trim().to_string(),
+                input_schema_json: json!({ "type": "object" }),
+                output_schema_json: Some(json!({ "type": "object" })),
+            }])
+            .expect("seed test action");
+    }
+
+    fn spawn_test_http_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.starts_with("POST /action-test HTTP/1.1"));
+            assert!(request.to_ascii_lowercase().contains("x-test: 1"));
+            assert!(request.contains("{\"ping\":\"pong\"}"));
+
+            let body = r#"{"ok":true,"reply":"ack"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        (format!("http://{addr}/action-test"), handle)
+    }
 
     fn seed_markdown_thing(
         sdk: &TriggerSdk,
@@ -4619,6 +5480,8 @@ mod tests {
                 rule: "true".to_string(),
                 description: "Always true".to_string(),
             }],
+            action_uuid: None,
+            action_args: json!({}),
         })
         .expect("register trigger");
 
@@ -4672,6 +5535,8 @@ mod tests {
                 rule: "true".to_string(),
                 description: "Always true".to_string(),
             }],
+            action_uuid: None,
+            action_args: json!({}),
         })
         .expect("register trigger");
 
@@ -4925,6 +5790,7 @@ mod tests {
                 device_id,
                 &thing_path,
                 "json_object",
+                None,
                 Some("Config"),
                 Some(r#"{"enabled":true,"count":1}"#),
                 None,
@@ -5033,6 +5899,7 @@ mod tests {
                 device_id,
                 &thing_path,
                 "json_object",
+                None,
                 Some("Config"),
                 Some(r#"{"enabled":true}"#),
                 None,
@@ -5257,6 +6124,418 @@ mod tests {
             "enabled": true,
             "count": 2
         }));
+    }
+
+    #[test]
+    fn sdk_seeds_builtin_actions_and_exposes_action_vfs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let actions = sdk.list_actions().expect("list actions");
+
+        assert!(!actions.is_empty());
+        assert_eq!(actions[0].action_uuid, "builtin.echo_json");
+
+        let tree = sdk
+            .tree_virtual_path("device-test", Some("/action"))
+            .expect("tree action root");
+        assert!(tree.contains("builtin.echo_json/"));
+
+        let metadata = sdk
+            .read_virtual_path("device-test", "/action/builtin.echo_json/metadata.json")
+            .expect("read action metadata");
+        assert!(metadata.content.contains("supports_trigger"));
+    }
+
+    #[cfg(feature = "quickjs")]
+    #[test]
+    fn actions_can_use_http_host_api() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let (url, server) = spawn_test_http_server();
+
+        seed_test_action(
+            &sdk,
+            "test.http_client",
+            "HTTP Client Test",
+            r#"
+const response = http.post(args.url, {
+    headers: { "x-test": "1" },
+    json: { ping: "pong" },
+});
+return {
+    ok: response.ok,
+    status: response.status,
+    method: response.method,
+    reply: response.body_json?.reply ?? null,
+};
+"#,
+        );
+
+        let record = sdk
+            .execute_action_now(
+                "test.http_client",
+                ActionInvocationSourceKind::System,
+                None,
+                None,
+                json!({ "url": url }),
+                Some("device-test"),
+            )
+            .expect("execute http action");
+
+        let result = record.result_json.expect("result json");
+        assert_eq!(result.get("ok"), Some(&json!(true)));
+        assert_eq!(result.get("status"), Some(&json!(200)));
+        assert_eq!(result.get("method"), Some(&json!("POST")));
+        assert_eq!(result.get("reply"), Some(&json!("ack")));
+
+        server.join().expect("join test server");
+    }
+
+    #[cfg(feature = "quickjs")]
+    #[test]
+    fn actions_can_send_notifications_and_emit_events() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let mut notification_rx = sdk.notifications_subscribe();
+
+        seed_test_action(
+            &sdk,
+            "test.notify_client",
+            "Notify Test",
+            r#"
+const created = notify.send({
+    title: "Action Reminder",
+    body: args.body,
+    category: "action:test",
+});
+const listed = notify.list({ category: "action:test", limit: 10 });
+return {
+    notificationId: created.notification_id,
+    listedCount: listed.items.length,
+    latestTitle: listed.items[0]?.title ?? null,
+};
+"#,
+        );
+
+        let record = sdk
+            .execute_action_now(
+                "test.notify_client",
+                ActionInvocationSourceKind::System,
+                None,
+                None,
+                json!({ "body": "Stretch now" }),
+                Some("device-test"),
+            )
+            .expect("execute notify action");
+
+        let event = notification_rx.try_recv().expect("notification event");
+        match event {
+            NotificationEvent::Added {
+                category,
+                source,
+                title,
+                ..
+            } => {
+                assert_eq!(category, "action:test");
+                assert_eq!(source, NotificationSource::System);
+                assert_eq!(title, "Action Reminder");
+            }
+            other => panic!("expected added event, got {other:?}"),
+        }
+
+        let result = record.result_json.expect("result json");
+        assert_eq!(result.get("listedCount"), Some(&json!(1)));
+        assert_eq!(result.get("latestTitle"), Some(&json!("Action Reminder")));
+
+        let stored = sdk
+            .storage
+            .list_notifications_by_category("action:test", 10)
+            .expect("stored notifications");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].body, "Stretch now");
+    }
+
+    #[test]
+    fn unbound_trigger_uses_default_notification_action() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let trigger_id = "trigger-default-notify".to_string();
+
+        sdk.register_trigger(TriggerRegistration {
+            trigger_uuid: trigger_id.clone(),
+            name: "Water Plants".to_string(),
+            version: "v1".to_string(),
+            precondition: vec![TriggerRule {
+                rule: "event('ManualTest')".to_string(),
+                description: "manual test timing".to_string(),
+            }],
+            condition: Vec::new(),
+            action_uuid: None,
+            action_args: json!({}),
+        })
+        .expect("register trigger");
+
+        let trigger = sdk
+            .storage
+            .fetch_trigger(&trigger_id)
+            .expect("fetch trigger")
+            .expect("trigger exists");
+        let fire_time = Utc.with_ymd_and_hms(2026, 4, 15, 10, 30, 0).single().unwrap();
+        let summary = sdk
+            .execute_trigger(&trigger, fire_time, TriggerRunType::Manual)
+            .expect("execute trigger");
+
+        assert!(summary.result);
+        assert!(summary.notification_id.is_some());
+
+        let invocation = sdk
+            .storage
+            .latest_action_invocation(DEFAULT_TRIGGER_NOTIFICATION_ACTION_UUID)
+            .expect("latest action invocation")
+            .expect("default notification invocation exists");
+        assert_eq!(invocation.source_kind, ActionInvocationSourceKind::Trigger);
+        assert_eq!(invocation.source_entity_uuid.as_deref(), Some(trigger_id.as_str()));
+
+        let invocation_notification_id = invocation
+            .result_json
+            .as_ref()
+            .and_then(|value| value.get("notification_id"))
+            .and_then(Value::as_i64);
+        assert_eq!(summary.notification_id, invocation_notification_id);
+
+        let notifications = sdk
+            .storage
+            .list_notifications_by_category(&trigger_id, 10)
+            .expect("list notifications");
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].source, NotificationSource::Trigger);
+        assert_eq!(notifications[0].title, "Water Plants");
+        assert_eq!(
+            notifications[0].body,
+            "触发器「Water Plants」已于 18:30 触发"
+        );
+    }
+
+    #[test]
+    fn explicit_trigger_action_overrides_default_notification_action() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let trigger_id = "trigger-custom-action".to_string();
+
+        sdk.register_trigger(TriggerRegistration {
+            trigger_uuid: trigger_id.clone(),
+            name: "Echo Trigger".to_string(),
+            version: "v1".to_string(),
+            precondition: vec![TriggerRule {
+                rule: "event('ManualTest')".to_string(),
+                description: "manual test timing".to_string(),
+            }],
+            condition: Vec::new(),
+            action_uuid: Some("builtin.echo_json".to_string()),
+            action_args: json!({ "scope": "custom-trigger" }),
+        })
+        .expect("register trigger");
+
+        let trigger = sdk
+            .storage
+            .fetch_trigger(&trigger_id)
+            .expect("fetch trigger")
+            .expect("trigger exists");
+        let summary = sdk
+            .execute_trigger(&trigger, Utc::now(), TriggerRunType::Manual)
+            .expect("execute trigger");
+
+        assert!(summary.result);
+        assert_eq!(summary.notification_id, None);
+
+        let notifications = sdk
+            .storage
+            .list_notifications_by_category(&trigger_id, 10)
+            .expect("list notifications");
+        assert!(notifications.is_empty());
+
+        let invocation = sdk
+            .storage
+            .latest_action_invocation("builtin.echo_json")
+            .expect("latest echo invocation")
+            .expect("echo invocation exists");
+        assert_eq!(invocation.source_kind, ActionInvocationSourceKind::Trigger);
+        assert_eq!(invocation.source_entity_uuid.as_deref(), Some(trigger_id.as_str()));
+    }
+
+    #[test]
+    fn collection_and_thing_action_bindings_are_exposed_and_invokable() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+
+        seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
+
+        sdk.things_set_collection_action_bindings(
+            device_id,
+            collection_id,
+            &[EntityActionBinding {
+                action_uuid: "builtin.echo_json".to_string(),
+                label_override: Some("Collection Echo".to_string()),
+                args_json: json!({ "scope": "collection" }),
+            }],
+        )
+        .expect("set collection bindings");
+        sdk.things_set_thing_action_bindings(
+            device_id,
+            thing_id,
+            &[EntityActionBinding {
+                action_uuid: "builtin.echo_json".to_string(),
+                label_override: Some("Thing Echo".to_string()),
+                args_json: json!({ "scope": "thing" }),
+            }],
+        )
+        .expect("set thing bindings");
+
+        let collection_actions = sdk
+            .read_virtual_path(device_id, &format!("/collection/{collection_id}/actions.json"))
+            .expect("read collection actions");
+        assert!(collection_actions.content.contains("Collection Echo"));
+        assert!(collection_actions.content.contains("builtin.echo_json"));
+
+        let thing_actions = sdk
+            .read_virtual_path(
+                device_id,
+                &format!("/collection/{collection_id}/things/{thing_id}/actions.json"),
+            )
+            .expect("read thing actions");
+        assert!(thing_actions.content.contains("Thing Echo"));
+
+        let collection_invocation = sdk
+            .execute_collection_action_now(device_id, collection_id, "builtin.echo_json")
+            .expect("invoke collection action");
+        assert_eq!(collection_invocation.source_kind, ActionInvocationSourceKind::CollectionManual);
+        assert_eq!(collection_invocation.source_entity_uuid.as_deref(), Some(collection_id));
+
+        let thing_invocation = sdk
+            .execute_thing_action_now(device_id, thing_id, "builtin.echo_json")
+            .expect("invoke thing action");
+        assert_eq!(thing_invocation.source_kind, ActionInvocationSourceKind::ThingManual);
+        assert_eq!(thing_invocation.source_entity_uuid.as_deref(), Some(thing_id));
+
+        let latest = sdk
+            .read_virtual_path(device_id, "/action/builtin.echo_json/latest-invocation.json")
+            .expect("latest invocation");
+        assert!(latest.content.contains("thing_manual") || latest.content.contains("collection_manual"));
+    }
+
+    #[test]
+    fn virtual_fs_create_and_edit_support_action_bindings() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sdk.sqlite3");
+        let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+        let device_id = "device-test";
+        let collection_id = "col-test";
+        let thing_id = "thing-test";
+        let trigger_id = "trigger-test";
+
+        seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
+        sdk.register_trigger(TriggerRegistration {
+            trigger_uuid: trigger_id.to_string(),
+            name: "Test Trigger".to_string(),
+            version: "v1".to_string(),
+            precondition: vec![TriggerRule {
+                rule: "true".to_string(),
+                description: "always".to_string(),
+            }],
+            condition: Vec::new(),
+            action_uuid: None,
+            action_args: json!({}),
+        })
+        .expect("register trigger");
+
+        sdk.create_virtual_path(
+            device_id,
+            &format!("/trigger/{trigger_id}"),
+            "action_binding",
+            Some("builtin.echo_json"),
+            None,
+            Some(r#"{"scope":"trigger"}"#),
+            None,
+            None,
+            None,
+        )
+        .expect("create trigger action binding");
+        sdk.create_virtual_path(
+            device_id,
+            &format!("/collection/{collection_id}"),
+            "action_binding",
+            Some("builtin.echo_json"),
+            Some("Collection Echo"),
+            Some(r#"{"scope":"collection"}"#),
+            None,
+            None,
+            None,
+        )
+        .expect("create collection action binding");
+        sdk.create_virtual_path(
+            device_id,
+            &format!("/collection/{collection_id}/things/{thing_id}"),
+            "action_binding",
+            Some("builtin.echo_json"),
+            Some("Thing Echo"),
+            Some(r#"{"scope":"thing"}"#),
+            None,
+            None,
+            None,
+        )
+        .expect("create thing action binding");
+
+        let trigger_action = sdk
+            .read_virtual_path(device_id, &format!("/trigger/{trigger_id}/action.json"))
+            .expect("read trigger action binding");
+        assert!(trigger_action.content.contains("builtin.echo_json"));
+        assert!(trigger_action.content.contains("scope"));
+
+        sdk.edit_virtual_path(
+            device_id,
+            &format!("/collection/{collection_id}/actions.json"),
+            "overwrite",
+            Some(&json!([
+                {
+                    "action_uuid": "builtin.echo_json",
+                    "label_override": "Collection Echo Updated",
+                    "args_json": { "scope": "collection-updated" }
+                }
+            ])),
+            None,
+            None,
+            None,
+        )
+        .expect("edit collection action bindings");
+        sdk.edit_virtual_path(
+            device_id,
+            &format!("/trigger/{trigger_id}/action.json"),
+            "overwrite",
+            Some(&json!(null)),
+            None,
+            None,
+            None,
+        )
+        .expect("clear trigger action binding");
+
+        let updated_collection_actions = sdk
+            .read_virtual_path(device_id, &format!("/collection/{collection_id}/actions.json"))
+            .expect("read updated collection actions");
+        assert!(updated_collection_actions.content.contains("Collection Echo Updated"));
+
+        let cleared_trigger_action = sdk
+            .read_virtual_path(device_id, &format!("/trigger/{trigger_id}/action.json"))
+            .expect("read cleared trigger action binding");
+        assert_eq!(cleared_trigger_action.content.trim(), "null");
     }
 }
 

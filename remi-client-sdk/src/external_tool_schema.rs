@@ -50,8 +50,7 @@ pub(crate) fn normalize_resume_state_tool_definitions(mut state: JsonValue) -> J
         .flatten()
         .filter(|definition| {
             tool_name(definition).is_none_or(|name| {
-                !SUPPRESSED_TOOL_NAMES.contains(&name)
-                    && !MANAGED_EXTERNAL_TOOL_NAMES.contains(&name)
+                !SUPPRESSED_TOOL_NAMES.contains(&name) && !MANAGED_EXTERNAL_TOOL_NAMES.contains(&name)
             })
         })
         .cloned()
@@ -191,10 +190,10 @@ fn fetch() -> JsonValue {
 fn tree_tool() -> JsonValue {
     tool(
         "tree_tool",
-        "Render the virtual Remi filesystem as a Unix tree. The root is '/', with /trigger and /collection subtrees.",
+        "Render the virtual Remi filesystem as a Unix tree. The root is '/', with /trigger, /action, and /collection subtrees.",
         obj(
             json!({
-                "path": nullable_str("Directory path to render. Defaults to '/'. Examples: '/', '/trigger', '/collection/<uuid>', '/collection/<uuid>/things/<thing_uuid>'.")
+                "path": nullable_str("Directory path to render. Defaults to '/'. Examples: '/', '/trigger', '/action', '/collection/<uuid>', '/collection/<uuid>/things/<thing_uuid>'.")
             }),
             &[],
         ),
@@ -204,17 +203,17 @@ fn tree_tool() -> JsonValue {
 fn edit_path_tool() -> JsonValue {
     tool(
         "edit_path_tool",
-        "Edit a file node in the virtual Remi filesystem. For metadata files such as name, trigger, status, and rule.json, omit operation and the tool defaults to overwrite. When editing status, use one of: none, in-progress, stalled, done. content.md supports overwrite, append, str_replace, and insert_at_line.",
+        "Edit a file node in the virtual Remi filesystem. For metadata files such as name, trigger, action.json, actions.json, status, and rule.json, omit operation and the tool defaults to overwrite. When editing status, use one of: none, in-progress, stalled, done. content.md supports overwrite, append, str_replace, and insert_at_line.",
         obj(
             json!({
-                "path": str_prop("Absolute file path to edit, such as '/trigger/<uuid>/name' or '/collection/<collection_uuid>/things/<thing_uuid>/entries.0'."),
+                "path": str_prop("Absolute file path to edit, such as '/trigger/<uuid>/action.json', '/collection/<collection_uuid>/actions.json', or '/collection/<collection_uuid>/things/<thing_uuid>/entries.0'."),
                 "operation": {
                     "type": ["string", "null"],
-                    "description": "Optional edit operation. Omit it for metadata files such as name, trigger, status, and rule.json; they default to 'overwrite'. content.md also supports append, str_replace, and insert_at_line.",
+                    "description": "Optional edit operation. Omit it for metadata files such as name, trigger, action.json, actions.json, status, and rule.json; they default to 'overwrite'. content.md also supports append, str_replace, and insert_at_line.",
                     "enum": ["overwrite", "append", "str_replace", "insert_at_line", null]
                 },
                 "value": {
-                    "description": "Replacement or inserted value. Use a string for name, status, and content.md. Status accepts: none, in-progress, stalled, done. Use an object for rule.json and entries.{idx}."
+                    "description": "Replacement or inserted value. Use a string for name, trigger, status, and content.md. Use null or an object for /trigger/<uuid>/action.json. Use an action binding object or array for actions.json. Status accepts: none, in-progress, stalled, done. Use an object for rule.json and entries.{idx}."
                 },
                 "old_str": nullable_str("Required for str_replace on content.md."),
                 "new_str": nullable_str("Replacement text for str_replace on content.md."),
@@ -230,7 +229,9 @@ fn delete_path_tool() -> JsonValue {
         "delete_path_tool",
         "Delete an entity directory or entry file from the virtual Remi filesystem. Supports trigger directories, collection directories, thing directories, and entries.{idx}.",
         obj(
-            json!({ "path": str_prop("Absolute path to delete. Examples: '/trigger/<uuid>', '/collection/<uuid>', '/collection/<collection_uuid>/things/<thing_uuid>', '/collection/<collection_uuid>/things/<thing_uuid>/entries.0'.") }),
+            json!({
+                "path": str_prop("Absolute path to delete. Examples: '/trigger/<uuid>', '/collection/<uuid>', '/collection/<collection_uuid>/things/<thing_uuid>', '/collection/<collection_uuid>/things/<thing_uuid>/entries.0'.")
+            }),
             &["path"],
         ),
     )
@@ -280,7 +281,7 @@ fn retrieve_events() -> JsonValue {
 fn ls_tool() -> JsonValue {
     tool(
         "ls_tool",
-        "List a directory in the virtual Remi filesystem using the same tree-style output as tree_tool. Supports '/', '/trigger', '/collection', and nested things directories.",
+        "List a directory in the virtual Remi filesystem using the same tree-style output as tree_tool. Supports '/', '/trigger', '/action', '/collection', and nested things directories.",
         obj(
             json!({
                 "path": nullable_str("Directory path to list. Defaults to '/'.")
@@ -306,9 +307,11 @@ fn abstract_events() -> JsonValue {
 fn cat_tool() -> JsonValue {
     tool(
         "cat_tool",
-        "Read a virtual filesystem file. For image entries, cat_tool returns the image directly instead of JSON text. Valid file nodes include trigger name/rule.json and collection or thing name/trigger/status/content.md/entries.{idx}/entries.{idx}.data.json/entries.{idx}.schema.json.",
+        "Read a virtual filesystem file. For image entries, cat_tool returns the image directly instead of JSON text. Valid file nodes include trigger name/rule.json/action.json, action name/metadata.json/input.schema.json/output.schema.json/script.js/latest-invocation.json, and collection or thing name/trigger/actions.json/status/content.md/entries.{idx}/entries.{idx}.data.json/entries.{idx}.schema.json.",
         obj(
-            json!({ "path": str_prop("Absolute file path to read, such as '/trigger/<uuid>/rule.json', '/collection/<collection_uuid>/trigger', '/collection/<collection_uuid>/things/<thing_uuid>/entries.1', or '/collection/<collection_uuid>/things/<thing_uuid>/entries.1.data.json'.") }),
+            json!({
+                "path": str_prop("Absolute file path to read, such as '/trigger/<uuid>/action.json', '/action/<action_uuid>/metadata.json', '/collection/<collection_uuid>/actions.json', '/collection/<collection_uuid>/things/<thing_uuid>/entries.1', or '/collection/<collection_uuid>/things/<thing_uuid>/entries.1.data.json'.")
+            }),
             &["path"],
         ),
     )
@@ -317,18 +320,19 @@ fn cat_tool() -> JsonValue {
 fn create_tool() -> JsonValue {
     tool(
         "create_tool",
-        "Create a new collection, thing, image entry, or json_object entry from a parent path. The tool generates a new UUID automatically and returns the created UUID and path.",
+        "Create a new collection, thing, image entry, json_object entry, or action binding from a parent path. The tool generates a new UUID automatically when creating collections, things, or entries, and returns the created UUID and path.",
         obj(
             json!({
-                "parent_path": str_prop("Parent path. Use '/' or '/collection' for collections. Use '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things' for things. Use '/collection/<collection_uuid>/things/<thing_uuid>' for image or json_object entries."),
+                "parent_path": str_prop("Parent path. Use '/' or '/collection' for collections. Use '/collection/<collection_uuid>/things' or '/collection/<collection_uuid>/things/<thing_uuid>/things' for things. Use '/collection/<collection_uuid>/things/<thing_uuid>' for image, json_object, or thing-level action_binding. Use '/collection/<collection_uuid>' for collection-level action_binding. Use '/trigger/<trigger_uuid>' for trigger action_binding."),
                 "type_name": {
                     "type": "string",
                     "description": "Entity type to create.",
-                    "enum": ["collection", "thing", "image", "json_object"]
+                    "enum": ["collection", "thing", "image", "json_object", "action_binding"]
                 },
-                "title": nullable_str("Optional initial title. Defaults to 'New Collection' or 'New Thing'. For image or json_object entries this becomes the entry title."),
-                "content": nullable_str("Optional initial markdown content for things. For json_object entries this may be a JSON object string used as initial data. Ignored for collections and images."),
-                "source_uri": nullable_str("Required for type='image'. Must be a remi:// URI, typically one of the current chat input image attachments.")
+                "action_uuid": nullable_str("Required for type_name='action_binding'. Names the action to bind, such as 'builtin.echo_json'."),
+                "title": nullable_str("Optional initial title. Defaults to 'New Collection' or 'New Thing'. For image or json_object entries this becomes the entry title. For collection/thing action_binding this becomes label_override."),
+                "content": nullable_str("Optional initial markdown content for things. For json_object entries this may be a JSON object string used as initial data. For action_binding this may be a JSON string used as args_json."),
+                "source_uri": nullable_str("Required for type_name='image'. Must be a remi:// URI, typically one of the current chat input image attachments.")
             }),
             &["parent_path", "type_name"],
         ),

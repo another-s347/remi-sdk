@@ -25,6 +25,8 @@ fn build_registration(trigger_uuid: &str, name: &str, cron_expr: &str) -> Trigge
             description: "cron".to_string(),
         }],
         condition: Vec::new(),
+        action_uuid: None,
+        action_args: json!({}),
     }
 }
 

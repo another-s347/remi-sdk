@@ -2179,6 +2179,10 @@ async fn handle_send_message(
                             session.last_error = None;
                             session.pending_interrupt = Some(pending.clone());
                         }
+                        let pending_tool_execution = s
+                            .sessions
+                            .get(&session_id_clone)
+                            .and_then(|session| session.protocol_state.pending_tool_execution.clone());
                         s.emit_session_status(&session_id_clone);
                         s.emit_event(ChatRuntimeEvent::InterruptPending {
                             session_id: session_id_clone.clone(),
@@ -2186,6 +2190,13 @@ async fn handle_send_message(
                             interrupt_type: pending.interrupt_type,
                             display_data: pending.display_data,
                         });
+                        if let Some(pending_tool_execution) = pending_tool_execution {
+                            s.emit_event(ChatRuntimeEvent::NeedToolExecution {
+                                session_id: session_id_clone.clone(),
+                                pending_calls: pending_tool_execution.pending_calls.clone(),
+                                pending_tool_execution,
+                            });
+                        }
                         should_persist = true;
                     }
                     Err(e) => {
@@ -2376,6 +2387,10 @@ async fn handle_resume(
                             session.last_error = None;
                             session.pending_interrupt = Some(pending.clone());
                         }
+                        let pending_tool_execution = s
+                            .sessions
+                            .get(&session_id_clone)
+                            .and_then(|session| session.protocol_state.pending_tool_execution.clone());
                         s.emit_session_status(&session_id_clone);
                         s.emit_event(ChatRuntimeEvent::InterruptPending {
                             session_id: session_id_clone.clone(),
@@ -2383,6 +2398,13 @@ async fn handle_resume(
                             interrupt_type: pending.interrupt_type,
                             display_data: pending.display_data,
                         });
+                        if let Some(pending_tool_execution) = pending_tool_execution {
+                            s.emit_event(ChatRuntimeEvent::NeedToolExecution {
+                                session_id: session_id_clone.clone(),
+                                pending_calls: pending_tool_execution.pending_calls.clone(),
+                                pending_tool_execution,
+                            });
+                        }
                         should_persist = true;
                     }
                     Err(e) => {

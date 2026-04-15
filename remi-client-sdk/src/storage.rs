@@ -1,9 +1,10 @@
 use crate::types::{
-    ChatSession, ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow, EventPayload,
-    LocationCacheEntry, NotificationEntry, NotificationGroup, NotificationResponseAction,
-    NotificationSource, StoredEvent, StoredTrigger, ThingsChangeLogEntry,
-    ThingsContentSnapshot, ThingsOperationType, TriggerInfo, TriggerLogEntry, TriggerLogLevel,
-    TriggerRegistration, TriggerRunType,
+    ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, ChatSession,
+    ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow, EventPayload, LocationCacheEntry,
+    NotificationEntry, NotificationGroup, NotificationResponseAction, NotificationSource,
+    StoredEvent, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
+    ThingsOperationType, TriggerInfo, TriggerLogEntry, TriggerLogLevel, TriggerRegistration,
+    TriggerRunType,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -141,11 +142,49 @@ impl Storage {
                 version TEXT NOT NULL DEFAULT 'v1',
                 precondition_json TEXT NOT NULL,
                 condition_json TEXT NOT NULL,
+                action_uuid TEXT,
+                action_args_json TEXT NOT NULL DEFAULT '{}',
                 next_fire_utc INTEGER,
                 last_result INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS actions (
+                action_uuid TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                version TEXT NOT NULL,
+                category TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                metadata_json TEXT NOT NULL,
+                script_source TEXT NOT NULL,
+                input_schema_json TEXT NOT NULL,
+                output_schema_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS action_invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_uuid TEXT NOT NULL UNIQUE,
+                action_uuid TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_entity_type TEXT,
+                source_entity_uuid TEXT,
+                args_json TEXT NOT NULL,
+                result_json TEXT,
+                console_logs_json TEXT NOT NULL,
+                error_json TEXT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                device_id TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_action_invocations_action_time
+                ON action_invocations(action_uuid, started_at DESC);
 
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -366,6 +405,11 @@ impl Storage {
             "ALTER TABLE triggers ADD COLUMN condition_json TEXT NOT NULL DEFAULT '{}'",
             [],
         );
+        let _ = conn.execute("ALTER TABLE triggers ADD COLUMN action_uuid TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE triggers ADD COLUMN action_args_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
         let _ = conn.execute(
             "ALTER TABLE triggers ADD COLUMN api_version TEXT NOT NULL DEFAULT 'unknown'",
             [],
@@ -412,6 +456,8 @@ impl Storage {
         // NULL means data was created while not logged in (anonymous).
         let user_id_tables = &[
             "triggers",
+            "actions",
+            "action_invocations",
             "events",
             "preferences",
             "things_state",
@@ -480,6 +526,8 @@ impl Storage {
         let conn = self.connection()?;
         // Order matters for foreign key constraints (children before parents)
         let tables = &[
+            "action_invocations",
+            "actions",
             "chat_messages",
             "chat_sessions",
             "things_content_snapshots",
@@ -520,12 +568,16 @@ impl Storage {
             version,
             precondition,
             condition,
+            action_uuid,
+            action_args,
         } = params;
 
         let precondition_json =
             serde_json::to_string(&precondition).context("Failed to serialize precondition")?;
         let condition_json =
             serde_json::to_string(&condition).context("Failed to serialize condition")?;
+        let action_args_json =
+            serde_json::to_string(&action_args).context("Failed to serialize action args")?;
 
         let now = Utc::now().timestamp();
         let next_fire_ts = next_fire.map(|dt| dt.timestamp());
@@ -535,13 +587,15 @@ impl Storage {
         let conn = self.connection()?;
         conn.execute(
             r#"INSERT INTO triggers
-            (trigger_uuid, name, version, precondition_json, condition_json, next_fire_utc, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            (trigger_uuid, name, version, precondition_json, condition_json, action_uuid, action_args_json, next_fire_utc, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
             ON CONFLICT(trigger_uuid) DO UPDATE SET
                 name = excluded.name,
                 version = excluded.version,
                 precondition_json = excluded.precondition_json,
                 condition_json = excluded.condition_json,
+                action_uuid = excluded.action_uuid,
+                action_args_json = excluded.action_args_json,
                 next_fire_utc = excluded.next_fire_utc,
                 last_result = NULL,
                 updated_at = excluded.updated_at
@@ -552,6 +606,8 @@ impl Storage {
                 version,
                 precondition_json,
                 condition_json,
+                action_uuid,
+                action_args_json,
                 next_fire_ts,
                 now
             ],
@@ -672,7 +728,7 @@ impl Storage {
     pub fn fetch_due_triggers(&self, now: DateTime<Utc>) -> Result<Vec<StoredTrigger>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            r#"SELECT trigger_uuid, name, version, precondition_json, condition_json, next_fire_utc
+                        r#"SELECT trigger_uuid, name, version, precondition_json, condition_json, action_uuid, action_args_json, next_fire_utc
                FROM triggers
                WHERE next_fire_utc IS NOT NULL AND next_fire_utc <= ?1
                  AND (is_paused = 0 OR is_paused IS NULL)
@@ -681,7 +737,7 @@ impl Storage {
         let rows = stmt
             .query_map([now.timestamp()], |row| {
                 let next_fire = row
-                    .get::<_, Option<i64>>(5)?
+                    .get::<_, Option<i64>>(7)?
                     .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
                 Ok(StoredTrigger {
                     trigger_uuid: row.get(0)?,
@@ -689,6 +745,8 @@ impl Storage {
                     version: row.get(2)?,
                     precondition_json: row.get(3)?,
                     condition_json: row.get(4)?,
+                    action_uuid: row.get(5)?,
+                    action_args_json: row.get(6)?,
                     next_fire,
                 })
             })?
@@ -700,7 +758,7 @@ impl Storage {
     pub fn fetch_trigger(&self, trigger_uuid: &str) -> Result<Option<StoredTrigger>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            r#"SELECT trigger_uuid, name, version, precondition_json, condition_json, next_fire_utc
+            r#"SELECT trigger_uuid, name, version, precondition_json, condition_json, action_uuid, action_args_json, next_fire_utc
                FROM triggers
                WHERE trigger_uuid = ?1
                LIMIT 1"#,
@@ -708,7 +766,7 @@ impl Storage {
         let trigger = stmt
             .query_row([trigger_uuid], |row| {
                 let next_fire = row
-                    .get::<_, Option<i64>>(5)?
+                    .get::<_, Option<i64>>(7)?
                     .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
                 Ok(StoredTrigger {
                     trigger_uuid: row.get(0)?,
@@ -716,6 +774,8 @@ impl Storage {
                     version: row.get(2)?,
                     precondition_json: row.get(3)?,
                     condition_json: row.get(4)?,
+                    action_uuid: row.get(5)?,
+                    action_args_json: row.get(6)?,
                     next_fire,
                 })
             })
@@ -1229,8 +1289,8 @@ impl Storage {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
             r#"SELECT t.trigger_uuid, t.name, t.version, t.precondition_json, t.condition_json,
-                      t.next_fire_utc, t.last_result, t.is_paused,
-                      tb.entity_type, tb.entity_uuid
+                 t.next_fire_utc, t.last_result, t.is_paused,
+                 tb.entity_type, tb.entity_uuid, t.action_uuid, t.action_args_json
                FROM triggers t
                LEFT JOIN trigger_bindings tb ON tb.trigger_uuid = t.trigger_uuid
                ORDER BY t.created_at ASC"#,
@@ -1248,6 +1308,9 @@ impl Storage {
 
                 let condition_json: String = row.get(4)?;
                 let condition = serde_json::from_str(&condition_json).unwrap_or_default();
+                let action_args_json: String = row.get(11)?;
+                let action_args = serde_json::from_str(&action_args_json)
+                    .unwrap_or_else(|_| Value::Object(Default::default()));
 
                 Ok(TriggerInfo {
                     trigger_id: row.get(0)?,
@@ -1260,6 +1323,8 @@ impl Storage {
                     is_paused,
                     bind_type: row.get(8)?,
                     bind_uuid: row.get(9)?,
+                    action_uuid: row.get(10)?,
+                    action_args,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1272,8 +1337,8 @@ impl Storage {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
             r#"SELECT t.trigger_uuid, t.name, t.version, t.precondition_json, t.condition_json,
-                      t.next_fire_utc, t.last_result, t.is_paused,
-                      tb.entity_type, tb.entity_uuid
+                 t.next_fire_utc, t.last_result, t.is_paused,
+                 tb.entity_type, tb.entity_uuid, t.action_uuid, t.action_args_json
                FROM triggers t
                LEFT JOIN trigger_bindings tb ON tb.trigger_uuid = t.trigger_uuid
                ORDER BY t.updated_at DESC
@@ -1292,6 +1357,9 @@ impl Storage {
 
                 let condition_json: String = row.get(4)?;
                 let condition = serde_json::from_str(&condition_json).unwrap_or_default();
+                let action_args_json: String = row.get(11)?;
+                let action_args = serde_json::from_str(&action_args_json)
+                    .unwrap_or_else(|_| Value::Object(Default::default()));
 
                 Ok(TriggerInfo {
                     trigger_id: row.get(0)?,
@@ -1304,12 +1372,208 @@ impl Storage {
                     is_paused,
                     bind_type: row.get(8)?,
                     bind_uuid: row.get(9)?,
+                    action_uuid: row.get(10)?,
+                    action_args,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to read trigger list (context prompt)")?;
 
         Ok(triggers)
+    }
+
+    pub fn seed_builtin_actions(&self, actions: &[ActionDefinition]) -> Result<()> {
+        let conn = self.connection()?;
+        let now = Utc::now().timestamp();
+        for action in actions {
+            conn.execute(
+                r#"INSERT INTO actions
+                   (action_uuid, name, title, description, version, category, enabled, metadata_json, script_source, input_schema_json, output_schema_json, created_at, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                   ON CONFLICT(action_uuid) DO UPDATE SET
+                     name = excluded.name,
+                     title = excluded.title,
+                     description = excluded.description,
+                     version = excluded.version,
+                     category = excluded.category,
+                     enabled = excluded.enabled,
+                     metadata_json = excluded.metadata_json,
+                     script_source = excluded.script_source,
+                     input_schema_json = excluded.input_schema_json,
+                     output_schema_json = excluded.output_schema_json,
+                     updated_at = excluded.updated_at"#,
+                params![
+                    &action.action_uuid,
+                    &action.name,
+                    &action.title,
+                    &action.description,
+                    &action.version,
+                    &action.category,
+                    if action.enabled { 1 } else { 0 },
+                    serde_json::to_string(&action.metadata_json)?,
+                    &action.script_source,
+                    serde_json::to_string(&action.input_schema_json)?,
+                    action.output_schema_json.as_ref().map(serde_json::to_string).transpose()?,
+                    now,
+                ],
+            )
+            .context("Failed to seed builtin action")?;
+        }
+        Ok(())
+    }
+
+    pub fn list_actions(&self) -> Result<Vec<ActionDefinition>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT action_uuid, name, title, description, version, category, enabled,
+                      metadata_json, script_source, input_schema_json, output_schema_json
+               FROM actions
+               ORDER BY created_at ASC"#,
+        )?;
+
+        let actions = stmt
+            .query_map([], |row| {
+                let metadata_json: String = row.get(7)?;
+                let input_schema_json: String = row.get(9)?;
+                let output_schema_json: Option<String> = row.get(10)?;
+
+                Ok(ActionDefinition {
+                    action_uuid: row.get(0)?,
+                    name: row.get(1)?,
+                    title: row.get(2)?,
+                    description: row.get(3)?,
+                    version: row.get(4)?,
+                    category: row.get(5)?,
+                    enabled: row.get::<_, i64>(6)? != 0,
+                    metadata_json: serde_json::from_str(&metadata_json)
+                        .unwrap_or_else(|_| Value::Object(Default::default())),
+                    script_source: row.get(8)?,
+                    input_schema_json: serde_json::from_str(&input_schema_json)
+                        .unwrap_or_else(|_| Value::Object(Default::default())),
+                    output_schema_json: output_schema_json
+                        .and_then(|value| serde_json::from_str(&value).ok()),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to read action list")?;
+
+        Ok(actions)
+    }
+
+    pub fn fetch_action(&self, action_uuid: &str) -> Result<Option<ActionDefinition>> {
+        let conn = self.connection()?;
+        let action = conn
+            .query_row(
+                r#"SELECT action_uuid, name, title, description, version, category, enabled,
+                          metadata_json, script_source, input_schema_json, output_schema_json
+                   FROM actions
+                   WHERE action_uuid = ?1
+                   LIMIT 1"#,
+                params![action_uuid],
+                |row| {
+                    let metadata_json: String = row.get(7)?;
+                    let input_schema_json: String = row.get(9)?;
+                    let output_schema_json: Option<String> = row.get(10)?;
+                    Ok(ActionDefinition {
+                        action_uuid: row.get(0)?,
+                        name: row.get(1)?,
+                        title: row.get(2)?,
+                        description: row.get(3)?,
+                        version: row.get(4)?,
+                        category: row.get(5)?,
+                        enabled: row.get::<_, i64>(6)? != 0,
+                        metadata_json: serde_json::from_str(&metadata_json)
+                            .unwrap_or_else(|_| Value::Object(Default::default())),
+                        script_source: row.get(8)?,
+                        input_schema_json: serde_json::from_str(&input_schema_json)
+                            .unwrap_or_else(|_| Value::Object(Default::default())),
+                        output_schema_json: output_schema_json
+                            .and_then(|value| serde_json::from_str(&value).ok()),
+                    })
+                },
+            )
+            .optional()
+            .context("Failed to fetch action by uuid")?;
+        Ok(action)
+    }
+
+    pub fn insert_action_invocation(&self, record: &ActionInvocationRecord) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"INSERT INTO action_invocations
+               (invocation_uuid, action_uuid, source_kind, source_entity_type, source_entity_uuid,
+                args_json, result_json, console_logs_json, error_json, started_at, finished_at,
+                duration_ms, device_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+            params![
+                &record.invocation_uuid,
+                &record.action_uuid,
+                record.source_kind.as_str(),
+                &record.source_entity_type,
+                &record.source_entity_uuid,
+                serde_json::to_string(&record.args_json)?,
+                record.result_json.as_ref().map(serde_json::to_string).transpose()?,
+                serde_json::to_string(&record.console_logs)?,
+                record.error_json.as_ref().map(serde_json::to_string).transpose()?,
+                record.started_at.timestamp(),
+                record.finished_at.timestamp(),
+                i64::try_from(record.duration_ms).unwrap_or(i64::MAX),
+                &record.device_id,
+            ],
+        )
+        .context("Failed to insert action invocation")?;
+        Ok(())
+    }
+
+    pub fn latest_action_invocation(&self, action_uuid: &str) -> Result<Option<ActionInvocationRecord>> {
+        let conn = self.connection()?;
+        let record = conn
+            .query_row(
+                r#"SELECT invocation_uuid, action_uuid, source_kind, source_entity_type, source_entity_uuid,
+                          args_json, result_json, console_logs_json, error_json, started_at, finished_at,
+                          duration_ms, device_id
+                   FROM action_invocations
+                   WHERE action_uuid = ?1
+                   ORDER BY started_at DESC
+                   LIMIT 1"#,
+                params![action_uuid],
+                |row| {
+                    let args_json: String = row.get(5)?;
+                    let result_json: Option<String> = row.get(6)?;
+                    let console_logs_json: String = row.get(7)?;
+                    let error_json: Option<String> = row.get(8)?;
+                    let started_at = row.get::<_, i64>(9)?;
+                    let finished_at = row.get::<_, i64>(10)?;
+                    let source_kind_raw: String = row.get(2)?;
+                    let source_kind = ActionInvocationSourceKind::from_str(&source_kind_raw)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                Type::Text,
+                                Box::new(io::Error::new(io::ErrorKind::InvalidData, error)),
+                            )
+                        })?;
+                    Ok(ActionInvocationRecord {
+                        invocation_uuid: row.get(0)?,
+                        action_uuid: row.get(1)?,
+                        source_kind,
+                        source_entity_type: row.get(3)?,
+                        source_entity_uuid: row.get(4)?,
+                        args_json: serde_json::from_str(&args_json)
+                            .unwrap_or_else(|_| Value::Object(Default::default())),
+                        result_json: result_json.and_then(|value| serde_json::from_str(&value).ok()),
+                        console_logs: serde_json::from_str(&console_logs_json).unwrap_or_default(),
+                        error_json: error_json.and_then(|value| serde_json::from_str(&value).ok()),
+                        started_at: Utc.timestamp_opt(started_at, 0).single().unwrap_or_else(Utc::now),
+                        finished_at: Utc.timestamp_opt(finished_at, 0).single().unwrap_or_else(Utc::now),
+                        duration_ms: row.get::<_, i64>(11)?.max(0) as u64,
+                        device_id: row.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .context("Failed to fetch latest action invocation")?;
+        Ok(record)
     }
 
     fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {

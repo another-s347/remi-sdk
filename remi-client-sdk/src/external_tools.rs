@@ -167,6 +167,7 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
         "cat_tool" => merge_tool_payload("virtual_fs_cat_request", arguments),
         "create_tool" => merge_tool_payload("virtual_fs_create_request", arguments),
         "tree_tool" => merge_tool_payload("virtual_fs_tree_request", arguments),
+        "preview_card" => merge_tool_payload("rendera_preview_card", arguments),
         "read_path_tool" => merge_tool_payload("virtual_fs_cat_request", arguments),
         "add_things_tool" => merge_tool_payload("things_thing_added", arguments),
         "edit_path_tool" => merge_tool_payload("virtual_fs_edit_request", arguments),

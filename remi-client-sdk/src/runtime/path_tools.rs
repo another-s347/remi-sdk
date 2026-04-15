@@ -4,7 +4,7 @@ use crate::things_crdt::{
     ThingDatatype, ThingUpsert,
 };
 use crate::types::{
-    TriggerRegistration, TriggerRule, VirtualFsNodeKind, VirtualFsProfileResult,
+    EntityActionBinding, TriggerRegistration, TriggerRule, VirtualFsNodeKind, VirtualFsProfileResult,
     VirtualFsProfileStep, VirtualFsReadResult,
 };
 use anyhow::{Context, Result, anyhow};
@@ -14,6 +14,7 @@ use std::time::Instant;
 
 const ROOT_PATH: &str = "/";
 const TRIGGER_PREVIEW_LIMIT: usize = 5;
+const ACTION_PREVIEW_LIMIT: usize = 5;
 const ENTRY_REFERENCE_SCHEME: &str = "remi-entry://";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,14 +24,26 @@ enum VirtualPath {
     TriggerDir { trigger_uuid: String },
     TriggerName { trigger_uuid: String },
     TriggerRule { trigger_uuid: String },
+    TriggerAction { trigger_uuid: String },
+    ActionRoot,
+    ActionDir { action_uuid: String },
+    ActionName { action_uuid: String },
+    ActionMetadata { action_uuid: String },
+    ActionInputSchema { action_uuid: String },
+    ActionOutputSchema { action_uuid: String },
+    ActionScript { action_uuid: String },
+    ActionLatestInvocation { action_uuid: String },
     CollectionRoot,
     CollectionDir { collection_uuid: String },
     CollectionName { collection_uuid: String },
     CollectionTriggerUuid { collection_uuid: String },
+    CollectionCardJsx { collection_uuid: String },
+    CollectionActions { collection_uuid: String },
     CollectionThingsDir { collection_uuid: String },
     ThingDir { collection_uuid: String, thing_uuid: String },
     ThingName { collection_uuid: String, thing_uuid: String },
     ThingTriggerUuid { collection_uuid: String, thing_uuid: String },
+    ThingActions { collection_uuid: String, thing_uuid: String },
     ThingStatus { collection_uuid: String, thing_uuid: String },
     ThingContent { collection_uuid: String, thing_uuid: String },
     ThingEntry { collection_uuid: String, thing_uuid: String, index: usize },
@@ -168,6 +181,10 @@ impl TriggerSdk {
         let triggers = self.list_triggers()?;
         push_profile_step(&mut steps, "list_triggers", triggers_started.elapsed());
 
+        let actions_started = Instant::now();
+        let actions = self.list_actions()?;
+        push_profile_step(&mut steps, "list_actions", actions_started.elapsed());
+
         let load_started = Instant::now();
         let doc_set = self.get_or_init_document_set(device_id)?;
         push_profile_step(&mut steps, "load_document_set", load_started.elapsed());
@@ -177,7 +194,7 @@ impl TriggerSdk {
         push_profile_step(&mut steps, "extract_tree_data", tree_data_started.elapsed());
 
         let render_started = Instant::now();
-        let node = self.build_tree_node_from_tree_data(&parsed, &triggers, &tree_data)?;
+        let node = self.build_tree_node_from_tree_data(&parsed, &triggers, &actions, &tree_data)?;
         let rendered = render_tree(&node);
         push_profile_step(&mut steps, "render_tree", render_started.elapsed());
 
@@ -276,6 +293,20 @@ impl TriggerSdk {
         let operation = normalize_operation(operation);
 
         let result = match parsed {
+            VirtualPath::ActionRoot
+            | VirtualPath::ActionDir { .. }
+            | VirtualPath::ActionName { .. }
+            | VirtualPath::ActionMetadata { .. }
+            | VirtualPath::ActionInputSchema { .. }
+            | VirtualPath::ActionOutputSchema { .. }
+            | VirtualPath::ActionScript { .. }
+            | VirtualPath::ActionLatestInvocation { .. } => {
+                return Err(friendly_anyhow(
+                    &path,
+                    "read_only_action_path",
+                    "The /action subtree is read-only in v1.",
+                ));
+            }
             VirtualPath::TriggerName { ref trigger_uuid } => {
                 let new_name = value
                     .and_then(JsonValue::as_str)
@@ -296,6 +327,38 @@ impl TriggerSdk {
                     "path": path,
                     "message": format!("Updated trigger rule for '{}'", trigger_uuid),
                     "value": rule,
+                })
+            }
+            VirtualPath::TriggerAction { ref trigger_uuid } => {
+                let binding = parse_trigger_action_binding_value(&path, value)?;
+                self.update_trigger_action(trigger_uuid, binding.as_ref())?;
+                json!({
+                    "ok": true,
+                    "path": path,
+                    "message": format!("Updated trigger action binding for '{}'", trigger_uuid),
+                    "value": binding,
+                })
+            }
+            VirtualPath::CollectionActions { ref collection_uuid } => {
+                let bindings = parse_entity_action_bindings_value(&path, value)?;
+                self.things_set_collection_action_bindings(device_id, collection_uuid, &bindings)?;
+                json!({
+                    "ok": true,
+                    "path": path,
+                    "message": format!("Updated collection action bindings for '{}'", collection_uuid),
+                    "value": bindings,
+                })
+            }
+            VirtualPath::CollectionCardJsx { ref collection_uuid } => {
+                let card_jsx = value
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| friendly_anyhow(&path, "invalid_value", "Editing collection card.jsx requires a string value. Use an empty string to clear the template."))?;
+                self.things_set_collection_card_jsx(device_id, collection_uuid, Some(card_jsx))?;
+                json!({
+                    "ok": true,
+                    "path": path,
+                    "message": format!("Updated collection card JSX for '{}'", collection_uuid),
+                    "value": card_jsx,
                 })
             }
             VirtualPath::CollectionName { ref collection_uuid } => {
@@ -352,6 +415,16 @@ impl TriggerSdk {
                     "path": path,
                     "message": format!("Updated thing trigger binding for '{}'", thing_uuid),
                     "value": trigger_uuid,
+                })
+            }
+            VirtualPath::ThingActions { ref thing_uuid, .. } => {
+                let bindings = parse_entity_action_bindings_value(&path, value)?;
+                self.things_set_thing_action_bindings(device_id, thing_uuid, &bindings)?;
+                json!({
+                    "ok": true,
+                    "path": path,
+                    "message": format!("Updated thing action bindings for '{}'", thing_uuid),
+                    "value": bindings,
                 })
             }
             VirtualPath::ThingStatus { ref thing_uuid, .. } => {
@@ -428,6 +501,23 @@ impl TriggerSdk {
         let parsed = parse_virtual_path(&path)?;
 
         let result = match parsed {
+            VirtualPath::ActionRoot
+            | VirtualPath::ActionDir { .. }
+            | VirtualPath::ActionName { .. }
+            | VirtualPath::ActionMetadata { .. }
+            | VirtualPath::ActionInputSchema { .. }
+            | VirtualPath::ActionOutputSchema { .. }
+            | VirtualPath::ActionScript { .. }
+            | VirtualPath::ActionLatestInvocation { .. }
+            | VirtualPath::TriggerAction { .. }
+            | VirtualPath::CollectionActions { .. }
+            | VirtualPath::ThingActions { .. } => {
+                return Err(friendly_anyhow(
+                    &path,
+                    "read_only_action_path",
+                    "The /action subtree is read-only in v1.",
+                ));
+            }
             VirtualPath::TriggerDir { ref trigger_uuid } => {
                 let deleted = self.delete_trigger_and_bindings(device_id, trigger_uuid)?;
                 json!({
@@ -497,6 +587,7 @@ impl TriggerSdk {
             | VirtualPath::CollectionRoot
             | VirtualPath::CollectionName { .. }
             | VirtualPath::CollectionTriggerUuid { .. }
+            | VirtualPath::CollectionCardJsx { .. }
             | VirtualPath::CollectionThingsDir { .. }
             | VirtualPath::ThingName { .. }
             | VirtualPath::ThingTriggerUuid { .. }
@@ -631,6 +722,7 @@ impl TriggerSdk {
         device_id: &str,
         parent_path: &str,
         kind: &str,
+        action_uuid: Option<&str>,
         title: Option<&str>,
         content: Option<&str>,
         source_uri: Option<&str>,
@@ -659,6 +751,11 @@ impl TriggerSdk {
                 "source_uri is only supported when create_tool type is 'image'.",
             ));
         }
+
+        let normalized_action_uuid = action_uuid
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
 
         let (created_path, created_uuid, extra) = match (kind.as_str(), parent) {
             ("collection", VirtualPath::Root | VirtualPath::CollectionRoot) => {
@@ -739,6 +836,108 @@ impl TriggerSdk {
                     format!("/collection/{collection_uuid}/things/{thing_uuid}"),
                     thing_uuid,
                     JsonValue::Null,
+                )
+            }
+            (
+                "action_binding",
+                VirtualPath::TriggerDir { trigger_uuid },
+            ) => {
+                let action_uuid = normalized_action_uuid.clone().ok_or_else(|| {
+                    friendly_anyhow(
+                        &parent_path,
+                        "missing_action_uuid",
+                        "Creating an action binding requires action_uuid.",
+                    )
+                })?;
+                let existing = self.fetch_trigger_or_err(&trigger_uuid, &parent_path)?;
+                if existing.action_uuid.as_deref().filter(|value| !value.is_empty()).is_some() {
+                    return Err(friendly_anyhow(
+                        &parent_path,
+                        "trigger_action_exists",
+                        "Trigger already has an action binding. Use edit_path_tool on action.json to replace it.",
+                    ));
+                }
+                let args_json = parse_action_args_json(&parent_path, content)?;
+                self.update_trigger_action(&trigger_uuid, Some(&(action_uuid.clone(), args_json.clone())))?;
+                (
+                    format!("/trigger/{trigger_uuid}/action.json"),
+                    action_uuid.clone(),
+                    json!({
+                        "trigger_uuid": trigger_uuid,
+                        "action_uuid": action_uuid,
+                        "args_json": args_json,
+                    }),
+                )
+            }
+            (
+                "action_binding",
+                VirtualPath::CollectionDir { collection_uuid },
+            ) => {
+                let action_uuid = normalized_action_uuid.clone().ok_or_else(|| {
+                    friendly_anyhow(
+                        &parent_path,
+                        "missing_action_uuid",
+                        "Creating an action binding requires action_uuid.",
+                    )
+                })?;
+                let mut bindings = self.list_collection_action_bindings(device_id, &collection_uuid)?;
+                if bindings.iter().any(|binding| binding.action_uuid == action_uuid) {
+                    return Err(friendly_anyhow(
+                        &parent_path,
+                        "duplicate_action_binding",
+                        "Collection already has this action binding. Use edit_path_tool on actions.json to update it.",
+                    ));
+                }
+                let binding = EntityActionBinding {
+                    action_uuid: action_uuid.clone(),
+                    label_override: title.map(ToString::to_string),
+                    args_json: parse_action_args_json(&parent_path, content)?,
+                };
+                bindings.push(binding.clone());
+                self.things_set_collection_action_bindings(device_id, &collection_uuid, &bindings)?;
+                (
+                    format!("/collection/{collection_uuid}/actions.json"),
+                    action_uuid.clone(),
+                    json!({
+                        "collection_uuid": collection_uuid,
+                        "binding": binding,
+                    }),
+                )
+            }
+            (
+                "action_binding",
+                VirtualPath::ThingDir { collection_uuid, thing_uuid },
+            ) => {
+                let action_uuid = normalized_action_uuid.clone().ok_or_else(|| {
+                    friendly_anyhow(
+                        &parent_path,
+                        "missing_action_uuid",
+                        "Creating an action binding requires action_uuid.",
+                    )
+                })?;
+                let mut bindings = self.list_thing_action_bindings(device_id, &thing_uuid)?;
+                if bindings.iter().any(|binding| binding.action_uuid == action_uuid) {
+                    return Err(friendly_anyhow(
+                        &parent_path,
+                        "duplicate_action_binding",
+                        "Thing already has this action binding. Use edit_path_tool on actions.json to update it.",
+                    ));
+                }
+                let binding = EntityActionBinding {
+                    action_uuid: action_uuid.clone(),
+                    label_override: title.map(ToString::to_string),
+                    args_json: parse_action_args_json(&parent_path, content)?,
+                };
+                bindings.push(binding.clone());
+                self.things_set_thing_action_bindings(device_id, &thing_uuid, &bindings)?;
+                (
+                    format!("/collection/{collection_uuid}/things/{thing_uuid}/actions.json"),
+                    action_uuid.clone(),
+                    json!({
+                        "collection_uuid": collection_uuid,
+                        "thing_uuid": thing_uuid,
+                        "binding": binding,
+                    }),
                 )
             }
             (
@@ -887,11 +1086,18 @@ impl TriggerSdk {
                     "json_object entries can only be created under a thing directory such as '/collection/{collection_uuid}/things/{thing_uuid}'.",
                 ));
             }
+            ("action_binding", _) => {
+                return Err(friendly_anyhow(
+                    &parent_path,
+                    "invalid_parent",
+                    "action_binding can only be created under '/trigger/{trigger_uuid}', '/collection/{collection_uuid}', or '/collection/{collection_uuid}/things/{thing_uuid}'.",
+                ));
+            }
             _ => {
                 return Err(friendly_anyhow(
                     &parent_path,
                     "invalid_type",
-                    "create_tool type must be 'collection', 'thing', 'image', or 'json_object'. Use create_trigger or create_timer_trigger for triggers.",
+                    "create_tool type must be 'collection', 'thing', 'image', 'json_object', or 'action_binding'. Use create_trigger or create_timer_trigger for trigger creation.",
                 ));
             }
         };
@@ -912,16 +1118,18 @@ impl TriggerSdk {
 
     fn build_tree_node(&self, device_id: &str, path: &VirtualPath) -> Result<TreeNode> {
         let triggers = self.list_triggers()?;
+        let actions = self.list_actions()?;
         let doc_set = self.get_or_init_document_set(device_id)?;
         let tree_data = doc_set.extract_tree_data()?;
 
-        self.build_tree_node_from_tree_data(path, &triggers, &tree_data)
+        self.build_tree_node_from_tree_data(path, &triggers, &actions, &tree_data)
     }
 
     fn build_tree_node_from_tree_data(
         &self,
         path: &VirtualPath,
         triggers: &[crate::types::TriggerInfo],
+        actions: &[crate::types::ActionDefinition],
         tree_data: &crate::things_crdt::ThingsTreeData,
     ) -> Result<TreeNode> {
         let index = TreeIndex::build(tree_data);
@@ -934,6 +1142,7 @@ impl TriggerSdk {
                     ROOT_PATH,
                     vec![
                         TreeNode::with_children("trigger/", trigger_children),
+                        TreeNode::with_children("action/", render_action_listing(actions, true)),
                         TreeNode::with_children("collection/", collection_children),
                     ],
                 ))
@@ -944,11 +1153,34 @@ impl TriggerSdk {
             )),
             VirtualPath::TriggerDir { trigger_uuid } => {
                 let trigger = self.fetch_trigger_or_err(trigger_uuid, "/trigger")?;
+                let mut children = vec![
+                    TreeNode::new(format!("name [value=\"{}\"]", trigger.name)),
+                    TreeNode::new("rule.json"),
+                ];
+                children.push(TreeNode::new(format!(
+                    "action.json [value=\"{}\"]",
+                    trigger.action_uuid.clone().unwrap_or_default()
+                )));
                 Ok(TreeNode::with_children(
                     format!("/trigger/{trigger_uuid}/"),
+                    children,
+                ))
+            }
+            VirtualPath::ActionRoot => Ok(TreeNode::with_children(
+                "/action/",
+                render_action_listing(actions, false),
+            )),
+            VirtualPath::ActionDir { action_uuid } => {
+                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                Ok(TreeNode::with_children(
+                    format!("/action/{action_uuid}/"),
                     vec![
-                        TreeNode::new(format!("name [value=\"{}\"]", trigger.name)),
-                        TreeNode::new("rule.json"),
+                        TreeNode::new(format!("name [value=\"{}\"]", action.title)),
+                        TreeNode::new("metadata.json"),
+                        TreeNode::new("input.schema.json"),
+                        TreeNode::new("output.schema.json"),
+                        TreeNode::new("script.js"),
+                        TreeNode::new("latest-invocation.json"),
                     ],
                 ))
             }
@@ -984,7 +1216,7 @@ impl TriggerSdk {
             _ => Err(friendly_anyhow(
                 &display_path(path),
                 "tree_unsupported",
-                "tree_tool expects a directory path such as /, /trigger, /collection, /collection/{collection_uuid}, or /collection/{collection_uuid}/things/{thing_uuid}.",
+                "tree_tool expects a directory path such as /, /trigger, /action, /collection, /collection/{collection_uuid}, or /collection/{collection_uuid}/things/{thing_uuid}.",
             )),
         }
     }
@@ -998,8 +1230,64 @@ impl TriggerSdk {
                     "version": trigger.version,
                     "precondition": parse_rules(&trigger.precondition_json)?,
                     "condition": parse_rules(&trigger.condition_json)?,
+                    "action_uuid": trigger.action_uuid,
+                    "action_args": serde_json::from_str::<JsonValue>(&trigger.action_args_json)
+                        .unwrap_or_else(|_| JsonValue::Object(Default::default())),
                 });
                 serde_json::to_string_pretty(&rule).context("Failed to serialize trigger rule.json")
+            }
+            VirtualPath::TriggerAction { trigger_uuid } => {
+                let trigger = self.fetch_trigger_or_err(trigger_uuid, "/trigger")?;
+                let action_value = trigger
+                    .action_uuid
+                    .as_ref()
+                    .filter(|value| !value.is_empty())
+                    .map(|action_uuid| {
+                        json!({
+                            "action_uuid": action_uuid,
+                            "args_json": serde_json::from_str::<JsonValue>(&trigger.action_args_json)
+                                .unwrap_or_else(|_| JsonValue::Object(Default::default())),
+                        })
+                    })
+                    .unwrap_or(JsonValue::Null);
+                serde_json::to_string_pretty(&action_value)
+                    .context("Failed to serialize trigger action binding")
+            }
+            VirtualPath::ActionName { action_uuid } => {
+                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                Ok(action.title)
+            }
+            VirtualPath::ActionMetadata { action_uuid } => {
+                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                serde_json::to_string_pretty(&action.metadata_json)
+                    .context("Failed to serialize action metadata")
+            }
+            VirtualPath::ActionInputSchema { action_uuid } => {
+                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                serde_json::to_string_pretty(&action.input_schema_json)
+                    .context("Failed to serialize action input schema")
+            }
+            VirtualPath::ActionOutputSchema { action_uuid } => {
+                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                serde_json::to_string_pretty(&action.output_schema_json.unwrap_or(JsonValue::Null))
+                    .context("Failed to serialize action output schema")
+            }
+            VirtualPath::ActionScript { action_uuid } => {
+                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                Ok(action.script_source)
+            }
+            VirtualPath::ActionLatestInvocation { action_uuid } => {
+                let record = self.storage.latest_action_invocation(action_uuid)?;
+                serde_json::to_string_pretty(&record)
+                    .context("Failed to serialize latest action invocation")
+            }
+            VirtualPath::CollectionActions { collection_uuid } => {
+                let bindings = self.resolve_collection_action_bindings(device_id, collection_uuid)?;
+                serde_json::to_string_pretty(&bindings)
+                    .context("Failed to serialize collection action bindings")
+            }
+            VirtualPath::CollectionCardJsx { collection_uuid } => {
+                Ok(self.get_collection_card_jsx(device_id, collection_uuid)?.unwrap_or_default())
             }
             VirtualPath::CollectionName { collection_uuid } => {
                 let snapshot = self.things_list_snapshot_lite(device_id)?;
@@ -1036,6 +1324,11 @@ impl TriggerSdk {
                     .find(|item| item.uuid == *thing_uuid)
                     .ok_or_else(|| friendly_anyhow(&display_path(path), "thing_not_found", &format!("Thing '{}' was not found.", thing_uuid)))?;
                 Ok(thing.trigger_uuid.unwrap_or_default())
+            }
+            VirtualPath::ThingActions { thing_uuid, .. } => {
+                let bindings = self.resolve_thing_action_bindings(device_id, thing_uuid)?;
+                serde_json::to_string_pretty(&bindings)
+                    .context("Failed to serialize thing action bindings")
             }
             VirtualPath::ThingStatus { thing_uuid, .. } => {
                 let snapshot = self.things_list_snapshot_lite(device_id)?;
@@ -1075,7 +1368,7 @@ impl TriggerSdk {
             _ => Err(friendly_anyhow(
                 &display_path(path),
                 "read_unsupported",
-                "cat_tool only supports file nodes such as name, trigger, status, content.md, entries.{idx}, entries.{idx}.data.json, entries.{idx}.schema.json, and rule.json.",
+                "cat_tool only supports file nodes such as name, trigger, card.jsx, status, content.md, entries.{idx}, entries.{idx}.data.json, entries.{idx}.schema.json, rule.json, metadata.json, input.schema.json, output.schema.json, script.js, and latest-invocation.json.",
             )),
         }
     }
@@ -1364,6 +1657,16 @@ impl TriggerSdk {
             })
     }
 
+    fn fetch_action_or_err(&self, action_uuid: &str, path: &str) -> Result<crate::types::ActionDefinition> {
+        self.storage.fetch_action(action_uuid)?.ok_or_else(|| {
+            friendly_anyhow(
+                path,
+                "action_not_found",
+                &format!("Action '{}' was not found.", action_uuid),
+            )
+        })
+    }
+
     fn update_trigger_name(&self, trigger_uuid: &str, name: &str) -> Result<()> {
         let existing = self.fetch_trigger_or_err(trigger_uuid, &format!("/trigger/{trigger_uuid}/name"))?;
         let registration = TriggerRegistration {
@@ -1372,6 +1675,9 @@ impl TriggerSdk {
             version: existing.version.clone(),
             precondition: parse_rules(&existing.precondition_json)?,
             condition: parse_rules(&existing.condition_json)?,
+            action_uuid: existing.action_uuid.clone(),
+            action_args: serde_json::from_str(&existing.action_args_json)
+                .unwrap_or_else(|_| JsonValue::Object(Default::default())),
         };
         self.register_trigger(registration)?;
         Ok(())
@@ -1389,6 +1695,32 @@ impl TriggerSdk {
                 .to_string(),
             precondition: parse_rules_value(rule.get("precondition"))?,
             condition: parse_rules_value(rule.get("condition"))?,
+            action_uuid: existing.action_uuid.clone(),
+            action_args: serde_json::from_str(&existing.action_args_json)
+                .unwrap_or_else(|_| JsonValue::Object(Default::default())),
+        };
+        self.register_trigger(registration)?;
+        Ok(())
+    }
+
+    fn update_trigger_action(
+        &self,
+        trigger_uuid: &str,
+        binding: Option<&(String, JsonValue)>,
+    ) -> Result<()> {
+        let existing = self.fetch_trigger_or_err(trigger_uuid, &format!("/trigger/{trigger_uuid}/action.json"))?;
+        let (action_uuid, action_args) = match binding {
+            Some((action_uuid, action_args)) => (Some(action_uuid.clone()), action_args.clone()),
+            None => (None, JsonValue::Object(Default::default())),
+        };
+        let registration = TriggerRegistration {
+            trigger_uuid: existing.trigger_uuid.clone(),
+            name: existing.name,
+            version: existing.version,
+            precondition: parse_rules(&existing.precondition_json)?,
+            condition: parse_rules(&existing.condition_json)?,
+            action_uuid,
+            action_args,
         };
         self.register_trigger(registration)?;
         Ok(())
@@ -1449,6 +1781,33 @@ fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
         ["trigger", trigger_uuid, "rule.json"] => Ok(VirtualPath::TriggerRule {
             trigger_uuid: (*trigger_uuid).to_string(),
         }),
+        ["trigger", trigger_uuid, "action.json"] => Ok(VirtualPath::TriggerAction {
+            trigger_uuid: (*trigger_uuid).to_string(),
+        }),
+        ["action"] => Ok(VirtualPath::ActionRoot),
+        ["action", action_uuid] => Ok(VirtualPath::ActionDir {
+            action_uuid: (*action_uuid).to_string(),
+        }),
+        ["action", action_uuid, "name"] => Ok(VirtualPath::ActionName {
+            action_uuid: (*action_uuid).to_string(),
+        }),
+        ["action", action_uuid, "metadata.json"] => Ok(VirtualPath::ActionMetadata {
+            action_uuid: (*action_uuid).to_string(),
+        }),
+        ["action", action_uuid, "input.schema.json"] => Ok(VirtualPath::ActionInputSchema {
+            action_uuid: (*action_uuid).to_string(),
+        }),
+        ["action", action_uuid, "output.schema.json"] => Ok(VirtualPath::ActionOutputSchema {
+            action_uuid: (*action_uuid).to_string(),
+        }),
+        ["action", action_uuid, "script.js"] => Ok(VirtualPath::ActionScript {
+            action_uuid: (*action_uuid).to_string(),
+        }),
+        ["action", action_uuid, "latest-invocation.json"] => {
+            Ok(VirtualPath::ActionLatestInvocation {
+                action_uuid: (*action_uuid).to_string(),
+            })
+        }
         ["collection"] => Ok(VirtualPath::CollectionRoot),
         ["collection", collection_uuid] => Ok(VirtualPath::CollectionDir {
             collection_uuid: (*collection_uuid).to_string(),
@@ -1458,6 +1817,12 @@ fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
         }),
         ["collection", collection_uuid, "trigger"]
         | ["collection", collection_uuid, "trigger_uuid"] => Ok(VirtualPath::CollectionTriggerUuid {
+            collection_uuid: (*collection_uuid).to_string(),
+        }),
+        ["collection", collection_uuid, "card.jsx"] => Ok(VirtualPath::CollectionCardJsx {
+            collection_uuid: (*collection_uuid).to_string(),
+        }),
+        ["collection", collection_uuid, "actions.json"] => Ok(VirtualPath::CollectionActions {
             collection_uuid: (*collection_uuid).to_string(),
         }),
         ["collection", collection_uuid, "things"] => Ok(VirtualPath::CollectionThingsDir {
@@ -1473,6 +1838,10 @@ fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
         }),
         ["collection", collection_uuid, "things", thing_uuid, "trigger"]
         | ["collection", collection_uuid, "things", thing_uuid, "trigger_uuid"] => Ok(VirtualPath::ThingTriggerUuid {
+            collection_uuid: (*collection_uuid).to_string(),
+            thing_uuid: (*thing_uuid).to_string(),
+        }),
+        ["collection", collection_uuid, "things", thing_uuid, "actions.json"] => Ok(VirtualPath::ThingActions {
             collection_uuid: (*collection_uuid).to_string(),
             thing_uuid: (*thing_uuid).to_string(),
         }),
@@ -1529,7 +1898,7 @@ fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
         _ => Err(friendly_anyhow(
             path,
             "invalid_path",
-            "Unsupported path. Expected /trigger/... or /collection/... according to the virtual filesystem contract.",
+            "Unsupported path. Expected /trigger/..., /action/..., or /collection/... according to the virtual filesystem contract.",
         )),
     }
 }
@@ -1557,6 +1926,33 @@ fn render_trigger_listing(triggers: &[crate::types::TriggerInfo], limit_preview:
     nodes
 }
 
+fn render_action_listing(actions: &[crate::types::ActionDefinition], limit_preview: bool) -> Vec<TreeNode> {
+    let mut nodes = actions
+        .iter()
+        .take(if limit_preview { ACTION_PREVIEW_LIMIT } else { actions.len() })
+        .map(|action| TreeNode::new(format!("{}/ [title=\"{}\"]", action.action_uuid, action.title)))
+        .collect::<Vec<_>>();
+
+    if limit_preview && actions.len() > ACTION_PREVIEW_LIMIT {
+        nodes.push(TreeNode::new(format!("Has {} More", actions.len() - ACTION_PREVIEW_LIMIT)));
+    }
+
+    if !limit_preview {
+        for (node, action) in nodes.iter_mut().zip(actions.iter()) {
+            node.children = vec![
+                TreeNode::new(format!("name [value=\"{}\"]", action.title)),
+                TreeNode::new("metadata.json"),
+                TreeNode::new("input.schema.json"),
+                TreeNode::new("output.schema.json"),
+                TreeNode::new("script.js"),
+                TreeNode::new("latest-invocation.json"),
+            ];
+        }
+    }
+
+    nodes
+}
+
 fn render_collection_listing(
     tree_data: &crate::things_crdt::ThingsTreeData,
     index: &TreeIndex<'_>,
@@ -1571,6 +1967,8 @@ fn render_collection_listing(
             let mut children = vec![
                 TreeNode::new(format!("name [value=\"{}\"]", collection.title)),
                 TreeNode::new(format!("trigger [value=\"{}\"]", collection.trigger_uuid.clone().unwrap_or_default())),
+                TreeNode::new("card.jsx"),
+                TreeNode::new("actions.json"),
             ];
             let child_things = index.child_things(&collection.uuid, None);
             let thing_nodes = render_thing_nodes(&child_things, index);
@@ -1603,6 +2001,8 @@ fn collection_dir_children(
     Ok(vec![
         TreeNode::new(format!("name [value=\"{}\"]", collection.title)),
         TreeNode::new(format!("trigger [value=\"{}\"]", collection.trigger_uuid.clone().unwrap_or_default())),
+        TreeNode::new("card.jsx"),
+        TreeNode::new("actions.json"),
         TreeNode::with_children(
             "things/",
             render_thing_nodes(&root_things, index)
@@ -1639,6 +2039,7 @@ fn thing_dir_children(
     let mut children = vec![
         TreeNode::new(format!("name [value=\"{}\"]", thing.title)),
         TreeNode::new(format!("trigger [value=\"{}\"]", thing.trigger_uuid.clone().unwrap_or_default())),
+        TreeNode::new("actions.json"),
         thing_status_node(&thing.status),
         TreeNode::new("content.md"),
     ];
@@ -1681,6 +2082,7 @@ fn render_thing_nodes(
                     "trigger [value=\"{}\"]",
                     thing.trigger_uuid.clone().unwrap_or_default()
                 )),
+                TreeNode::new("actions.json"),
                 thing_status_node(&thing.status),
             ];
             let has_children = index.has_children(&thing.collection_uuid, &thing.uuid);
@@ -1757,6 +2159,129 @@ fn parse_rules_value(value: Option<&JsonValue>) -> Result<Vec<TriggerRule>> {
     serde_json::from_value(value.clone()).context("Failed to decode trigger rules")
 }
 
+fn parse_action_args_json(path: &str, content: Option<&str>) -> Result<JsonValue> {
+    match content.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+            friendly_anyhow(
+                path,
+                "invalid_content",
+                &format!("Action binding content must be valid JSON: {error}"),
+            )
+        }),
+        None => Ok(JsonValue::Object(Default::default())),
+    }
+}
+
+fn parse_trigger_action_binding_value(
+    path: &str,
+    value: Option<&JsonValue>,
+) -> Result<Option<(String, JsonValue)>> {
+    let Some(value) = value else {
+        return Err(friendly_anyhow(
+            path,
+            "invalid_value",
+            "Editing action.json requires null, a JSON object, or a JSON string.",
+        ));
+    };
+
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    if let Some(text) = value.as_str() {
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = serde_json::from_str::<JsonValue>(text).map_err(|error| {
+            friendly_anyhow(
+                path,
+                "invalid_value",
+                &format!("action.json string value must be valid JSON: {error}"),
+            )
+        })?;
+        return parse_trigger_action_binding_value(path, Some(&parsed));
+    }
+
+    let object = value.as_object().ok_or_else(|| {
+        friendly_anyhow(
+            path,
+            "invalid_value",
+            "action.json must be null or an object like { action_uuid, args_json }.",
+        )
+    })?;
+
+    let action_uuid = object
+        .get("action_uuid")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            friendly_anyhow(
+                path,
+                "missing_action_uuid",
+                "action.json requires a non-empty action_uuid when setting a binding.",
+            )
+        })?
+        .to_string();
+    let args_json = object
+        .get("args_json")
+        .cloned()
+        .unwrap_or_else(|| JsonValue::Object(Default::default()));
+    Ok(Some((action_uuid, args_json)))
+}
+
+fn parse_entity_action_bindings_value(
+    path: &str,
+    value: Option<&JsonValue>,
+) -> Result<Vec<EntityActionBinding>> {
+    let Some(value) = value else {
+        return Err(friendly_anyhow(
+            path,
+            "invalid_value",
+            "actions.json requires an array, an object, or null.",
+        ));
+    };
+
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(text) = value.as_str() {
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let parsed = serde_json::from_str::<JsonValue>(text).map_err(|error| {
+            friendly_anyhow(
+                path,
+                "invalid_value",
+                &format!("actions.json string value must be valid JSON: {error}"),
+            )
+        })?;
+        return parse_entity_action_bindings_value(path, Some(&parsed));
+    }
+
+    if let Some(array) = value.as_array() {
+        return serde_json::from_value::<Vec<EntityActionBinding>>(JsonValue::Array(array.clone()))
+            .map_err(|error| {
+                friendly_anyhow(
+                    path,
+                    "invalid_value",
+                    &format!("actions.json must be an array of action bindings: {error}"),
+                )
+            });
+    }
+
+    serde_json::from_value::<EntityActionBinding>(value.clone())
+        .map(|binding| vec![binding])
+        .map_err(|error| {
+            friendly_anyhow(
+                path,
+                "invalid_value",
+                &format!("actions.json must be an action binding object or array: {error}"),
+            )
+        })
+}
+
 fn normalize_operation(operation: &str) -> &str {
     let trimmed = operation.trim();
     if trimmed.is_empty() {
@@ -1773,14 +2298,28 @@ fn display_path(path: &VirtualPath) -> String {
         VirtualPath::TriggerDir { trigger_uuid } => format!("/trigger/{trigger_uuid}"),
         VirtualPath::TriggerName { trigger_uuid } => format!("/trigger/{trigger_uuid}/name"),
         VirtualPath::TriggerRule { trigger_uuid } => format!("/trigger/{trigger_uuid}/rule.json"),
+        VirtualPath::TriggerAction { trigger_uuid } => format!("/trigger/{trigger_uuid}/action.json"),
+        VirtualPath::ActionRoot => "/action".to_string(),
+        VirtualPath::ActionDir { action_uuid } => format!("/action/{action_uuid}"),
+        VirtualPath::ActionName { action_uuid } => format!("/action/{action_uuid}/name"),
+        VirtualPath::ActionMetadata { action_uuid } => format!("/action/{action_uuid}/metadata.json"),
+        VirtualPath::ActionInputSchema { action_uuid } => format!("/action/{action_uuid}/input.schema.json"),
+        VirtualPath::ActionOutputSchema { action_uuid } => format!("/action/{action_uuid}/output.schema.json"),
+        VirtualPath::ActionScript { action_uuid } => format!("/action/{action_uuid}/script.js"),
+        VirtualPath::ActionLatestInvocation { action_uuid } => {
+            format!("/action/{action_uuid}/latest-invocation.json")
+        }
         VirtualPath::CollectionRoot => "/collection".to_string(),
         VirtualPath::CollectionDir { collection_uuid } => format!("/collection/{collection_uuid}"),
         VirtualPath::CollectionName { collection_uuid } => format!("/collection/{collection_uuid}/name"),
         VirtualPath::CollectionTriggerUuid { collection_uuid } => format!("/collection/{collection_uuid}/trigger"),
+        VirtualPath::CollectionCardJsx { collection_uuid } => format!("/collection/{collection_uuid}/card.jsx"),
+        VirtualPath::CollectionActions { collection_uuid } => format!("/collection/{collection_uuid}/actions.json"),
         VirtualPath::CollectionThingsDir { collection_uuid } => format!("/collection/{collection_uuid}/things"),
         VirtualPath::ThingDir { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}"),
         VirtualPath::ThingName { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/name"),
         VirtualPath::ThingTriggerUuid { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/trigger"),
+        VirtualPath::ThingActions { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/actions.json"),
         VirtualPath::ThingStatus { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/status"),
         VirtualPath::ThingContent { collection_uuid, thing_uuid } => format!("/collection/{collection_uuid}/things/{thing_uuid}/content.md"),
         VirtualPath::ThingEntry { collection_uuid, thing_uuid, index } => format!("/collection/{collection_uuid}/things/{thing_uuid}/entries.{index}"),

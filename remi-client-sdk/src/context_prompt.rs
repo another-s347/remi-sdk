@@ -428,6 +428,7 @@ mod tests {
                 uuid: "c1".to_string(),
                 title: "Inbox".to_string(),
                 trigger_uuid: Some("tr-1".to_string()),
+                card_jsx: None,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
                 updated_at: "2026-04-01T00:00:00Z".to_string(),
                 actor_type: None,
