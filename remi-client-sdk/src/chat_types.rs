@@ -104,14 +104,40 @@ pub enum CachedUiElement {
     Images {
         uris: Vec<String>,
     },
+    ToolInvocation {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        tool_name: String,
+        status_text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default)]
+        failed: bool,
+        #[serde(default)]
+        running: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sub_session: Option<CachedSubSession>,
+    },
     ToolCall {
         tool_name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         arguments_json: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     ToolResult {
         tool_name: String,
         result: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     SubSession {
         data: CachedSubSession,
@@ -179,7 +205,11 @@ pub struct CachedMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub references: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,7 +230,9 @@ impl CachedMessage {
             thinking: None,
             has_error: None,
             tool_name: None,
+            tool_call_id: None,
             tool_result: None,
+            duration_ms: None,
             references: None,
             attachments: None,
             sub_session: None,
@@ -217,7 +249,9 @@ impl CachedMessage {
             thinking: None,
             has_error: None,
             tool_name: None,
+            tool_call_id: None,
             tool_result: None,
+            duration_ms: None,
             references: None,
             attachments: None,
             sub_session: None,
@@ -225,7 +259,14 @@ impl CachedMessage {
         }
     }
 
-    pub fn tool_result(id: String, tool_name: String, result: String, timestamp_ms: i64) -> Self {
+    pub fn tool_result(
+        id: String,
+        tool_name: String,
+        tool_call_id: Option<String>,
+        result: String,
+        timestamp_ms: i64,
+        duration_ms: Option<u64>,
+    ) -> Self {
         Self {
             id,
             content: String::new(),
@@ -234,7 +275,9 @@ impl CachedMessage {
             thinking: None,
             has_error: None,
             tool_name: Some(tool_name),
+            tool_call_id,
             tool_result: Some(result),
+            duration_ms,
             references: None,
             attachments: None,
             sub_session: None,
@@ -296,6 +339,8 @@ fn derive_ui_elements(message: &CachedMessage) -> Vec<CachedUiElement> {
                 .clone()
                 .unwrap_or_else(|| "tool".to_string()),
             result: result.clone(),
+            tool_call_id: message.tool_call_id.clone(),
+            duration_ms: message.duration_ms,
         });
         append_references(&mut elements, message.references.as_ref());
         append_images(&mut elements, image_uris);
@@ -310,6 +355,8 @@ fn derive_ui_elements(message: &CachedMessage) -> Vec<CachedUiElement> {
         elements.push(CachedUiElement::ToolCall {
             tool_name: tool_name.clone(),
             arguments_json: parse_tool_call_arguments(&message.content),
+            tool_call_id: message.tool_call_id.clone(),
+            duration_ms: message.duration_ms,
         });
         if let Some(sub_session) = message.sub_session.clone() {
             elements.push(CachedUiElement::SubSession { data: sub_session });
@@ -328,6 +375,477 @@ fn derive_ui_elements(message: &CachedMessage) -> Vec<CachedUiElement> {
     append_references(&mut elements, message.references.as_ref());
     append_images(&mut elements, image_uris);
     elements
+}
+
+pub fn compact_cached_messages_for_ui(messages: &[CachedMessage]) -> Vec<CachedMessage> {
+    let mut compacted = Vec::new();
+    let mut consumed_result_indices = std::collections::HashSet::new();
+    let mut index = 0usize;
+
+    while index < messages.len() {
+        if consumed_result_indices.contains(&index) {
+            index += 1;
+            continue;
+        }
+
+        let message = &messages[index];
+        let tool_call = extract_tool_call(message);
+        if let Some(tool_call) = tool_call {
+            let matched_result_index = find_matching_tool_result_index(messages, index + 1, message, &tool_call, &consumed_result_indices);
+            let matched_result = matched_result_index
+                .and_then(|result_index| messages.get(result_index))
+                .and_then(extract_tool_result);
+            if let Some(result_index) = matched_result_index {
+                consumed_result_indices.insert(result_index);
+            }
+
+            compacted.push(build_tool_invocation_message(
+                Some(message),
+                Some(tool_call),
+                matched_result_index.and_then(|result_index| messages.get(result_index)),
+                matched_result,
+            ));
+            index += 1;
+            continue;
+        }
+
+        if let Some(tool_result) = extract_tool_result(message) {
+            compacted.push(build_tool_invocation_message(
+                None,
+                None,
+                Some(message),
+                Some(tool_result),
+            ));
+            index += 1;
+            continue;
+        }
+
+        compacted.push(message.clone());
+        index += 1;
+    }
+
+    compacted
+}
+
+fn find_matching_tool_result_index(
+    messages: &[CachedMessage],
+    start_index: usize,
+    call_message: &CachedMessage,
+    tool_call: &ToolCallView,
+    consumed_result_indices: &std::collections::HashSet<usize>,
+) -> Option<usize> {
+    let tool_call_id = tool_call
+        .tool_call_id
+        .as_deref()
+        .or(call_message.tool_call_id.as_deref())
+        .or_else(|| parse_tool_call_id_from_message_id(&call_message.id));
+
+    for (index, message) in messages.iter().enumerate().skip(start_index) {
+        if consumed_result_indices.contains(&index) {
+            continue;
+        }
+
+        let Some(tool_result) = extract_tool_result(message) else {
+            continue;
+        };
+
+        let is_match = if let Some(tool_call_id) = tool_call_id {
+            tool_result
+                .tool_call_id
+                .as_deref()
+                .or(message.tool_call_id.as_deref())
+                .or_else(|| parse_tool_call_id_from_message_id(&message.id))
+                .map(|result_id| result_id == tool_call_id)
+                .unwrap_or(false)
+        } else {
+            tool_messages_match(call_message, message, tool_call, &tool_result)
+        };
+
+        if is_match {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+#[derive(Clone)]
+struct ToolCallView {
+    tool_name: String,
+    tool_call_id: Option<String>,
+    arguments_json: Option<String>,
+    duration_ms: Option<u64>,
+    sub_session: Option<CachedSubSession>,
+}
+
+#[derive(Clone)]
+struct ToolResultView {
+    tool_name: String,
+    tool_call_id: Option<String>,
+    result: String,
+    duration_ms: Option<u64>,
+}
+
+fn extract_tool_call(message: &CachedMessage) -> Option<ToolCallView> {
+    let element = message.ui_elements.iter().find_map(|item| match item {
+        CachedUiElement::ToolCall {
+            tool_name,
+            arguments_json,
+            tool_call_id,
+            duration_ms,
+        } if !tool_name.trim().is_empty() => Some(ToolCallView {
+            tool_name: tool_name.clone(),
+            tool_call_id: tool_call_id.clone().or_else(|| message.tool_call_id.clone()),
+            arguments_json: arguments_json.clone(),
+            duration_ms: duration_ms.or(message.duration_ms),
+            sub_session: message.sub_session.clone(),
+        }),
+        _ => None,
+    })?;
+
+    Some(element)
+}
+
+fn extract_tool_result(message: &CachedMessage) -> Option<ToolResultView> {
+    message.ui_elements.iter().find_map(|item| match item {
+        CachedUiElement::ToolResult {
+            tool_name,
+            result,
+            tool_call_id,
+            duration_ms,
+        } if !result.trim().is_empty() => Some(ToolResultView {
+            tool_name: if tool_name.trim().is_empty() {
+                "tool".to_string()
+            } else {
+                tool_name.clone()
+            },
+            tool_call_id: tool_call_id.clone().or_else(|| message.tool_call_id.clone()),
+            result: result.clone(),
+            duration_ms: duration_ms.or(message.duration_ms),
+        }),
+        _ => None,
+    })
+}
+
+fn tool_messages_match(
+    call_message: &CachedMessage,
+    result_message: &CachedMessage,
+    tool_call: &ToolCallView,
+    tool_result: &ToolResultView,
+) -> bool {
+    let call_id = tool_call
+        .tool_call_id
+        .as_deref()
+        .or(call_message.tool_call_id.as_deref())
+        .or_else(|| parse_tool_call_id_from_message_id(&call_message.id));
+    let result_id = tool_result
+        .tool_call_id
+        .as_deref()
+        .or(result_message.tool_call_id.as_deref())
+        .or_else(|| parse_tool_call_id_from_message_id(&result_message.id));
+
+    if let (Some(call_id), Some(result_id)) = (call_id, result_id) {
+        return call_id == result_id;
+    }
+
+    !tool_call.tool_name.trim().is_empty() && tool_call.tool_name == tool_result.tool_name
+}
+
+fn parse_tool_call_id_from_message_id(message_id: &str) -> Option<&str> {
+    message_id
+        .strip_prefix("tool_call:")
+        .or_else(|| message_id.strip_prefix("tool_result:"))
+}
+
+fn build_tool_invocation_message(
+    call_message: Option<&CachedMessage>,
+    tool_call: Option<ToolCallView>,
+    result_message: Option<&CachedMessage>,
+    tool_result: Option<ToolResultView>,
+) -> CachedMessage {
+    let base = call_message.or(result_message).cloned().unwrap_or_else(|| CachedMessage::assistant("tool-invocation".to_string(), 0));
+    let tool_name = tool_call
+        .as_ref()
+        .map(|value| value.tool_name.clone())
+        .or_else(|| tool_result.as_ref().map(|value| value.tool_name.clone()))
+        .unwrap_or_else(|| "tool".to_string());
+    let tool_call_id = tool_call
+        .as_ref()
+        .and_then(|value| value.tool_call_id.clone())
+        .or_else(|| tool_result.as_ref().and_then(|value| value.tool_call_id.clone()))
+        .or_else(|| call_message.and_then(|value| value.tool_call_id.clone()))
+        .or_else(|| result_message.and_then(|value| value.tool_call_id.clone()))
+        .or_else(|| parse_tool_call_id_from_message_id(&base.id).map(ToString::to_string));
+    let request_text = tool_call.as_ref().and_then(|value| value.arguments_json.clone());
+    let response_text = tool_result.as_ref().map(|value| value.result.clone());
+    let failed = response_text.as_ref().map(|value| is_failed_tool_response(value)).unwrap_or(false);
+    let running = tool_result.is_none();
+    let duration_ms = tool_call
+        .as_ref()
+        .and_then(|value| value.duration_ms)
+        .or_else(|| tool_result.as_ref().and_then(|value| value.duration_ms))
+        .or_else(|| derive_tool_duration_ms(call_message, result_message));
+    let status_text = build_semantic_tool_status(
+        &tool_name,
+        request_text.as_deref(),
+        response_text.as_deref(),
+        failed,
+        running,
+    );
+    let mut ui_elements = Vec::new();
+    ui_elements.push(CachedUiElement::ToolInvocation {
+        tool_call_id: tool_call_id.clone(),
+        tool_name: tool_name.clone(),
+        status_text,
+        request_text,
+        response_text,
+        duration_ms,
+        failed,
+        running,
+        sub_session: tool_call.as_ref().and_then(|value| value.sub_session.clone()),
+    });
+    ui_elements.extend(compact_residual_ui_elements(call_message, result_message));
+
+    CachedMessage {
+        id: tool_call_id
+            .as_ref()
+            .map(|value| format!("tool_invocation:{value}"))
+            .unwrap_or(base.id),
+        content: String::new(),
+        is_user: false,
+        timestamp_ms: call_message
+            .map(|value| value.timestamp_ms)
+            .or_else(|| result_message.map(|value| value.timestamp_ms))
+            .unwrap_or(base.timestamp_ms),
+        thinking: None,
+        has_error: Some(failed),
+        tool_name: Some(tool_name),
+        tool_call_id,
+        tool_result: tool_result.as_ref().map(|value| value.result.clone()),
+        duration_ms,
+        references: None,
+        attachments: None,
+        sub_session: None,
+        ui_elements,
+    }
+}
+
+fn compact_residual_ui_elements(
+    call_message: Option<&CachedMessage>,
+    result_message: Option<&CachedMessage>,
+) -> Vec<CachedUiElement> {
+    let mut elements = Vec::new();
+
+    for message in [call_message, result_message].into_iter().flatten() {
+        for element in &message.ui_elements {
+            match element {
+                CachedUiElement::ToolCall { .. }
+                | CachedUiElement::ToolResult { .. }
+                | CachedUiElement::SubSession { .. } => {}
+                other => elements.push(other.clone()),
+            }
+        }
+    }
+
+    elements
+}
+
+fn derive_tool_duration_ms(
+    call_message: Option<&CachedMessage>,
+    result_message: Option<&CachedMessage>,
+) -> Option<u64> {
+    let started_at = call_message?.timestamp_ms;
+    let finished_at = result_message?.timestamp_ms;
+    if finished_at < started_at {
+        return None;
+    }
+
+    Some((finished_at - started_at) as u64)
+}
+
+fn build_semantic_tool_status(
+    tool_name: &str,
+    request_text: Option<&str>,
+    response_text: Option<&str>,
+    failed: bool,
+    running: bool,
+) -> String {
+    let normalized_name = tool_name.trim().to_ascii_lowercase();
+    let request = parse_structured_payload(request_text);
+    let primary_target = describe_tool_target(request.as_ref()).or_else(|| describe_response_target(response_text));
+
+    if normalized_name.contains("fetch") {
+        return build_status_line(primary_target.map(|target| format!("Viewing {target}")).unwrap_or_else(|| "Checking".to_string()), failed, running);
+    }
+    if normalized_name.contains("cat") || normalized_name.contains("read") {
+        return build_status_line(primary_target.map(|target| format!("Viewing {target}")).unwrap_or_else(|| "Viewing file".to_string()), failed, running);
+    }
+    if normalized_name.contains("tree") || normalized_name.contains("list") {
+        return build_status_line(primary_target.map(|target| format!("Checking {target}")).unwrap_or_else(|| "Checking workspace".to_string()), failed, running);
+    }
+    if normalized_name.contains("grep") || normalized_name.contains("search") {
+        return build_status_line(primary_target.map(|target| format!("Searching {target}")).unwrap_or_else(|| "Searching".to_string()), failed, running);
+    }
+    if normalized_name.contains("apply_patch") || normalized_name.contains("edit") {
+        let changed_lines = estimate_changed_lines(request_text);
+        let suffix = primary_target.map(|target| format!(" in {target}")).unwrap_or_default();
+        let base = changed_lines
+            .map(|count| format!("Editing {count} lines{suffix}"))
+            .unwrap_or_else(|| format!("Editing{suffix}"));
+        return build_status_line(base.trim().to_string(), failed, running);
+    }
+    if normalized_name.contains("create") {
+        return build_status_line(primary_target.map(|target| format!("Creating {target}")).unwrap_or_else(|| "Creating".to_string()), failed, running);
+    }
+
+    let fallback = primary_target
+        .map(|target| format!("{} {target}", humanize_tool_name(tool_name)))
+        .unwrap_or_else(|| humanize_tool_name(tool_name));
+    build_status_line(fallback, failed, running)
+}
+
+fn build_status_line(base: String, failed: bool, running: bool) -> String {
+    if failed {
+        if let Some(rest) = base.strip_prefix("Viewing ") {
+            return format!("Failed to view {rest}");
+        }
+        return format!("{base} failed");
+    }
+    if running {
+        return base;
+    }
+    if let Some(rest) = base.strip_prefix("Editing ") {
+        return format!("Edited {rest}");
+    }
+    if let Some(rest) = base.strip_prefix("Creating ") {
+        return format!("Created {rest}");
+    }
+    if let Some(rest) = base.strip_prefix("Checking ") {
+        return format!("Checked {rest}");
+    }
+    if let Some(rest) = base.strip_prefix("Searching ") {
+        return format!("Searched {rest}");
+    }
+    if let Some(rest) = base.strip_prefix("Viewing ") {
+        return format!("Viewed {rest}");
+    }
+    format!("Completed {}", base.to_lowercase())
+}
+
+fn parse_structured_payload(text: Option<&str>) -> Option<serde_json::Map<String, JsonValue>> {
+    let text = text?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<JsonValue>(text).ok()? {
+        JsonValue::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+fn describe_tool_target(payload: Option<&serde_json::Map<String, JsonValue>>) -> Option<String> {
+    let payload = payload?;
+    let direct = ["path", "filePath", "uri", "url", "query", "name", "tool_name"]
+        .into_iter()
+        .filter_map(|key| payload.get(key))
+        .find_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(shorten_target);
+    if direct.is_some() {
+        return direct;
+    }
+
+    payload
+        .get("args")
+        .and_then(|value| value.as_object())
+        .and_then(|value| describe_tool_target(Some(value)))
+}
+
+fn describe_response_target(text: Option<&str>) -> Option<String> {
+    let line = text?
+        .lines()
+        .map(str::trim)
+        .find(|value| !value.is_empty())?;
+    Some(truncate_preview(line, 60))
+}
+
+fn shorten_target(target: &str) -> String {
+    if let Ok(url) = url::Url::parse(target) {
+        let path = url.path().trim_end_matches('/');
+        let combined = if path.is_empty() {
+            url.host_str().unwrap_or_default().to_string()
+        } else {
+            format!("{}{}", url.host_str().unwrap_or_default(), path)
+        };
+        return truncate_preview(&combined, 60);
+    }
+
+    let normalized = target.replace('\\', "/");
+    let tail = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/");
+    truncate_preview(&tail, 60)
+}
+
+fn humanize_tool_name(tool_name: &str) -> String {
+    let normalized = tool_name
+        .replace('_', " ")
+        .replace('-', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = normalized.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.collect::<String>()),
+        None => "Tool".to_string(),
+    }
+}
+
+fn estimate_changed_lines(request_text: Option<&str>) -> Option<usize> {
+    let text = request_text?;
+    let count = text
+        .lines()
+        .filter(|line| (line.starts_with('+') || line.starts_with('-')) && !line.starts_with("+++") && !line.starts_with("---"))
+        .count();
+    if count == 0 {
+        None
+    } else {
+        Some(count)
+    }
+}
+
+fn is_failed_tool_response(response_text: &str) -> bool {
+    let trimmed = response_text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.to_ascii_lowercase().starts_with("error") || trimmed.to_ascii_lowercase().starts_with("failed") {
+        return true;
+    }
+    serde_json::from_str::<JsonValue>(trimmed)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| object.contains_key("error")))
+        .unwrap_or(false)
+}
+
+fn truncate_preview(text: &str, max_length: usize) -> String {
+    if text.chars().count() <= max_length {
+        return text.to_string();
+    }
+
+    let mut truncated = text.chars().take(max_length).collect::<String>();
+    while matches!(truncated.chars().last(), Some(' ' | '.' | ',' | ';' | ':')) {
+        let _ = truncated.pop();
+    }
+    format!("{truncated}...")
 }
 
 fn append_references(elements: &mut Vec<CachedUiElement>, references: Option<&JsonValue>) {
@@ -431,6 +949,87 @@ fn parse_tool_call_arguments(content: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{CachedMessage, CachedUiElement, compact_cached_messages_for_ui};
+
+    #[test]
+    fn compact_cached_messages_merges_tool_call_and_result() {
+        let mut tool_call = CachedMessage::assistant("tool_call:call-1".to_string(), 1_000);
+        tool_call.content = "Tool call: `fetch`\n\n```json\n{\"url\":\"https://example.com/docs\"}\n```".to_string();
+        tool_call.tool_name = Some("fetch".to_string());
+        tool_call.tool_call_id = Some("call-1".to_string());
+        tool_call.refresh_ui_elements();
+
+        let mut tool_result = CachedMessage::tool_result(
+            "tool_result:call-1".to_string(),
+            "fetch".to_string(),
+            Some("call-1".to_string()),
+            "{\"title\":\"Docs\"}".to_string(),
+            1_450,
+            None,
+        );
+        tool_result.refresh_ui_elements();
+
+        let compacted = compact_cached_messages_for_ui(&[tool_call, tool_result]);
+        assert_eq!(compacted.len(), 1);
+
+        match &compacted[0].ui_elements[0] {
+            CachedUiElement::ToolInvocation {
+                tool_call_id,
+                tool_name,
+                status_text,
+                request_text,
+                response_text,
+                duration_ms,
+                failed,
+                running,
+                ..
+            } => {
+                assert_eq!(tool_call_id.as_deref(), Some("call-1"));
+                assert_eq!(tool_name, "fetch");
+                assert_eq!(status_text, "Viewed example.com/docs");
+                assert_eq!(request_text.as_deref(), Some("{\"url\":\"https://example.com/docs\"}"));
+                assert_eq!(response_text.as_deref(), Some("{\"title\":\"Docs\"}"));
+                assert_eq!(*duration_ms, Some(450));
+                assert!(!failed);
+                assert!(!running);
+            }
+            other => panic!("expected tool invocation element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_cached_messages_keeps_running_tool_call_open() {
+        let mut tool_call = CachedMessage::assistant("tool_call:call-2".to_string(), 2_000);
+        tool_call.content = "Tool call: `grep_search`\n\n```json\n{\"query\":\"tool invocation\"}\n```".to_string();
+        tool_call.tool_name = Some("grep_search".to_string());
+        tool_call.tool_call_id = Some("call-2".to_string());
+        tool_call.refresh_ui_elements();
+
+        let compacted = compact_cached_messages_for_ui(&[tool_call]);
+        assert_eq!(compacted.len(), 1);
+
+        match &compacted[0].ui_elements[0] {
+            CachedUiElement::ToolInvocation {
+                tool_call_id,
+                tool_name,
+                status_text,
+                response_text,
+                running,
+                ..
+            } => {
+                assert_eq!(tool_call_id.as_deref(), Some("call-2"));
+                assert_eq!(tool_name, "grep_search");
+                assert_eq!(status_text, "Searching tool invocation");
+                assert!(response_text.is_none());
+                assert!(*running);
+            }
+            other => panic!("expected tool invocation element, got {other:?}"),
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Protocol Session State
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -478,6 +1077,8 @@ pub struct ToolExecutionOutcome {
     pub result_parts: Option<Vec<ToolImagePart>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// A raw image returned by a tool handler (before proto serialisation).
@@ -591,7 +1192,9 @@ pub struct ChatTracingConfig {
 #[derive(Debug, Clone, Default)]
 pub enum ChatRuntimeBackend {
     #[default]
+    /// Remote server-hosted chat stream.
     RemoteServer,
+    /// Device-local execution using the embedded or configured WASM/native agent runtime.
     LocalWasm(ChatLocalWasmConfig),
 }
 

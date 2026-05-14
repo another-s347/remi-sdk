@@ -23,6 +23,87 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_stream::StreamExt;
 
+fn tool_outcome_shape(outcome: &ToolExecutionOutcome) -> &'static str {
+    if outcome.result.is_some() {
+        "result"
+    } else if outcome.result_parts.is_some() {
+        "parts"
+    } else if outcome.error.is_some() {
+        "error"
+    } else {
+        "empty"
+    }
+}
+
+fn summarize_tool_outcome(outcome: &ToolExecutionOutcome) -> String {
+    let detail = if let Some(result) = &outcome.result {
+        format!("len={}", result.len())
+    } else if let Some(parts) = &outcome.result_parts {
+        format!("parts={}", parts.len())
+    } else if let Some(error) = &outcome.error {
+        format!("len={}", error.len())
+    } else {
+        "len=0".to_string()
+    };
+
+    format!(
+        "{}:{}:{}:{}",
+        outcome.tool_call_id,
+        outcome.tool_name,
+        tool_outcome_shape(outcome),
+        detail
+    )
+}
+
+fn summarize_protocol_history_message(message: &ProtocolHistoryMessage) -> String {
+    let content_shape = match &message.content {
+        JsonValue::String(text) => format!("text:{}", text.len()),
+        JsonValue::Array(parts) => format!("parts:{}", parts.len()),
+        JsonValue::Object(map) => format!("object:{}", map.len()),
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(_) => "bool".to_string(),
+        JsonValue::Number(_) => "number".to_string(),
+    };
+
+    format!(
+        "{}:{}:tool_calls={}:tool_call_id={}:{}",
+        message.id,
+        message.role,
+        message.tool_calls.len(),
+        message.tool_call_id.as_deref().unwrap_or("-"),
+        content_shape,
+    )
+}
+
+fn serialize_tool_outcomes_for_resume(
+    session_id: &str,
+    source: &str,
+    outcomes: &[ToolExecutionOutcome],
+) -> Vec<chat_proto::ChatToolCallOutcome> {
+    let mut serialized = Vec::with_capacity(outcomes.len());
+    let mut dropped = Vec::new();
+
+    for outcome in outcomes {
+        match tool_outcome_to_proto(outcome) {
+            Some(proto) => serialized.push(proto),
+            None => dropped.push(summarize_tool_outcome(outcome)),
+        }
+    }
+
+    tracing::info!(
+        session_id = %session_id,
+        source,
+        total_results = outcomes.len(),
+        serialized_results = serialized.len(),
+        dropped_results = dropped.len(),
+        results = ?outcomes.iter().map(summarize_tool_outcome).collect::<Vec<_>>(),
+        dropped = ?dropped,
+        "Prepared tool outcomes for chat resume"
+    );
+
+    serialized
+}
+
 fn extract_fatal_error_from_event(event: &ChatStreamEvent) -> Option<String> {
     match event.event.as_ref()? {
         chat_stream_event::Event::Error(err) => Some(if err.message.trim().is_empty() {
@@ -315,6 +396,7 @@ fn build_tool_call_message(session: &SessionState, tool_call_id: &str, now_ms: i
         None => format!("Tool call: `{}`", tool_name),
     };
     message.tool_name = Some(tool_name);
+    message.tool_call_id = Some(tool_call_id.to_string());
     message.sub_session = session
         .sub_sessions
         .get(tool_call_id)
@@ -416,11 +498,13 @@ impl ProtocolTurnState {
     }
 
     fn flush_phase_into_history(&mut self, session: &mut SessionState, assistant_id: &str) {
-        if let Some(user) = self.pending_user.take() {
-            session.protocol_state.history.push(user);
-        }
-        if let Some(assistant) = self.assistant_message(assistant_id) {
-            session.protocol_state.history.push(assistant);
+        if !self.committed {
+            if let Some(user) = self.pending_user.take() {
+                session.protocol_state.history.push(user);
+            }
+            if let Some(assistant) = self.assistant_message(assistant_id) {
+                session.protocol_state.history.push(assistant);
+            }
         }
         session
             .protocol_state
@@ -503,7 +587,8 @@ enum Command {
         system_prompt: Option<String>,
         references: Option<JsonValue>,
         attachments: Option<JsonValue>,
-        agent_mode: Option<String>,
+        active_agent: Option<String>,
+        configured_external_tool_names: Option<Vec<String>>,
         user_msg_id: Option<String>,
         assistant_msg_id: Option<String>,
         reply: oneshot::Sender<Result<(), String>>,
@@ -662,15 +747,24 @@ fn build_execution_backend(config: &ChatRuntimeConfig) -> Result<ChatExecutionBa
     build_chat_agent(config).map(ChatExecutionBackend)
 }
 
-fn apply_agent_mode_override(
+fn normalize_active_agent_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(match trimmed.to_ascii_lowercase().as_str() {
+        "light" => "ask".to_string(),
+        "deep" | "auto" => "manager".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn apply_active_agent_override(
     user_state: Option<JsonValue>,
-    agent_mode: Option<&str>,
+    active_agent: Option<&str>,
 ) -> Option<JsonValue> {
-    let Some(agent_mode) = agent_mode.and_then(|value| match value {
-        "ask" | "light" => Some("ask"),
-        "manager" | "deep" => Some("manager"),
-        _ => None,
-    }) else {
+    let Some(active_agent) = active_agent.and_then(normalize_active_agent_name) else {
         return user_state;
     };
 
@@ -681,12 +775,12 @@ fn apply_agent_mode_override(
 
     let Some(root) = user_state.as_object_mut() else {
         return Some(json!({
-            "agent_mode": agent_mode,
-            "remi_handoff": { "current_agent": agent_mode },
+            "agent_mode": active_agent,
+            "remi_handoff": { "current_agent": active_agent },
         }));
     };
 
-    root.insert("agent_mode".to_string(), JsonValue::String(agent_mode.to_string()));
+    root.insert("agent_mode".to_string(), JsonValue::String(active_agent.to_string()));
     root.remove("handoff_summary");
 
     let handoff = root
@@ -698,7 +792,7 @@ fn apply_agent_mode_override(
     if let Some(handoff) = handoff.as_object_mut() {
         handoff.insert(
             "current_agent".to_string(),
-            JsonValue::String(agent_mode.to_string()),
+            JsonValue::String(active_agent.to_string()),
         );
         handoff.remove("handoff_summary");
     }
@@ -833,6 +927,40 @@ fn merge_chat_attachments_into_user_state(
     Some(user_state)
 }
 
+fn merge_configured_external_tool_names_into_user_state(
+    user_state: Option<JsonValue>,
+    configured_external_tool_names: Option<Vec<String>>,
+) -> Option<JsonValue> {
+    let configured_external_tool_names = configured_external_tool_names
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if configured_external_tool_names.is_empty() {
+        return user_state;
+    }
+
+    let mut user_state = match user_state {
+        Some(JsonValue::Object(map)) => JsonValue::Object(map),
+        _ => json!({}),
+    };
+
+    if let Some(root) = user_state.as_object_mut() {
+        root.insert(
+            "configured_external_tool_names".to_string(),
+            JsonValue::Array(
+                configured_external_tool_names
+                    .into_iter()
+                    .map(JsonValue::String)
+                    .collect(),
+            ),
+        );
+    }
+
+    Some(user_state)
+}
+
 fn build_chat_attachment_prompt(image_uris: &[UploadedImage]) -> Option<String> {
     if image_uris.is_empty() {
         return None;
@@ -918,28 +1046,50 @@ async fn ensure_protocol_state_loaded(
     state: &Arc<RwLock<ActorState>>,
     session_id: &str,
 ) -> Result<(), String> {
-    let (needs_load, sdk) = {
+    let (needs_load, needs_message_hydration, sdk) = {
         let s = state.read().await;
-        let needs_load = s
+        let (needs_load, needs_message_hydration) = s
             .sessions
             .get(session_id)
-            .map(|session| !session.protocol_loaded)
-            .unwrap_or(true);
-        (needs_load, s.sdk.clone())
+            .map(|session| (!session.protocol_loaded, session.messages.is_empty()))
+            .unwrap_or((true, true));
+        (needs_load, needs_message_hydration, s.sdk.clone())
     };
 
-    if !needs_load {
+    if !needs_load && !needs_message_hydration {
         return Ok(());
     }
 
-    let stored = match sdk {
-        Some(sdk) => sdk
-            .get_chat_runtime_state_json(session_id)
-            .map_err(|e| format!("Failed to load chat runtime state: {}", e))?,
-        None => None,
+    let (stored_state, stored_messages) = match sdk {
+        Some(sdk) => {
+            let stored_state = if needs_load {
+                sdk.get_chat_runtime_state_json(session_id)
+                    .map_err(|e| format!("Failed to load chat runtime state: {}", e))?
+            } else {
+                None
+            };
+
+            let stored_messages = if needs_message_hydration {
+                sdk.list_chat_messages_json(session_id, None, 0)
+                    .map_err(|e| format!("Failed to load chat messages: {}", e))?
+                    .into_iter()
+                    .map(|json| {
+                        let mut message = serde_json::from_str::<CachedMessage>(&json)
+                            .map_err(|e| format!("Failed to parse cached chat message: {}", e))?;
+                        message.refresh_ui_elements();
+                        Ok(message)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            } else {
+                Vec::new()
+            };
+
+            (stored_state, stored_messages)
+        }
+        None => (None, Vec::new()),
     };
 
-    let loaded_state = match stored {
+    let loaded_state = match stored_state {
         Some(json) => serde_json::from_str::<ChatProtocolSessionState>(&json)
             .map_err(|e| format!("Failed to parse chat runtime state: {}", e))?,
         None => ChatProtocolSessionState::default(),
@@ -950,6 +1100,23 @@ async fn ensure_protocol_state_loaded(
     if !session.protocol_loaded {
         session.protocol_state = loaded_state;
         session.protocol_loaded = true;
+    }
+    if session.messages.is_empty() && !stored_messages.is_empty() {
+        session.index.clear();
+        session.sub_sessions.clear();
+        for message in stored_messages {
+            if let Some(sub_session) = message.sub_session.clone() {
+                session.sub_sessions.insert(
+                    sub_session.parent_tool_call_id.clone(),
+                    ProtocolSubSessionDraft::from_cached(sub_session),
+                );
+            }
+            let id = message.id.clone();
+            let idx = session.messages.len();
+            session.messages.push(message);
+            session.index.insert(id, idx);
+        }
+        session.version += 1;
     }
 
     Ok(())
@@ -1107,15 +1274,21 @@ fn proto_tool_outcome_to_runtime(outcome: &chat_proto::ChatToolCallOutcome) -> O
             result: Some(result.clone()),
             result_parts: None,
             error: None,
+            duration_ms: None,
         }),
         chat_proto::chat_tool_call_outcome::Outcome::Parts(parts_msg) => {
             let mut pending_exif = None;
+            let mut text_parts = Vec::new();
             let images = parts_msg
                 .parts
                 .iter()
                 .filter_map(|part| match &part.value {
                     Some(chat_proto::chat_content_part::Value::Text(text)) => {
-                        pending_exif = parse_image_exif_text(text);
+                        if let Some(exif) = parse_image_exif_text(text) {
+                            pending_exif = Some(exif);
+                        } else {
+                            text_parts.push(text.clone());
+                        }
                         None
                     }
                     Some(chat_proto::chat_content_part::Value::ImageUrl(img))
@@ -1130,12 +1303,14 @@ fn proto_tool_outcome_to_runtime(outcome: &chat_proto::ChatToolCallOutcome) -> O
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            let text_result = (!text_parts.is_empty()).then(|| text_parts.join("\n"));
             Some(ToolExecutionOutcome {
                 tool_call_id: outcome.tool_call_id.clone(),
                 tool_name: outcome.tool_name.clone(),
-                result: None,
+                result: if images.is_empty() { text_result } else { None },
                 result_parts: if images.is_empty() { None } else { Some(images) },
                 error: None,
+                duration_ms: None,
             })
         }
         chat_proto::chat_tool_call_outcome::Outcome::Error(error) => Some(ToolExecutionOutcome {
@@ -1144,6 +1319,7 @@ fn proto_tool_outcome_to_runtime(outcome: &chat_proto::ChatToolCallOutcome) -> O
             result: None,
             result_parts: None,
             error: Some(error.clone()),
+            duration_ms: None,
         }),
     }
 }
@@ -1296,7 +1472,8 @@ impl ChatRuntime {
         system_prompt: Option<String>,
         references: Option<JsonValue>,
         attachments: Option<JsonValue>,
-        agent_mode: Option<String>,
+        active_agent: Option<String>,
+        configured_external_tool_names: Option<Vec<String>>,
         user_msg_id: Option<String>,
         assistant_msg_id: Option<String>,
     ) -> Result<(), String> {
@@ -1308,7 +1485,8 @@ impl ChatRuntime {
                 system_prompt,
                 references,
                 attachments,
-                agent_mode,
+                active_agent,
+                configured_external_tool_names,
                 user_msg_id,
                 assistant_msg_id,
                 reply: reply_tx,
@@ -1533,7 +1711,8 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
                 system_prompt,
                 references,
                 attachments,
-                agent_mode,
+                active_agent,
+                configured_external_tool_names,
                 user_msg_id,
                 assistant_msg_id,
                 reply,
@@ -1545,7 +1724,8 @@ async fn run_actor(mut cmd_rx: mpsc::Receiver<Command>, sdk: Arc<TriggerSdk>) {
                     system_prompt,
                     references,
                     attachments,
-                    agent_mode,
+                    active_agent,
+                    configured_external_tool_names,
                     user_msg_id,
                     assistant_msg_id,
                 )
@@ -1931,7 +2111,8 @@ async fn handle_send_message(
     system_prompt: Option<String>,
     references: Option<JsonValue>,
     attachments: Option<JsonValue>,
-    agent_mode: Option<String>,
+    active_agent: Option<String>,
+    configured_external_tool_names: Option<Vec<String>>,
     user_msg_id: Option<String>,
     assistant_msg_id: Option<String>,
 ) -> Result<(), String> {
@@ -2069,10 +2250,14 @@ async fn handle_send_message(
                 .or_else(|| Some(value.clone()))
         });
         let attachment_context = uploaded_images_to_user_state(&image_uris);
+        let incoming_configured_external_tool_names = configured_external_tool_names.clone();
         let effective_user_state = merge_chat_attachments_into_user_state(
-            merge_active_context_into_user_state(
-                apply_agent_mode_override(latest_user_state, agent_mode.as_deref()),
-                normalized_active_context,
+            merge_configured_external_tool_names_into_user_state(
+                merge_active_context_into_user_state(
+                    apply_active_agent_override(latest_user_state, active_agent.as_deref()),
+                    normalized_active_context,
+                ),
+                configured_external_tool_names,
             ),
             attachment_context,
         );
@@ -2084,7 +2269,30 @@ async fn handle_send_message(
             raw_active_context.as_ref(),
             attachment_prompt.as_deref(),
         );
+            let effective_agent_mode = effective_user_state
+                .as_ref()
+                .and_then(|value| value.get("agent_mode"))
+                .and_then(JsonValue::as_str)
+                .map(ToString::to_string);
+            let effective_configured_external_tool_names = effective_user_state
+                .as_ref()
+                .and_then(|value| value.get("configured_external_tool_names"))
+                .and_then(JsonValue::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(JsonValue::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
         let mut request_history = session.protocol_state.history.clone();
+        tracing::info!(
+            session_id = %session_id,
+            history_count = request_history.len(),
+            history = ?request_history.iter().map(summarize_protocol_history_message).collect::<Vec<_>>(),
+            "[ChatRuntime] building start input from protocol history"
+        );
         if let Some(sys) = transient_system_prompt {
             request_history.push(ProtocolHistoryMessage {
                 id: format!("system_{}", now_ms),
@@ -2096,6 +2304,17 @@ async fn handle_send_message(
             });
         }
 
+        let extra_tools = external_tool_schema::chat_start_extra_tools(effective_user_state.as_ref());
+        tracing::info!(
+            session_id = %session_id,
+            incoming_active_agent = ?active_agent,
+            incoming_configured_external_tool_names = ?incoming_configured_external_tool_names,
+            effective_agent_mode = ?effective_agent_mode,
+            effective_configured_external_tool_names = ?effective_configured_external_tool_names,
+            extra_tool_count = extra_tools.len(),
+            "[ChatRuntime] built start input extra tools"
+        );
+
         chat_proto::ChatStartInput {
             history: request_history
                 .iter()
@@ -2103,7 +2322,7 @@ async fn handle_send_message(
                 .collect(),
             current: Some(current_input.clone()),
             metadata: build_chat_start_metadata(&config, &session_id),
-            extra_tools: external_tool_schema::chat_start_extra_tools(effective_user_state.as_ref()),
+            extra_tools,
             user_state: effective_user_state
                 .clone()
                 .map(json_value_to_prost_struct),
@@ -2298,10 +2517,11 @@ async fn handle_resume(
                 .push(outcome_to_protocol_tool_message(outcome));
         }
         session.protocol_state.pending_tool_execution = None;
+        let resume_results = serialize_tool_outcomes_for_resume(&session_id, "manual_resume", &all_results);
 
         let resume_input = chat_proto::ChatResumeInput {
             state: Some(json_value_to_prost_struct(normalized_state)),
-            results: all_results.iter().filter_map(tool_outcome_to_proto).collect(),
+            results: resume_results,
         };
 
         session.current_run_id = Some(run_id);
@@ -2564,12 +2784,6 @@ async fn run_stream_loop(
                                 );
                             }
 
-                            if let Some(chat_stream_event::Event::Interrupt(interrupt_event)) = event.event.as_ref() {
-                                if !interrupt_event.interrupts.is_empty() {
-                                    return Err("Interrupt-based tool flow is no longer supported; expected external tool calling".to_string());
-                                }
-                            }
-
                             match process_stream_event(
                                 &state,
                                 &session_id,
@@ -2582,6 +2796,19 @@ async fn run_stream_loop(
                                     auto_resume_count += 1;
                                     if auto_resume_count > config.max_auto_resumes {
                                         return Err("Max auto-resume limit reached".to_string());
+                                    }
+
+                                    {
+                                        let mut s = state.write().await;
+                                        if let Some(session) = s.sessions.get_mut(&session_id) {
+                                            turn_state.flush_phase_into_history(session, &current_assistant_id);
+                                            tracing::info!(
+                                                session_id = %session_id,
+                                                assistant_id = %current_assistant_id,
+                                                history_len = session.protocol_state.history.len(),
+                                                "Flushed tool phase into protocol history before auto-resume"
+                                            );
+                                        }
                                     }
 
                                     tracing::info!(
@@ -2821,8 +3048,10 @@ async fn process_stream_event(
                 let message = CachedMessage::tool_result(
                     format!("tool_result:{}", tool_delta.id),
                     tool_name,
+                    Some(tool_delta.id.clone()),
                     combined,
                     now_ms,
+                    None,
                 );
                 session.upsert(message);
                 Some(session.version)
@@ -2845,6 +3074,7 @@ async fn process_stream_event(
                 result: Some(tool_result.result.clone()),
                 result_parts: None,
                 error: None,
+                duration_ms: None,
             };
             turn_state.record_tool_result_message(&outcome);
 
@@ -2873,8 +3103,10 @@ async fn process_stream_event(
                 let message = CachedMessage::tool_result(
                     format!("tool_result:{}", tool_result.id),
                     tool_name,
+                    Some(tool_result.id.clone()),
                     tool_result.result.clone(),
                     now_ms,
+                    None,
                 );
                 session.upsert(message);
                 Some(session.version)
@@ -3055,6 +3287,15 @@ async fn handle_need_tool_execution_event(
         .iter()
         .filter_map(proto_tool_outcome_to_runtime)
         .collect::<Vec<_>>();
+    tracing::info!(
+        session_id = %session_id,
+        assistant_id = %assistant_id,
+        upstream_completed_results = event.completed_results.len(),
+        parsed_completed_results = completed_results.len(),
+        parsed_results = ?completed_results.iter().map(summarize_tool_outcome).collect::<Vec<_>>(),
+        requested_tool_calls = ?event.tool_calls.iter().map(|tool_call| format!("{}:{}", tool_call.id, tool_call.tool_name)).collect::<Vec<_>>(),
+        "Chat runtime received need_tool_execution event"
+    );
     for outcome in &completed_results {
         turn_state.record_tool_result_message(outcome);
     }
@@ -3085,8 +3326,14 @@ async fn handle_need_tool_execution_event(
     }
 
     let mut s = state.write().await;
-    if let Some(session) = s.sessions.get_mut(session_id) {
+    let version_opt = if let Some(session) = s.sessions.get_mut(session_id) {
         session.protocol_state.latest_state = Some(normalized_state.clone());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        upsert_tool_outcomes_in_session_cache(session, &completed_results, now_ms);
+        upsert_tool_outcomes_in_session_cache(session, &execution_plan.resolved_results, now_ms);
         if execution_plan.pending_calls.is_empty() {
             turn_state.commit_completed(session, assistant_id);
         } else {
@@ -3098,6 +3345,16 @@ async fn handle_need_tool_execution_event(
             };
             turn_state.commit_need_tool_execution(session, assistant_id, pending_state);
         }
+        Some(session.version)
+    } else {
+        None
+    };
+
+    if let Some(version) = version_opt {
+        s.emit_event(ChatRuntimeEvent::CacheUpdated {
+            session_id: session_id.to_string(),
+            version,
+        });
     }
 
     if execution_plan.trigger_scheduler_sync_needed {
@@ -3115,11 +3372,62 @@ async fn handle_need_tool_execution_event(
     let mut all_results = Vec::new();
     all_results.extend(completed_results);
     all_results.extend(execution_plan.resolved_results);
+    let resume_results = serialize_tool_outcomes_for_resume(session_id, "auto_resume", &all_results);
 
     Ok(StreamControl::AutoResume(chat_proto::ChatResumeInput {
         state: Some(json_value_to_prost_struct(normalized_state)),
-        results: all_results.iter().filter_map(tool_outcome_to_proto).collect(),
+        results: resume_results,
     }))
+}
+
+fn upsert_tool_outcomes_in_session_cache(
+    session: &mut SessionState,
+    outcomes: &[ToolExecutionOutcome],
+    now_ms: i64,
+) {
+    for outcome in outcomes {
+        if !outcome.tool_name.trim().is_empty() {
+            session
+                .tool_call_name
+                .insert(outcome.tool_call_id.clone(), outcome.tool_name.clone());
+        }
+
+        let result_text = tool_outcome_display_text(outcome);
+        session
+            .tool_result_content
+            .insert(outcome.tool_call_id.clone(), result_text.clone());
+
+        let message = CachedMessage::tool_result(
+            format!("tool_result:{}", outcome.tool_call_id),
+            outcome.tool_name.clone(),
+            Some(outcome.tool_call_id.clone()),
+            result_text,
+            now_ms,
+            outcome.duration_ms,
+        );
+        session.upsert(message);
+    }
+}
+
+fn tool_outcome_display_text(outcome: &ToolExecutionOutcome) -> String {
+    if let Some(result) = &outcome.result {
+        return result.clone();
+    }
+    if let Some(error) = &outcome.error {
+        return error.clone();
+    }
+    if let Some(parts) = &outcome.result_parts {
+        let mut segments = parts
+            .iter()
+            .filter_map(|part| image_part_exif_text(part.exif.as_ref()))
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            segments.push("Returned image result".to_string());
+        }
+        return segments.join("\n\n");
+    }
+
+    String::new()
 }
 
 async fn persist_session(state: &Arc<RwLock<ActorState>>, session_id: &str) {
@@ -3336,6 +3644,7 @@ mod tests {
                 exif: Some(expected_exif.clone()),
             }]),
             error: None,
+            duration_ms: None,
         };
 
         let proto = tool_outcome_to_proto(&outcome).expect("tool outcome proto");
@@ -3347,6 +3656,83 @@ mod tests {
 
         assert_eq!(part.media_type, "image/jpeg");
         assert_eq!(part.exif, Some(expected_exif));
+    }
+
+    #[test]
+    fn tool_outcome_proto_round_trip_preserves_text_only_parts() {
+        let proto = chat_proto::ChatToolCallOutcome {
+            tool_call_id: "agent_doc_read:0".to_string(),
+            tool_name: "agent_doc_read".to_string(),
+            outcome: Some(chat_proto::chat_tool_call_outcome::Outcome::Parts(
+                chat_proto::ChatToolCallResultParts {
+                    parts: vec![chat_proto::ChatContentPart {
+                        r#type: "text".to_string(),
+                        value: Some(chat_proto::chat_content_part::Value::Text(
+                            "# manager\ncontent".to_string(),
+                        )),
+                    }],
+                },
+            )),
+        };
+
+        let round_trip = proto_tool_outcome_to_runtime(&proto).expect("runtime outcome");
+        assert_eq!(round_trip.result.as_deref(), Some("# manager\ncontent"));
+        assert!(round_trip.result_parts.is_none());
+
+        let encoded = tool_outcome_to_proto(&round_trip).expect("tool outcome proto");
+        match encoded.outcome {
+            Some(chat_proto::chat_tool_call_outcome::Outcome::Result(result)) => {
+                assert_eq!(result, "# manager\ncontent");
+            }
+            other => panic!("expected plain result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn flush_phase_after_need_tool_execution_does_not_duplicate_assistant() {
+        let assistant_id = "assistant-tool-phase";
+        let mut turn_state = ProtocolTurnState::default();
+        let mut session = SessionState::default();
+
+        turn_state.record_tool_call_start("agent_doc_read:0", "agent_doc_read");
+        turn_state.record_tool_call_delta("agent_doc_read:0", r#"{"agent_id":"manager"}"#);
+
+        turn_state.commit_need_tool_execution(
+            &mut session,
+            assistant_id,
+            PendingToolExecutionState {
+                state: JsonValue::Null,
+                completed_results: Vec::new(),
+                resolved_results: Vec::new(),
+                pending_calls: Vec::new(),
+            },
+        );
+
+        turn_state.record_tool_result_message(&ToolExecutionOutcome {
+            tool_call_id: "agent_doc_read:0".to_string(),
+            tool_name: "agent_doc_read".to_string(),
+            result: Some("# manager".to_string()),
+            result_parts: None,
+            error: None,
+            duration_ms: None,
+        });
+
+        turn_state.flush_phase_into_history(&mut session, assistant_id);
+
+        assert_eq!(session.protocol_state.history.len(), 2);
+        assert_eq!(
+            session
+                .protocol_state
+                .history
+                .iter()
+                .filter(|message| message.id == assistant_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            session.protocol_state.history[1].tool_call_id.as_deref(),
+            Some("agent_doc_read:0")
+        );
     }
 
     #[test]

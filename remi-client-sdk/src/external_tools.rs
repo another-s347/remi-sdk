@@ -108,7 +108,11 @@ impl ExternalToolExecutor {
                 "[ExternalToolExecutor] Local tool handler finished"
             );
 
-            let outcome = raw_resume_value_to_outcome(&pending_call, resume_value);
+            let outcome = raw_resume_value_to_outcome(
+                &pending_call,
+                resume_value,
+                Some(started_at.elapsed().as_millis() as u64),
+            );
             if tool_kind == "trigger_rule_published" && outcome.error.is_none() {
                 plan.trigger_scheduler_sync_needed = true;
             }
@@ -155,7 +159,7 @@ pub fn manual_resume_outcomes(
             })
             .ok_or_else(|| format!("Missing resume value for tool call {}", call.tool_call_id))?;
 
-        outcomes.push(raw_resume_value_to_outcome(call, RichHandlerResult::Json(raw)));
+        outcomes.push(raw_resume_value_to_outcome(call, RichHandlerResult::Json(raw), None));
     }
 
     Ok(outcomes)
@@ -195,6 +199,17 @@ fn tool_call_display_payload(tool_name: &str, arguments: &JsonValue) -> JsonValu
         "fetch" | "resolve_uri" => json!({
             "type": "fetch_request",
             "uri": arguments.get("uri").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
+        }),
+        "agent_doc_read" => json!({
+            "type": "agent_doc_read_request",
+            "agent_id": arguments.get("agent_id").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
+            "version_id": arguments.get("version_id").cloned().unwrap_or(JsonValue::Null),
+        }),
+        "agent_doc_edit" => json!({
+            "type": "agent_doc_edit_request",
+            "agent_id": arguments.get("agent_id").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
+            "version_id": arguments.get("version_id").cloned().unwrap_or(JsonValue::Null),
+            "raw_markdown": arguments.get("raw_markdown").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
         }),
         _ => json!({
             "type": "external_tool_call",
@@ -360,6 +375,7 @@ fn merge_tool_payload(interrupt_type: &str, arguments: &JsonValue) -> JsonValue 
 fn raw_resume_value_to_outcome(
     call: &PendingToolCall,
     raw: RichHandlerResult,
+    duration_ms: Option<u64>,
 ) -> ToolExecutionOutcome {
     match raw {
         RichHandlerResult::Image(img) => ToolExecutionOutcome {
@@ -368,6 +384,7 @@ fn raw_resume_value_to_outcome(
             result: None,
             result_parts: Some(vec![img]),
             error: None,
+            duration_ms,
         },
         RichHandlerResult::Json(json_val) => {
             let error = json_val
@@ -383,6 +400,7 @@ fn raw_resume_value_to_outcome(
                     result: None,
                     result_parts: None,
                     error: Some(error),
+                    duration_ms,
                 },
                 None => ToolExecutionOutcome {
                     tool_call_id: call.tool_call_id.clone(),
@@ -393,6 +411,7 @@ fn raw_resume_value_to_outcome(
                     }),
                     result_parts: None,
                     error: None,
+                    duration_ms,
                 },
             }
         }

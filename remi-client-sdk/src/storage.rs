@@ -1,6 +1,7 @@
 use crate::types::{
-    ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, ChatSession,
-    ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow, EventPayload, LocationCacheEntry,
+    ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, AgentVersion,
+    AgentVersionUpdate, ChatSession, ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow,
+    EvalDataset, EvalDatasetRun, EvalDatasetRunEval, EvalDatasetRunItem, EvalDatasetSession, EvalDatasetUpdate, EventPayload, LocationCacheEntry,
     NotificationEntry, NotificationGroup, NotificationResponseAction, NotificationSource,
     StoredEvent, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
     ThingsOperationType, TriggerInfo, TriggerLogEntry, TriggerLogLevel, TriggerRegistration,
@@ -279,6 +280,101 @@ impl Storage {
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS agent_versions (
+                version_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                raw_markdown TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                applied_at INTEGER,
+                user_id TEXT DEFAULT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_versions_agent_updated
+                ON agent_versions(agent_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS eval_datasets (
+                dataset_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                user_id TEXT DEFAULT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_eval_datasets_updated
+                ON eval_datasets(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS eval_dataset_sessions (
+                dataset_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                user_id TEXT DEFAULT NULL,
+                PRIMARY KEY(dataset_id, session_id),
+                FOREIGN KEY (dataset_id) REFERENCES eval_datasets(dataset_id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(session_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_eval_dataset_sessions_dataset_added
+                ON eval_dataset_sessions(dataset_id, added_at DESC);
+
+            CREATE TABLE IF NOT EXISTS eval_dataset_runs (
+                run_id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                agent_version_id TEXT,
+                agent_version_name TEXT,
+                variant_id TEXT NOT NULL,
+                variant_label TEXT NOT NULL,
+                source_session_count INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                user_id TEXT DEFAULT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_eval_dataset_runs_dataset_created
+                ON eval_dataset_runs(dataset_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS eval_dataset_run_items (
+                run_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                final_text TEXT NOT NULL,
+                reasoning TEXT,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                tool_results_json TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                cancelled INTEGER NOT NULL DEFAULT 0,
+                interrupted INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                user_id TEXT DEFAULT NULL,
+                PRIMARY KEY(run_id, session_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_eval_dataset_run_items_run
+                ON eval_dataset_run_items(run_id, created_at ASC);
+
+            CREATE TABLE IF NOT EXISTS eval_dataset_run_evals (
+                run_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                analysis_agent_id TEXT NOT NULL,
+                score TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                user_id TEXT DEFAULT NULL,
+                PRIMARY KEY(run_id, session_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_eval_dataset_run_evals_run
+                ON eval_dataset_run_evals(run_id, created_at ASC);
+
             CREATE INDEX IF NOT EXISTS idx_chat_sessions_last_activity
                 ON chat_sessions(last_activity DESC);
 
@@ -478,6 +574,31 @@ impl Storage {
             );
         }
 
+        let _ = conn.execute(
+            "ALTER TABLE agent_versions ADD COLUMN user_id TEXT DEFAULT NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE eval_datasets ADD COLUMN user_id TEXT DEFAULT NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE eval_dataset_sessions ADD COLUMN user_id TEXT DEFAULT NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE eval_dataset_runs ADD COLUMN user_id TEXT DEFAULT NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE eval_dataset_run_items ADD COLUMN user_id TEXT DEFAULT NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE eval_dataset_run_evals ADD COLUMN user_id TEXT DEFAULT NULL",
+            [],
+        );
+
         Ok(())
     }
 
@@ -496,6 +617,12 @@ impl Storage {
             "trigger_bindings",
             "chat_sessions",
             "chat_messages",
+            "agent_versions",
+            "eval_datasets",
+            "eval_dataset_sessions",
+            "eval_dataset_runs",
+            "eval_dataset_run_items",
+            "eval_dataset_run_evals",
             "things_change_log",
             "things_content_snapshots",
             "crdt_documents",
@@ -2230,6 +2357,11 @@ impl Storage {
     pub fn delete_chat_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(
+            "DELETE FROM eval_dataset_sessions WHERE session_id = ?1",
+            [session_id],
+        )
+        .context("Failed to delete dataset session membership")?;
+        conn.execute(
             "DELETE FROM chat_messages WHERE session_id = ?1",
             [session_id],
         )
@@ -2245,6 +2377,474 @@ impl Storage {
         )
         .context("Failed to delete chat session")?;
         Ok(())
+    }
+
+    // ===== Agent Versions =====
+
+    pub fn create_agent_version(&self, version: &AgentVersion) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"INSERT INTO agent_versions (version_id, agent_id, name, raw_markdown, created_at, updated_at, applied_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            params![
+                version.version_id,
+                version.agent_id,
+                version.name,
+                version.raw_markdown,
+                version.created_at.timestamp(),
+                version.updated_at.timestamp(),
+                version.applied_at.map(|value| value.timestamp()),
+            ],
+        )
+        .context("Failed to create agent version")?;
+        Ok(())
+    }
+
+    pub fn get_agent_version(&self, version_id: &str) -> Result<Option<AgentVersion>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT version_id, agent_id, name, raw_markdown, created_at, updated_at, applied_at FROM agent_versions WHERE version_id = ?1",
+        )?;
+        let version = stmt
+            .query_row([version_id], |row| Self::map_agent_version_row(row))
+            .optional()
+            .context("Failed to fetch agent version")?;
+        Ok(version)
+    }
+
+    pub fn list_agent_versions(&self, agent_id: &str) -> Result<Vec<AgentVersion>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT version_id, agent_id, name, raw_markdown, created_at, updated_at, applied_at FROM agent_versions WHERE agent_id = ?1 ORDER BY updated_at DESC, created_at DESC",
+        )?;
+        let versions = stmt
+            .query_map([agent_id], Self::map_agent_version_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list agent versions")?;
+        Ok(versions)
+    }
+
+    pub fn update_agent_version(&self, update: &AgentVersionUpdate) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"UPDATE agent_versions
+               SET name = ?1, raw_markdown = ?2, updated_at = ?3
+               WHERE version_id = ?4"#,
+            params![
+                update.name,
+                update.raw_markdown,
+                update.updated_at.timestamp(),
+                update.version_id,
+            ],
+        )
+        .context("Failed to update agent version")?;
+        Ok(())
+    }
+
+    pub fn mark_agent_version_applied(
+        &self,
+        version_id: &str,
+        agent_id: &str,
+        applied_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE agent_versions SET applied_at = NULL WHERE agent_id = ?1",
+            [agent_id],
+        )
+        .context("Failed to clear applied agent version markers")?;
+        tx.execute(
+            "UPDATE agent_versions SET applied_at = ?1, updated_at = ?1 WHERE version_id = ?2",
+            params![applied_at.timestamp(), version_id],
+        )
+        .context("Failed to mark agent version as applied")?;
+        tx.commit().context("Failed to commit agent version apply marker")?;
+        Ok(())
+    }
+
+    pub fn delete_agent_version(&self, version_id: &str) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            "DELETE FROM agent_versions WHERE version_id = ?1",
+            [version_id],
+        )
+        .context("Failed to delete agent version")?;
+        Ok(())
+    }
+
+    // ===== Eval Datasets =====
+
+    pub fn create_eval_dataset(&self, dataset: &EvalDataset) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"INSERT INTO eval_datasets (dataset_id, name, description, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            params![
+                dataset.dataset_id,
+                dataset.name,
+                dataset.description,
+                dataset.created_at.timestamp(),
+                dataset.updated_at.timestamp(),
+            ],
+        )
+        .context("Failed to create eval dataset")?;
+        Ok(())
+    }
+
+    pub fn get_eval_dataset(&self, dataset_id: &str) -> Result<Option<EvalDataset>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT dataset_id, name, description, created_at, updated_at FROM eval_datasets WHERE dataset_id = ?1",
+        )?;
+        let dataset = stmt
+            .query_row([dataset_id], |row| Self::map_eval_dataset_row(row))
+            .optional()
+            .context("Failed to fetch eval dataset")?;
+        Ok(dataset)
+    }
+
+    pub fn list_eval_datasets(&self) -> Result<Vec<EvalDataset>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT dataset_id, name, description, created_at, updated_at FROM eval_datasets ORDER BY updated_at DESC, created_at DESC",
+        )?;
+        let datasets = stmt
+            .query_map([], Self::map_eval_dataset_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list eval datasets")?;
+        Ok(datasets)
+    }
+
+    pub fn update_eval_dataset(&self, update: &EvalDatasetUpdate) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"UPDATE eval_datasets
+               SET name = ?1, description = ?2, updated_at = ?3
+               WHERE dataset_id = ?4"#,
+            params![
+                update.name,
+                update.description,
+                update.updated_at.timestamp(),
+                update.dataset_id,
+            ],
+        )
+        .context("Failed to update eval dataset")?;
+        Ok(())
+    }
+
+    pub fn delete_eval_dataset(&self, dataset_id: &str) -> Result<()> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM eval_dataset_run_evals WHERE dataset_id = ?1",
+            [dataset_id],
+        )
+        .context("Failed to delete eval dataset run evals")?;
+        tx.execute(
+            "DELETE FROM eval_dataset_run_items WHERE dataset_id = ?1",
+            [dataset_id],
+        )
+        .context("Failed to delete eval dataset run items")?;
+        tx.execute(
+            "DELETE FROM eval_dataset_runs WHERE dataset_id = ?1",
+            [dataset_id],
+        )
+        .context("Failed to delete eval dataset runs")?;
+        tx.execute(
+            "DELETE FROM eval_dataset_sessions WHERE dataset_id = ?1",
+            [dataset_id],
+        )
+        .context("Failed to delete eval dataset sessions")?;
+        tx.execute(
+            "DELETE FROM eval_datasets WHERE dataset_id = ?1",
+            [dataset_id],
+        )
+        .context("Failed to delete eval dataset")?;
+        tx.commit().context("Failed to commit eval dataset deletion")?;
+        Ok(())
+    }
+
+    pub fn add_session_to_dataset(&self, item: &EvalDatasetSession) -> Result<()> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            r#"INSERT INTO eval_dataset_sessions (dataset_id, session_id, added_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(dataset_id, session_id) DO UPDATE SET added_at = excluded.added_at"#,
+            params![item.dataset_id, item.session_id, item.added_at.timestamp()],
+        )
+        .context("Failed to add session to dataset")?;
+        tx.execute(
+            "UPDATE eval_datasets SET updated_at = ?1 WHERE dataset_id = ?2",
+            params![item.added_at.timestamp(), item.dataset_id],
+        )
+        .context("Failed to bump eval dataset updated_at after adding session")?;
+        tx.commit().context("Failed to commit dataset session add")?;
+        Ok(())
+    }
+
+    pub fn remove_session_from_dataset(&self, dataset_id: &str, session_id: &str) -> Result<()> {
+        let conn = self.connection()?;
+        let now = Utc::now().timestamp();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM eval_dataset_sessions WHERE dataset_id = ?1 AND session_id = ?2",
+            params![dataset_id, session_id],
+        )
+        .context("Failed to remove session from dataset")?;
+        tx.execute(
+            "UPDATE eval_datasets SET updated_at = ?1 WHERE dataset_id = ?2",
+            params![now, dataset_id],
+        )
+        .context("Failed to bump eval dataset updated_at after removing session")?;
+        tx.commit().context("Failed to commit dataset session removal")?;
+        Ok(())
+    }
+
+    pub fn list_dataset_sessions(&self, dataset_id: &str) -> Result<Vec<EvalDatasetSession>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT ds.dataset_id, ds.session_id, ds.added_at, cs.title, cs.last_activity, cs.message_count
+               FROM eval_dataset_sessions ds
+               LEFT JOIN chat_sessions cs ON cs.session_id = ds.session_id
+               WHERE ds.dataset_id = ?1
+               ORDER BY ds.added_at DESC"#,
+        )?;
+        let items = stmt
+            .query_map([dataset_id], |row| {
+                let added_at_ts: i64 = row.get(2)?;
+                let last_activity_ts: Option<i64> = row.get(4)?;
+                Ok(EvalDatasetSession {
+                    dataset_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    added_at: Self::timestamp_or_now(added_at_ts),
+                    title: row.get(3)?,
+                    last_activity: last_activity_ts.map(Self::timestamp_or_now),
+                    message_count: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list dataset sessions")?;
+        Ok(items)
+    }
+
+    pub fn create_eval_dataset_run(
+        &self,
+        run: &EvalDatasetRun,
+        items: &[EvalDatasetRunItem],
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            r#"INSERT INTO eval_dataset_runs (
+                    run_id, dataset_id, agent_id, agent_version_id, agent_version_name,
+                    variant_id, variant_label, source_session_count, created_at, updated_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            params![
+                run.run_id,
+                run.dataset_id,
+                run.agent_id,
+                run.agent_version_id,
+                run.agent_version_name,
+                run.variant_id,
+                run.variant_label,
+                run.source_session_count,
+                run.created_at.timestamp(),
+                run.updated_at.timestamp(),
+            ],
+        )
+        .context("Failed to create eval dataset run")?;
+
+        for item in items {
+            tx.execute(
+                r#"INSERT INTO eval_dataset_run_items (
+                        run_id, dataset_id, session_id, final_text, reasoning,
+                        prompt_tokens, completion_tokens, tool_results_json,
+                        done, cancelled, interrupted, error, created_at, updated_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
+                params![
+                    item.run_id,
+                    item.dataset_id,
+                    item.session_id,
+                    item.final_text,
+                    item.reasoning,
+                    item.prompt_tokens,
+                    item.completion_tokens,
+                    item.tool_results_json,
+                    if item.done { 1 } else { 0 },
+                    if item.cancelled { 1 } else { 0 },
+                    if item.interrupted { 1 } else { 0 },
+                    item.error,
+                    item.created_at.timestamp(),
+                    item.updated_at.timestamp(),
+                ],
+            )
+            .context("Failed to create eval dataset run item")?;
+        }
+
+        tx.execute(
+            "UPDATE eval_datasets SET updated_at = ?1 WHERE dataset_id = ?2",
+            params![run.updated_at.timestamp(), run.dataset_id],
+        )
+        .context("Failed to bump eval dataset updated_at after replay run")?;
+        tx.commit().context("Failed to commit eval dataset run")?;
+        Ok(())
+    }
+
+    pub fn save_eval_dataset_run_evals(
+        &self,
+        run_id: &str,
+        dataset_id: &str,
+        evals: &[EvalDatasetRunEval],
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM eval_dataset_run_evals WHERE run_id = ?1",
+            [run_id],
+        )
+        .context("Failed to clear existing eval dataset run evals")?;
+
+        for item in evals {
+            tx.execute(
+                r#"INSERT INTO eval_dataset_run_evals (
+                        run_id, dataset_id, session_id, analysis_agent_id, score,
+                        summary, rationale, created_at, updated_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                params![
+                    item.run_id,
+                    item.dataset_id,
+                    item.session_id,
+                    item.analysis_agent_id,
+                    item.score,
+                    item.summary,
+                    item.rationale,
+                    item.created_at.timestamp(),
+                    item.updated_at.timestamp(),
+                ],
+            )
+            .context("Failed to persist eval dataset run eval")?;
+        }
+
+        tx.execute(
+            "UPDATE eval_dataset_runs SET updated_at = ?1 WHERE run_id = ?2",
+            params![updated_at.timestamp(), run_id],
+        )
+        .context("Failed to bump eval dataset run updated_at after analysis")?;
+        tx.execute(
+            "UPDATE eval_datasets SET updated_at = ?1 WHERE dataset_id = ?2",
+            params![updated_at.timestamp(), dataset_id],
+        )
+        .context("Failed to bump eval dataset updated_at after analysis")?;
+        tx.commit().context("Failed to commit eval dataset run evals")?;
+        Ok(())
+    }
+
+    pub fn list_eval_dataset_runs(&self, dataset_id: &str) -> Result<Vec<EvalDatasetRun>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT run_id, dataset_id, agent_id, agent_version_id, agent_version_name,
+                      variant_id, variant_label, source_session_count, created_at, updated_at
+               FROM eval_dataset_runs
+               WHERE dataset_id = ?1
+               ORDER BY created_at DESC"#,
+        )?;
+        let runs = stmt
+            .query_map([dataset_id], |row| Self::map_eval_dataset_run_row(row))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list eval dataset runs")?;
+        Ok(runs)
+    }
+
+    pub fn get_eval_dataset_run(&self, run_id: &str) -> Result<Option<EvalDatasetRun>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT run_id, dataset_id, agent_id, agent_version_id, agent_version_name,
+                      variant_id, variant_label, source_session_count, created_at, updated_at
+               FROM eval_dataset_runs
+               WHERE run_id = ?1"#,
+        )?;
+        let run = stmt
+            .query_row([run_id], |row| Self::map_eval_dataset_run_row(row))
+            .optional()
+            .context("Failed to fetch eval dataset run")?;
+        Ok(run)
+    }
+
+    pub fn list_eval_dataset_run_items(&self, run_id: &str) -> Result<Vec<EvalDatasetRunItem>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT i.run_id, i.dataset_id, i.session_id, cs.title, cs.last_activity, cs.message_count,
+                      i.final_text, i.reasoning, i.prompt_tokens, i.completion_tokens,
+                      i.tool_results_json, i.done, i.cancelled, i.interrupted, i.error,
+                      i.created_at, i.updated_at
+               FROM eval_dataset_run_items i
+               LEFT JOIN chat_sessions cs ON cs.session_id = i.session_id
+               WHERE i.run_id = ?1
+               ORDER BY i.created_at ASC"#,
+        )?;
+        let items = stmt
+            .query_map([run_id], |row| {
+                let last_activity_ts: Option<i64> = row.get(4)?;
+                let done: i64 = row.get(11)?;
+                let cancelled: i64 = row.get(12)?;
+                let interrupted: i64 = row.get(13)?;
+                let created_at_ts: i64 = row.get(15)?;
+                let updated_at_ts: i64 = row.get(16)?;
+                Ok(EvalDatasetRunItem {
+                    run_id: row.get(0)?,
+                    dataset_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    title: row.get(3)?,
+                    last_activity: last_activity_ts.map(Self::timestamp_or_now),
+                    message_count: row.get(5)?,
+                    final_text: row.get(6)?,
+                    reasoning: row.get(7)?,
+                    prompt_tokens: row.get(8)?,
+                    completion_tokens: row.get(9)?,
+                    tool_results_json: row.get(10)?,
+                    done: done != 0,
+                    cancelled: cancelled != 0,
+                    interrupted: interrupted != 0,
+                    error: row.get(14)?,
+                    created_at: Self::timestamp_or_now(created_at_ts),
+                    updated_at: Self::timestamp_or_now(updated_at_ts),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list eval dataset run items")?;
+        Ok(items)
+    }
+
+    pub fn list_eval_dataset_run_evals(&self, run_id: &str) -> Result<Vec<EvalDatasetRunEval>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT run_id, dataset_id, session_id, analysis_agent_id, score, summary, rationale, created_at, updated_at
+               FROM eval_dataset_run_evals
+               WHERE run_id = ?1
+               ORDER BY created_at ASC"#,
+        )?;
+        let items = stmt
+            .query_map([run_id], |row| {
+                let created_at_ts: i64 = row.get(7)?;
+                let updated_at_ts: i64 = row.get(8)?;
+                Ok(EvalDatasetRunEval {
+                    run_id: row.get(0)?,
+                    dataset_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    analysis_agent_id: row.get(3)?,
+                    score: row.get(4)?,
+                    summary: row.get(5)?,
+                    rationale: row.get(6)?,
+                    created_at: Self::timestamp_or_now(created_at_ts),
+                    updated_at: Self::timestamp_or_now(updated_at_ts),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list eval dataset run evals")?;
+        Ok(items)
     }
 
     // ===== Chat Messages =====
@@ -2318,6 +2918,56 @@ impl Storage {
         )
         .context("Failed to delete chat messages")?;
         Ok(())
+    }
+
+    fn timestamp_or_now(timestamp: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(timestamp, 0)
+            .single()
+            .unwrap_or_else(Utc::now)
+    }
+
+    fn map_agent_version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentVersion> {
+        let created_at_ts: i64 = row.get(4)?;
+        let updated_at_ts: i64 = row.get(5)?;
+        let applied_at_ts: Option<i64> = row.get(6)?;
+        Ok(AgentVersion {
+            version_id: row.get(0)?,
+            agent_id: row.get(1)?,
+            name: row.get(2)?,
+            raw_markdown: row.get(3)?,
+            created_at: Self::timestamp_or_now(created_at_ts),
+            updated_at: Self::timestamp_or_now(updated_at_ts),
+            applied_at: applied_at_ts.map(Self::timestamp_or_now),
+        })
+    }
+
+    fn map_eval_dataset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvalDataset> {
+        let created_at_ts: i64 = row.get(3)?;
+        let updated_at_ts: i64 = row.get(4)?;
+        Ok(EvalDataset {
+            dataset_id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            created_at: Self::timestamp_or_now(created_at_ts),
+            updated_at: Self::timestamp_or_now(updated_at_ts),
+        })
+    }
+
+    fn map_eval_dataset_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvalDatasetRun> {
+        let created_at_ts: i64 = row.get(8)?;
+        let updated_at_ts: i64 = row.get(9)?;
+        Ok(EvalDatasetRun {
+            run_id: row.get(0)?,
+            dataset_id: row.get(1)?,
+            agent_id: row.get(2)?,
+            agent_version_id: row.get(3)?,
+            agent_version_name: row.get(4)?,
+            variant_id: row.get(5)?,
+            variant_label: row.get(6)?,
+            source_session_count: row.get(7)?,
+            created_at: Self::timestamp_or_now(created_at_ts),
+            updated_at: Self::timestamp_or_now(updated_at_ts),
+        })
     }
 
     /// Create or update runtime-owned chat protocol state for a session.

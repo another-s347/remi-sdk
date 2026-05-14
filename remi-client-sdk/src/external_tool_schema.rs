@@ -28,6 +28,15 @@ const MANAGED_EXTERNAL_TOOL_NAMES: &[&str] = &[
 enum ChatAgentMode {
     Ask,
     Manager,
+    Refiner,
+}
+
+fn normalize_active_agent_name(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "light" => "ask".to_string(),
+        "deep" | "auto" | "" => "manager".to_string(),
+        other => other.to_string(),
+    }
 }
 
 pub(crate) fn chat_start_extra_tools(user_state: Option<&JsonValue>) -> Vec<ProstStruct> {
@@ -74,19 +83,100 @@ fn mode_for_user_state(user_state: Option<&JsonValue>) -> ChatAgentMode {
                 .or_else(|| value.get("agent_mode"))
         })
         .and_then(JsonValue::as_str)
-        .map(|mode| match mode {
-            "ask" | "light" => ChatAgentMode::Ask,
-            "manager" | "deep" => ChatAgentMode::Manager,
+        .map(|agent_name| match normalize_active_agent_name(agent_name).as_str() {
+            "ask" => ChatAgentMode::Ask,
+            "refiner" => ChatAgentMode::Refiner,
             _ => ChatAgentMode::Manager,
         })
         .unwrap_or(ChatAgentMode::Manager)
 }
 
+fn configured_external_tool_names(user_state: Option<&JsonValue>) -> Option<Vec<String>> {
+    user_state
+        .and_then(|value| value.get("configured_external_tool_names"))
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+}
+
+fn configured_tool_definitions(tool_names: &[String]) -> Vec<JsonValue> {
+    dedupe_tool_definitions(
+        tool_names
+            .iter()
+            .filter_map(|name| tool_definition_for_name(name))
+            .collect(),
+    )
+}
+
+fn tool_definition_for_name(name: &str) -> Option<JsonValue> {
+    match name {
+        "test_trigger" => Some(test_trigger()),
+        "ls_tool" => Some(ls_tool()),
+        "cat_tool" => Some(cat_tool()),
+        "create_tool" => Some(create_tool()),
+        "create_timer_trigger" => Some(create_timer_trigger()),
+        "tree_tool" => Some(tree_tool()),
+        "edit_path_tool" => Some(edit_path_tool()),
+        "delete_path_tool" => Some(delete_path_tool()),
+        "move_path_tool" => Some(move_path_tool()),
+        "fetch" => Some(fetch()),
+        "retrieve_events" => Some(retrieve_events()),
+        "abstract_events" => Some(abstract_events()),
+        "agent_doc_read" => Some(agent_doc_read()),
+        "agent_doc_edit" => Some(agent_doc_edit()),
+        _ => None,
+    }
+}
+
 fn tool_definitions_for_user_state(user_state: Option<&JsonValue>) -> Vec<JsonValue> {
-    match mode_for_user_state(user_state) {
+    if let Some(tool_names) = configured_external_tool_names(user_state) {
+        let resolved = configured_tool_definitions(&tool_names);
+        let resolved_names = resolved
+            .iter()
+            .filter_map(tool_name)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let unresolved_names = tool_names
+            .iter()
+            .filter(|name| !resolved_names.iter().any(|resolved| resolved == *name))
+            .cloned()
+            .collect::<Vec<_>>();
+        tracing::info!(
+            configured_external_tool_names = ?tool_names,
+            resolved_external_tool_names = ?resolved_names,
+            unresolved_external_tool_names = ?unresolved_names,
+            resolved_external_tool_count = resolved.len(),
+            "[external_tool_schema] resolved explicit configured tool names"
+        );
+        return resolved;
+    }
+
+    let mode = mode_for_user_state(user_state);
+    let definitions = match mode {
         ChatAgentMode::Ask => ask_tool_definitions(),
         ChatAgentMode::Manager => manager_tool_definitions(),
-    }
+        ChatAgentMode::Refiner => refiner_tool_definitions(),
+    };
+    let emitted_external_tool_names = definitions
+        .iter()
+        .filter_map(tool_name)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    tracing::info!(
+        agent_mode = ?mode,
+        emitted_external_tool_names = ?emitted_external_tool_names,
+        emitted_external_tool_count = definitions.len(),
+        "[external_tool_schema] resolved fallback tool set from agent mode"
+    );
+    definitions
 }
 
 fn dedupe_tool_definitions(definitions: Vec<JsonValue>) -> Vec<JsonValue> {
@@ -391,6 +481,39 @@ fn manager_tool_definitions() -> Vec<JsonValue> {
     ]
 }
 
+fn refiner_tool_definitions() -> Vec<JsonValue> {
+    vec![agent_doc_read(), agent_doc_edit()]
+}
+
+fn agent_doc_read() -> JsonValue {
+    tool(
+        "agent_doc_read",
+        "Read the current markdown for an agent live draft or saved version under review.",
+        obj(
+            json!({
+                "agent_id": str_prop("Target agent definition id, such as 'manager' or 'lab_agent_refiner'."),
+                "version_id": nullable_str("Optional saved version id. Omit or pass null to read the live draft.")
+            }),
+            &["agent_id"],
+        ),
+    )
+}
+
+fn agent_doc_edit() -> JsonValue {
+    tool(
+        "agent_doc_edit",
+        "Replace an agent live draft or saved version with a validated full markdown document.",
+        obj(
+            json!({
+                "agent_id": str_prop("Target agent definition id for the draft or version being edited."),
+                "version_id": nullable_str("Optional saved version id. Omit or pass null to edit the live draft."),
+                "raw_markdown": str_prop("Full replacement markdown, including YAML frontmatter and prompt body.")
+            }),
+            &["agent_id", "raw_markdown"],
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +553,31 @@ mod tests {
         assert!(!names.iter().any(|name| name == "delete_trigger"));
         assert!(!names.iter().any(|name| name == "add_things_tool"));
         assert!(!names.iter().any(|name| name == "create_trigger_simple"));
+    }
+
+    #[test]
+    fn refiner_mode_exposes_agent_doc_tools_only() {
+        let names = tool_names(&tool_definitions_for_user_state(Some(&json!({
+            "agent_mode": "refiner"
+        }))));
+
+        assert!(names.iter().any(|name| name == "agent_doc_read"));
+        assert!(names.iter().any(|name| name == "agent_doc_edit"));
+        assert!(!names.iter().any(|name| name == "create_tool"));
+        assert!(!names.iter().any(|name| name == "ls_tool"));
+    }
+
+    #[test]
+    fn configured_external_tool_names_override_mode_defaults() {
+        let names = tool_names(&tool_definitions_for_user_state(Some(&json!({
+            "agent_mode": "manager",
+            "configured_external_tool_names": ["cat_tool", "fetch", "preview_card"]
+        }))));
+
+        assert!(names.iter().any(|name| name == "cat_tool"));
+        assert!(names.iter().any(|name| name == "fetch"));
+        assert!(!names.iter().any(|name| name == "preview_card"));
+        assert!(!names.iter().any(|name| name == "tree_tool"));
     }
 
     #[test]

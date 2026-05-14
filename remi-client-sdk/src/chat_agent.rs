@@ -58,6 +58,10 @@ impl ChatAgent for RemoteServerChatAgent {
             .await
             .unwrap_or_else(|| access_token.to_string());
 
+        tracing::info!(
+            session_id = %session_id,
+            "[ChatRuntime] opening remote server-hosted model stream"
+        );
         tracing::info!(session_id = %session_id, "[ChatRuntime] creating ChatClient via shared transport");
         let mut client = ChatClient::new_with_shared_transport(current_access_token)
             .await

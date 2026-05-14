@@ -772,6 +772,100 @@ pub struct ChatSessionUpdate {
     pub message_count: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentVersion {
+    pub version_id: String,
+    pub agent_id: String,
+    pub name: String,
+    pub raw_markdown: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub applied_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentVersionUpdate {
+    pub version_id: String,
+    pub name: String,
+    pub raw_markdown: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDataset {
+    pub dataset_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDatasetUpdate {
+    pub dataset_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDatasetSession {
+    pub dataset_id: String,
+    pub session_id: String,
+    pub added_at: DateTime<Utc>,
+    pub title: Option<String>,
+    pub last_activity: Option<DateTime<Utc>>,
+    pub message_count: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDatasetRun {
+    pub run_id: String,
+    pub dataset_id: String,
+    pub agent_id: String,
+    pub agent_version_id: Option<String>,
+    pub agent_version_name: Option<String>,
+    pub variant_id: String,
+    pub variant_label: String,
+    pub source_session_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDatasetRunItem {
+    pub run_id: String,
+    pub dataset_id: String,
+    pub session_id: String,
+    pub title: Option<String>,
+    pub last_activity: Option<DateTime<Utc>>,
+    pub message_count: Option<i32>,
+    pub final_text: String,
+    pub reasoning: Option<String>,
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub tool_results_json: String,
+    pub done: bool,
+    pub cancelled: bool,
+    pub interrupted: bool,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDatasetRunEval {
+    pub run_id: String,
+    pub dataset_id: String,
+    pub session_id: String,
+    pub analysis_agent_id: String,
+    pub score: String,
+    pub summary: String,
+    pub rationale: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 mod event_timestamp {
     use super::*;
     use serde::de::{Error as DeError, Visitor};

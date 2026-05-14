@@ -52,6 +52,7 @@ pub use chat_types::{
     CachedMessage, ChatLocalWasmConfig, ChatLocalWasmSource, ChatRunState, ChatRunStatus,
     ChatSessionExportBundle, ChatTracingConfig,
     ChatRuntimeBackend, ChatRuntimeConfig, ChatRuntimeEvent, PendingInterrupt,
+    compact_cached_messages_for_ui,
 };
 pub use external_tool_handler::ExternalToolHandler;
 pub use external_tools::ExternalToolExecutor;
@@ -73,6 +74,7 @@ pub use things_handlers::register_things_external_tools;
 pub use trigger_client::{ServerTriggerInfo, TriggerClient};
 pub use types::{
     ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, EntityActionBinding,
+    AgentVersion, AgentVersionUpdate, EvalDataset, EvalDatasetRun, EvalDatasetRunEval, EvalDatasetRunItem, EvalDatasetSession, EvalDatasetUpdate,
     ChatSession, ChatSessionUpdate, CoordinateSystem, EventPayload, Location, LocationCacheEntry,
     NotificationEntry, NotificationGroup, NotificationResponseAction, NotificationSource,
     ResolvedEntityActionBinding,

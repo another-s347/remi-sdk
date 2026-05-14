@@ -6,7 +6,7 @@ use base64::Engine as _;
 use futures::{Stream, StreamExt as FuturesStreamExt};
 use prost_types::{Struct as ProstStruct, Value as ProstValue};
 use remi_agentloop::agent::Agent;
-use remi_agentloop::prelude::ToolDefinition;
+use remi_agentloop::prelude::{ChatCtx, ChatCtxState, ToolDefinition};
 use remi_agentloop::protocol::ProtocolEvent;
 use remi_agentloop::state::AgentState;
 use remi_agentloop::tracing::{
@@ -17,7 +17,8 @@ use remi_agentloop::tracing::{
 };
 use remi_agentloop::types::{
     Content, ContentPart, FunctionCall, ImageUrlDetail, LoopInput, Message, MessageId,
-    ParsedToolCall, Role, RunId, ThreadId, ToolCallMessage, ToolCallOutcome,
+    ParsedToolCall, Role, RunId, SpanKind, SpanNode, ThreadId, ToolCallMessage,
+    ToolCallOutcome,
 };
 use remi_agentloop_wasm::WasmAgentWithHttp;
 use serde_json::{Value as JsonValue, json};
@@ -54,6 +55,7 @@ struct LocalWasmRunTracer {
     input_messages: Vec<Message>,
     run_id: Option<RunId>,
     thread_id: Option<ThreadId>,
+    run_span: Option<SpanNode>,
     run_started_at: Option<chrono::DateTime<chrono::Utc>>,
     metadata: Option<JsonValue>,
     assistant_output: String,
@@ -102,7 +104,7 @@ impl LocalWasmRunTracer {
 
         match loop_input {
             LoopInput::Start {
-                content,
+                message,
                 history,
                 model,
                 metadata,
@@ -110,16 +112,7 @@ impl LocalWasmRunTracer {
                 ..
             } => {
                 let mut input_messages = history.clone();
-                input_messages.push(Message {
-                    id: MessageId::new(),
-                    role: Role::User,
-                    content: content.clone(),
-                    tool_calls: Some(Vec::new()),
-                    tool_call_id: None,
-                    name: None,
-                    reasoning_content: None,
-                    metadata: None,
-                });
+                input_messages.push(message.clone());
 
                 let current_tool_names = extra_tools
                     .iter()
@@ -132,6 +125,7 @@ impl LocalWasmRunTracer {
                     input_messages,
                     run_id: None,
                     thread_id: None,
+                    run_span: None,
                     run_started_at: None,
                     metadata: metadata.clone(),
                     assistant_output: String::new(),
@@ -147,12 +141,13 @@ impl LocalWasmRunTracer {
                     pending_start_custom_events: Self::pending_start_custom_events(loop_input),
                 })
             }
-            LoopInput::Resume { state, results } => Some(Self {
+            LoopInput::Resume { state, results, .. } => Some(Self {
                 tracer: tracer.attach_to_existing_run(),
                 model: state.config.model.clone(),
                 input_messages: state.messages.clone(),
                 run_id: Some(state.run_id.clone()),
                 thread_id: Some(state.thread_id.clone()),
+                run_span: Some(Self::derive_run_span(&state.run_id)),
                 run_started_at: None,
                 metadata: state.config.metadata.clone(),
                 assistant_output: String::new(),
@@ -171,8 +166,23 @@ impl LocalWasmRunTracer {
                 pending_resume_payload_count: results.len(),
                 pending_start_custom_events: Vec::new(),
             }),
-            LoopInput::Cancel { .. } => None,
         }
+    }
+
+    fn derive_run_span(run_id: &RunId) -> SpanNode {
+        SpanNode::derived(SpanKind::Run, format!("run:{}", run_id.0), None)
+    }
+
+    fn derive_model_span(&self, turn: usize, call_index: usize) -> Option<SpanNode> {
+        self.run_span.as_ref().map(|run_span| {
+            run_span.derived_child(SpanKind::Model, format!("turn:{turn}:call:{call_index}"))
+        })
+    }
+
+    fn derive_tool_span(&self, tool_call_id: &str, tool_name: &str) -> Option<SpanNode> {
+        self.run_span.as_ref().map(|run_span| {
+            run_span.derived_child(SpanKind::Tool, format!("{tool_name}:{tool_call_id}"))
+        })
     }
 
     fn pending_start_custom_events(loop_input: &LoopInput) -> Vec<(String, JsonValue)> {
@@ -221,12 +231,14 @@ impl LocalWasmRunTracer {
             return;
         };
 
-        let Some(outcomes) = self.pending_resume_outcomes.take() else {
-            return;
-        };
+        let outcomes = self.pending_resume_outcomes.take().unwrap_or_default();
 
         self.tracer
             .on_resume(&ResumeTrace {
+                span: self
+                    .run_span
+                    .clone()
+                    .unwrap_or_else(|| Self::derive_run_span(&run_id)),
                 run_id: run_id.clone(),
                 payloads_count: self.pending_resume_payload_count,
                 outcomes: outcomes.clone(),
@@ -313,9 +325,9 @@ impl LocalWasmRunTracer {
             return;
         };
 
+        self.current_turn = turn;
         let call_index = self.next_model_call_index;
         self.next_model_call_index += 1;
-        self.current_turn = turn;
         self.pending_model = Some(PendingModelTrace {
             turn,
             call_index,
@@ -328,6 +340,9 @@ impl LocalWasmRunTracer {
 
         self.tracer
             .on_turn_start(&TurnStartTrace {
+                span: self
+                    .derive_model_span(turn, call_index)
+                    .unwrap_or_else(|| Self::derive_run_span(&run_id)),
                 run_id: run_id.clone(),
                 turn,
                 timestamp: chrono::Utc::now(),
@@ -336,6 +351,9 @@ impl LocalWasmRunTracer {
 
         self.tracer
             .on_model_start(&ModelStartTrace {
+                span: self
+                    .derive_model_span(turn, call_index)
+                    .unwrap_or_else(|| Self::derive_run_span(&run_id)),
                 run_id,
                 turn,
                 call_index,
@@ -361,6 +379,9 @@ impl LocalWasmRunTracer {
         let tool_calls = self.pending_tool_call_traces();
         self.tracer
             .on_model_end(&ModelEndTrace {
+                span: self
+                    .derive_model_span(model.turn, model.call_index)
+                    .unwrap_or_else(|| Self::derive_run_span(&run_id)),
                 run_id,
                 turn: model.turn,
                 call_index: model.call_index,
@@ -397,6 +418,9 @@ impl LocalWasmRunTracer {
 
         self.tracer
             .on_tool_start(&ToolStartTrace {
+                span: self
+                    .derive_tool_span(&tool_call_id, &tool_name)
+                    .unwrap_or_else(|| Self::derive_run_span(&run_id)),
                 run_id,
                 turn,
                 tool_call_id,
@@ -419,12 +443,15 @@ impl LocalWasmRunTracer {
                 let thread_id = ThreadId(thread_id.clone());
                 self.run_id = Some(run_id.clone());
                 self.thread_id = Some(thread_id.clone());
+                let run_span = Self::derive_run_span(&run_id);
+                self.run_span = Some(run_span.clone());
                 self.run_started_at = Some(timestamp);
                 if metadata.is_some() {
                     self.metadata = metadata.clone();
                 }
                 self.tracer
                     .on_run_start(&RunStartTrace {
+                        span: run_span,
                         thread_id: Some(thread_id.clone()),
                         run_id: run_id.clone(),
                         model: self.model.clone(),
@@ -476,16 +503,22 @@ impl LocalWasmRunTracer {
 
                 if let Some(run_id) = self.run_id.clone() {
                     if let Some(call) = self.pending_tool_calls.iter_mut().find(|call| call.id == *id) {
+                        let tool_call_id = call.id.clone();
+                        let tool_name = call.name.clone();
                         let duration = call
                             .local_tool_started_at
                             .map(|started_at| started_at.elapsed())
                             .unwrap_or_default();
+                        let span = self
+                            .derive_tool_span(&tool_call_id, &tool_name)
+                            .unwrap_or_else(|| Self::derive_run_span(&run_id));
                         self.tracer
                             .on_tool_end(&ToolEndTrace {
+                                span,
                                 run_id,
                                 turn: self.current_turn,
-                                tool_call_id: call.id.clone(),
-                                tool_name: call.name.clone(),
+                                tool_call_id,
+                                tool_name,
                                 result: Some(result.clone()),
                                 interrupted: false,
                                 error: None,
@@ -508,7 +541,6 @@ impl LocalWasmRunTracer {
                     .iter()
                     .map(|definition| definition.function.name.clone())
                     .collect();
-
                 if let Some(run_id) = self.run_id.clone() {
                     self.tracer
                         .on_tool_execution_handoff(&ToolExecutionHandoffTrace {
@@ -527,6 +559,10 @@ impl LocalWasmRunTracer {
                 if let Some(run_id) = &self.run_id {
                     self.tracer
                         .on_interrupt(&InterruptTrace {
+                            span: self
+                                .run_span
+                                .clone()
+                                .unwrap_or_else(|| Self::derive_run_span(run_id)),
                             run_id: run_id.clone(),
                             interrupts: interrupts.clone(),
                             timestamp: chrono::Utc::now(),
@@ -568,17 +604,6 @@ impl LocalWasmRunTracer {
         }
     }
 
-    fn parsed_tool_call_trace(tool_call: &ParsedToolCall) -> ToolCallTrace {
-        ToolCallTrace {
-            id: tool_call.id.clone(),
-            name: tool_call.name.clone(),
-            arguments: tool_call.arguments.clone(),
-            result: None,
-            interrupted: false,
-            duration: std::time::Duration::ZERO,
-        }
-    }
-
     async fn finish(&mut self, status: RunStatus, error: Option<String>) {
         let Some(run_id) = self.run_id.clone() else {
             return;
@@ -604,6 +629,10 @@ impl LocalWasmRunTracer {
 
         self.tracer
             .on_run_end(&RunEndTrace {
+                span: self
+                    .run_span
+                    .clone()
+                    .unwrap_or_else(|| Self::derive_run_span(&run_id)),
                 run_id,
                 status,
                 output_messages,
@@ -619,8 +648,20 @@ impl LocalWasmRunTracer {
             .await;
         self.tracer.on_flush().await;
         self.run_id = None;
+        self.run_span = None;
         self.pending_tool_calls.clear();
         self.pending_model = None;
+    }
+
+    fn parsed_tool_call_trace(tool_call: &ParsedToolCall) -> ToolCallTrace {
+        ToolCallTrace {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+            result: None,
+            interrupted: false,
+            duration: std::time::Duration::ZERO,
+        }
     }
 }
 
@@ -659,7 +700,7 @@ pub(crate) async fn start_stream(
     start_input: Option<chat_proto::ChatStartInput>,
     resume_input: Option<chat_proto::ChatResumeInput>,
 ) -> Result<ChatEventStream, String> {
-    let loop_input = if let Some(start_input) = start_input {
+    let (ctx, loop_input) = if let Some(start_input) = start_input {
         loop_input_from_start(start_input, config, session_id).await?
     } else if let Some(resume_input) = resume_input {
         loop_input_from_resume(resume_input)?
@@ -674,7 +715,7 @@ pub(crate) async fn start_stream(
 
     Ok(Box::pin(async_stream::stream! {
         let event_stream = agent
-            .chat(loop_input)
+            .chat(ctx, loop_input)
             .await
             .map_err(|error| error.message)?;
         futures::pin_mut!(event_stream);
@@ -696,7 +737,7 @@ async fn loop_input_from_start(
     input: chat_proto::ChatStartInput,
     config: &ChatRuntimeConfig,
     session_id: &str,
-) -> Result<LoopInput, String> {
+) -> Result<(ChatCtx, LoopInput), String> {
     let mut history = Vec::with_capacity(input.history.len());
     for message in input.history {
         history.push(history_message_from_proto(message).await?);
@@ -720,24 +761,27 @@ async fn loop_input_from_start(
         extra_tools.push(definition);
     }
 
-    Ok(LoopInput::Start {
-        content: content_from_input_message(current).await?,
+    let message = Message::user_content(content_from_input_message(current).await?);
+    let user_state = input
+        .user_state
+        .as_ref()
+        .map(prost_struct_to_json)
+        .unwrap_or(JsonValue::Null);
+    let ctx = ChatCtx::new(ChatCtxState::default().with_user_state(user_state));
+    ctx.update(|state| state.metadata = metadata.clone());
+
+    Ok((ctx, LoopInput::Start {
+        message,
         history,
         extra_tools,
         model,
         temperature: None,
         max_tokens: None,
         metadata,
-        message_metadata: None,
-        user_name: None,
-        user_state: input
-            .user_state
-            .as_ref()
-            .map(|user_state| prost_struct_to_json(user_state)),
-    })
+    }))
 }
 
-fn loop_input_from_resume(input: chat_proto::ChatResumeInput) -> Result<LoopInput, String> {
+fn loop_input_from_resume(input: chat_proto::ChatResumeInput) -> Result<(ChatCtx, LoopInput), String> {
     let state_json = input
         .state
         .as_ref()
@@ -751,7 +795,22 @@ fn loop_input_from_resume(input: chat_proto::ChatResumeInput) -> Result<LoopInpu
         results.push(tool_outcome_from_proto(&outcome)?);
     }
 
-    Ok(LoopInput::Resume { state, results })
+    let ctx = ChatCtx::with_ids(
+        state.thread_id.clone(),
+        state.run_id.clone(),
+        ChatCtxState {
+            user_state: state.user_state.clone(),
+            metadata: state.config.metadata.clone(),
+            active_tool_chain: Vec::new(),
+            span: None,
+        },
+    );
+
+    Ok((ctx, LoopInput::Resume {
+        state,
+        pending_interrupts: Vec::new(),
+        results,
+    }))
 }
 
 async fn history_message_from_proto(
