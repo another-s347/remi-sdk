@@ -175,6 +175,45 @@ cargo test --workspace --verbose
 - `introRetryMs`
 - `keyFile`
 
+#### 3. Offline / local-only
+
+适合完全本地运行的场景。SDK 不会创建 TCP gRPC channel，也不会初始化 decenet UDP transport 或尝试连接服务器。
+
+关键字段：
+
+- `transportMode = "offline"`
+- `requestTimeoutMs` 可选，仅用于保持配置兼容
+
+如果未显式设置 `transportMode = "offline"`，SDK 也会在缺少可用远端地址时进入离线模式：
+
+- TCP 模式下 `tcpGrpcAddr` 为空或缺失
+- decenet 模式下 `endpoint`、`remoteVirtualAddr` 或 `remoteUdpAddr` 为空或缺失
+
+离线模式下可用的能力：
+
+- 本地 SQLite 持久化
+- 本地 Things / Collections CRDT 创建、读取和修改
+- 本地 Trigger 注册、调度和执行
+- 本地事件记录
+- `ChatRuntimeBackend::LocalWasm` 聊天运行时
+
+离线模式下远端能力会快速返回明确错误，例如 auth 登录、profile/media 上传、push token 注册、app update 查询、server sync、`ChatRuntimeBackend::RemoteServer`。当前 SDK 不会自动创建延迟同步队列；本地 dirty CRDT 状态会保留，应用可以在恢复远端配置后显式运行同步。
+
+示例：
+
+```rust
+use remi_client_sdk::transport::configure_shared_transport;
+
+let offline_transport_config = serde_json::json!({
+    "transportMode": "offline",
+    "requestTimeoutMs": 20000
+})
+.to_string();
+
+let transport = configure_shared_transport(&offline_transport_config).await?;
+assert!(transport.is_offline());
+```
+
 ### 共享传输初始化示例
 
 ```rust

@@ -14,6 +14,8 @@ use tonic_conn::{NetConnector, NetConnectorOptions};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const OFFLINE_TRANSPORT_ERROR: &str =
+    "Remi SDK is running in offline mode; remote transport is unavailable";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransportConfig {
@@ -53,10 +55,18 @@ pub struct TransportConfig {
 }
 
 pub struct TransportState {
-    pub endpoint: Endpoint,
+    pub mode: SharedTransportMode,
+    pub endpoint: Option<Endpoint>,
     /// `Some` = decenet (NetConnector); `None` = plain TCP.
     pub connector: Option<NetConnector>,
     pub request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedTransportMode {
+    Offline,
+    Tcp,
+    Decenet,
 }
 
 pub struct SharedTransport {
@@ -69,7 +79,20 @@ impl SharedTransport {
         self.state.request_timeout
     }
 
+    pub fn mode(&self) -> SharedTransportMode {
+        self.state.mode
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.state.mode == SharedTransportMode::Offline
+    }
+
     pub async fn get_channel(&self) -> Result<Channel, String> {
+        if self.is_offline() {
+            tracing::debug!("[transport] get_channel: offline transport has no remote channel");
+            return Err(OFFLINE_TRANSPORT_ERROR.to_string());
+        }
+
         let mut guard = self.channel.lock().await;
         if let Some(ch) = guard.as_ref() {
             tracing::debug!("[transport] get_channel: returning cached channel");
@@ -77,9 +100,13 @@ impl SharedTransport {
         }
 
         tracing::info!("[transport] get_channel: no cached channel, creating channel...");
+        let endpoint = self
+            .state
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| "Shared transport endpoint is not configured".to_string())?;
         let channel = if let Some(connector) = self.state.connector.clone() {
-            self.state
-                .endpoint
+            endpoint
                 .clone()
                 .connect_with_connector(connector)
                 .await
@@ -90,7 +117,7 @@ impl SharedTransport {
         } else {
             // For direct TCP server mode, keep a lazy channel so tonic can re-establish
             // the underlying connection on the next request after transient network loss.
-            self.state.endpoint.clone().connect_lazy()
+            endpoint.clone().connect_lazy()
         };
         tracing::info!("[transport] get_channel: channel ready");
         guard.replace(channel.clone());
@@ -138,7 +165,12 @@ pub fn is_recoverable_transport_message(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_recoverable_transport_message;
+    use super::{
+        OFFLINE_TRANSPORT_ERROR, SharedTransport, SharedTransportMode, build_transport_state,
+        is_offline_transport_config, is_recoverable_transport_message,
+    };
+    use serde_json::json;
+    use tokio::sync::Mutex;
 
     #[test]
     fn detects_connection_reset_messages() {
@@ -149,6 +181,94 @@ mod tests {
             "deadline has elapsed while waiting for response"
         ));
         assert!(!is_recoverable_transport_message("permission denied"));
+    }
+
+    #[test]
+    fn detects_explicit_offline_transport_config() {
+        let config = serde_json::from_value(json!({
+            "transportMode": "offline"
+        }))
+        .expect("valid config");
+
+        assert!(is_offline_transport_config(&config));
+    }
+
+    #[test]
+    fn detects_tcp_without_remote_address_as_offline() {
+        let config = serde_json::from_value(json!({
+            "transportMode": "tcp",
+            "tcpGrpcAddr": "  "
+        }))
+        .expect("valid config");
+
+        assert!(is_offline_transport_config(&config));
+    }
+
+    #[test]
+    fn detects_decenet_without_remote_fields_as_offline() {
+        let config = serde_json::from_value(json!({
+            "endpoint": "net-app-telemetry",
+            "localVirtualAddr": "local-device",
+            "remoteVirtualAddr": "net-app-telemetry",
+            "localUdpBind": "127.0.0.1:0",
+            "remoteUdpAddr": ""
+        }))
+        .expect("valid config");
+
+        assert!(is_offline_transport_config(&config));
+    }
+
+    #[test]
+    fn accepts_valid_tcp_remote_config() {
+        let config = serde_json::from_value(json!({
+            "transportMode": "tcp",
+            "tcpGrpcAddr": "127.0.0.1:50051"
+        }))
+        .expect("valid config");
+
+        assert!(!is_offline_transport_config(&config));
+    }
+
+    #[test]
+    fn accepts_valid_decenet_remote_config() {
+        let config = serde_json::from_value(json!({
+            "endpoint": "net-app-telemetry",
+            "localVirtualAddr": "local-device",
+            "remoteVirtualAddr": "net-app-telemetry",
+            "localUdpBind": "127.0.0.1:0",
+            "remoteUdpAddr": "127.0.0.1:47000"
+        }))
+        .expect("valid config");
+
+        assert!(!is_offline_transport_config(&config));
+    }
+
+    #[tokio::test]
+    async fn offline_transport_get_channel_fails_without_network_setup() {
+        let state = build_transport_state(
+            &json!({
+                "transportMode": "offline",
+                "requestTimeoutMs": 1234
+            })
+            .to_string(),
+        )
+        .await
+        .expect("offline transport state should build");
+
+        assert_eq!(state.mode, SharedTransportMode::Offline);
+        assert!(state.endpoint.is_none());
+        assert!(state.connector.is_none());
+
+        let transport = SharedTransport {
+            state,
+            channel: Mutex::new(None),
+        };
+
+        let error = transport
+            .get_channel()
+            .await
+            .expect_err("offline transport should not create a channel");
+        assert_eq!(error, OFFLINE_TRANSPORT_ERROR);
     }
 }
 
@@ -203,23 +323,41 @@ pub fn get_shared_transport() -> Result<Arc<SharedTransport>, String> {
         .ok_or_else(|| "Shared transport is not configured".to_string())
 }
 
+pub fn is_shared_transport_offline() -> bool {
+    SHARED_TRANSPORT
+        .get()
+        .map(|transport| transport.is_offline())
+        .unwrap_or(false)
+}
+
 pub async fn build_transport_state(config_json: &str) -> Result<TransportState, String> {
     let config: TransportConfig = serde_json::from_str(config_json)
         .map_err(|err| format!("Invalid telemetry transport config: {err}"))?;
+
+    let request_timeout = config
+        .request_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+
+    if is_offline_transport_config(&config) {
+        tracing::info!("[transport] build_transport_state: offline mode, skipping network setup");
+        return Ok(TransportState {
+            mode: SharedTransportMode::Offline,
+            endpoint: None,
+            connector: None,
+            request_timeout,
+        });
+    }
 
     // TCP fast-path: skip all decenet / NetStack setup.
     if config.transport_mode.as_deref() == Some("tcp") {
         let tcp_addr = config
             .tcp_grpc_addr
             .as_deref()
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| "tcpGrpcAddr is required when transportMode=tcp".to_string())?;
         let endpoint_uri = format!("http://{tcp_addr}");
         tracing::info!("[transport] build_transport_state: TCP mode, addr={tcp_addr}");
-        let request_timeout = config
-            .request_timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
         let mut endpoint = Endpoint::from_shared(endpoint_uri)
             .map_err(|err| format!("Invalid TCP gRPC endpoint: {err}"))?;
         if let Some(timeout_ms) = config.connect_timeout_ms {
@@ -230,7 +368,8 @@ pub async fn build_transport_state(config_json: &str) -> Result<TransportState, 
         endpoint = endpoint.timeout(request_timeout);
         endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(30)));
         return Ok(TransportState {
-            endpoint,
+            mode: SharedTransportMode::Tcp,
+            endpoint: Some(endpoint),
             connector: None,
             request_timeout,
         });
@@ -320,10 +459,6 @@ pub async fn build_transport_state(config_json: &str) -> Result<TransportState, 
 
     let mut endpoint = Endpoint::from_shared(endpoint_uri)
         .map_err(|err| format!("Invalid endpoint URI: {err}"))?;
-    let request_timeout = config
-        .request_timeout_ms
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
     if let Some(timeout_ms) = config.connect_timeout_ms {
         endpoint = endpoint.connect_timeout(Duration::from_millis(timeout_ms));
     } else {
@@ -333,10 +468,30 @@ pub async fn build_transport_state(config_json: &str) -> Result<TransportState, 
     endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(30)));
 
     Ok(TransportState {
-        endpoint,
+        mode: SharedTransportMode::Decenet,
+        endpoint: Some(endpoint),
         connector: Some(connector),
         request_timeout,
     })
+}
+
+pub fn is_offline_transport_config(config: &TransportConfig) -> bool {
+    match config.transport_mode.as_deref().map(str::trim) {
+        Some(mode) if mode.eq_ignore_ascii_case("offline") || mode.eq_ignore_ascii_case("none") => {
+            true
+        }
+        Some(mode) if mode.eq_ignore_ascii_case("tcp") => config
+            .tcp_grpc_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none(),
+        _ => {
+            config.endpoint.trim().is_empty()
+                || config.remote_virtual_addr.trim().is_empty()
+                || config.remote_udp_addr.trim().is_empty()
+        }
+    }
 }
 
 fn fallback_key_file_path(local_addr: &str) -> PathBuf {
