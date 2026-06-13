@@ -43,7 +43,7 @@ remi-sdk/
 
 `remi-client-sdk` 的公开 API 大致分成下面几类：
 
-- 传输层：`transport`，支持共享连接、复用 gRPC channel，以及 decenet / TCP 两种模式。
+- 传输层：`transport`，支持共享连接、复用 gRPC channel，以及 TCP / offline 两种模式。
 - 认证：`AuthClient`，支持登录、注册、登出、refresh token、恢复持久化 session。
 - 本地运行时：`TriggerSdk`，负责本地 SQLite 存储、事件记录、trigger 注册与调度、Things 本地状态与广播通知。
 - 远程客户端：`ThingsClient`、`TriggerClient`、`ChatClient`、`ProfileClient`、`AppKeysClient`。
@@ -159,25 +159,9 @@ cargo test --workspace --verbose
 - `requestTimeoutMs`
 - `connectTimeoutMs`
 
-#### 2. decenet
+#### 2. Offline / local-only
 
-适合使用 Remi 的去中心化网络栈时。
-
-关键字段：
-
-- `endpoint`
-- `localVirtualAddr`
-- `remoteVirtualAddr`
-- `localUdpBind`
-- `remoteUdpAddr`
-- `encryption`
-- `introAttempts`
-- `introRetryMs`
-- `keyFile`
-
-#### 3. Offline / local-only
-
-适合完全本地运行的场景。SDK 不会创建 TCP gRPC channel，也不会初始化 decenet UDP transport 或尝试连接服务器。
+适合完全本地运行的场景。SDK 不会创建 TCP gRPC channel 或尝试连接服务器。
 
 关键字段：
 
@@ -187,7 +171,6 @@ cargo test --workspace --verbose
 如果未显式设置 `transportMode = "offline"`，SDK 也会在缺少可用远端地址时进入离线模式：
 
 - TCP 模式下 `tcpGrpcAddr` 为空或缺失
-- decenet 模式下 `endpoint`、`remoteVirtualAddr` 或 `remoteUdpAddr` 为空或缺失
 
 离线模式下可用的能力：
 

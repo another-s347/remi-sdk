@@ -848,40 +848,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "decentralized_network"
-version = "0.1.0"
-source = "git+https://github.com/another-s347/decenet.git?rev=d37d9a6cb9319f3cd8979555bc21498f1f914b40#d37d9a6cb9319f3cd8979555bc21498f1f914b40"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-trait",
- "base64",
- "bincode",
- "bytes",
- "chacha20poly1305",
- "chrono",
- "dashmap",
- "ed25519-dalek",
- "futures",
- "hkdf",
- "once_cell",
- "parking_lot",
- "rand 0.8.5",
- "ring",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "user_tcp",
- "uuid",
- "x25519-dalek",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2812,7 +2778,6 @@ dependencies = [
  "base64",
  "chrono",
  "croner",
- "decentralized_network",
  "futures",
  "http 0.2.12",
  "once_cell",
@@ -2836,7 +2801,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "tonic_conn",
  "tracing",
  "urlencoding",
  "uuid",
@@ -3703,26 +3667,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tonic_conn"
-version = "0.1.0"
-source = "git+https://github.com/another-s347/decenet.git?rev=d37d9a6cb9319f3cd8979555bc21498f1f914b40#d37d9a6cb9319f3cd8979555bc21498f1f914b40"
-dependencies = [
- "anyhow",
- "decentralized_network",
- "futures-core",
- "http 1.4.0",
- "hyper-util",
- "prost",
- "protoc-bin-vendored",
- "tokio",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tower",
- "tracing",
-]
-
-[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3932,23 +3876,6 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
-
-[[package]]
-name = "user_tcp"
-version = "0.1.0"
-source = "git+https://github.com/another-s347/decenet.git?rev=d37d9a6cb9319f3cd8979555bc21498f1f914b40#d37d9a6cb9319f3cd8979555bc21498f1f914b40"
-dependencies = [
- "async-trait",
- "bytes",
- "chacha20",
- "memchr",
- "rand 0.8.5",
- "rand_core 0.6.4",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "utf8_iter"
