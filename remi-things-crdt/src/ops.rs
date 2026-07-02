@@ -852,20 +852,15 @@ fn splice_text_chars(
         anyhow::bail!("Block '{}' not found in thing '{}'", block_id, thing_id);
     };
 
-    // Fast path for full overwrite: callers in higher layers use `delete = usize::MAX` as a
-    // sentinel meaning "replace everything". Implement this as a scalar replacement to avoid
-    // expensive character-level splice operations (and legacy -> Text migrations) on mobile.
-    if index == 0 && delete == usize::MAX {
-        let _ = doc.delete(&block_obj, "text");
-        put_string(doc, &block_obj, "text", insert)?;
-        return Ok(());
-    }
-
     let text_obj = ensure_block_text_obj(doc, &block_obj)?;
     let len = doc.length(&text_obj);
     let start = index.min(len);
     let max_delete = len.saturating_sub(start);
-    let delete = delete.min(max_delete);
+    let delete = if delete == usize::MAX {
+        max_delete
+    } else {
+        delete.min(max_delete)
+    };
     let del = isize::try_from(delete).unwrap_or(isize::MAX);
     doc.splice_text(&text_obj, start, del, insert)
         .context("Failed to splice text")?;
@@ -1458,19 +1453,18 @@ pub fn apply_thing_markdown_op(
                 anyhow::bail!("Block '{}' not found", block_id);
             };
 
-            if index == 0 && delete == usize::MAX {
-                let _ = doc.delete(&block_obj, "text");
-                put_string(&mut doc, &block_obj, "text", &insert)?;
+            let text_obj = ensure_block_text_obj(&mut doc, &block_obj)?;
+            let len = doc.length(&text_obj);
+            let start = index.min(len);
+            let max_delete = len.saturating_sub(start);
+            let del = if delete == usize::MAX {
+                max_delete
             } else {
-                let text_obj = ensure_block_text_obj(&mut doc, &block_obj)?;
-                let len = doc.length(&text_obj);
-                let start = index.min(len);
-                let max_delete = len.saturating_sub(start);
-                let del = delete.min(max_delete);
-                let del = isize::try_from(del).unwrap_or(isize::MAX);
-                doc.splice_text(&text_obj, start, del, &insert)
-                    .context("Failed to splice text")?;
-            }
+                delete.min(max_delete)
+            };
+            let del = isize::try_from(del).unwrap_or(isize::MAX);
+            doc.splice_text(&text_obj, start, del, &insert)
+                .context("Failed to splice text")?;
         }
     }
 
@@ -1641,6 +1635,67 @@ mod tests_v3 {
         .expect_err("invalid thing status must be rejected");
 
         assert!(err.to_string().contains("Invalid thing status"), "{err:?}");
+    }
+
+    #[test]
+    fn concurrent_thing_markdown_splices_preserve_both_edits() {
+        let thing_uuid = "thing-1";
+        let base = apply_thing_markdown_op(
+            &[],
+            "base",
+            thing_uuid,
+            ThingMarkdownOp::SetContent {
+                content: Content::Markdown {
+                    blocks: vec![Block {
+                        id: "main".to_string(),
+                        r#type: "markdown".to_string(),
+                        attrs_json: None,
+                        text: Some("base".to_string()),
+                    }],
+                },
+            },
+        )
+        .unwrap();
+
+        let a = apply_thing_markdown_op(
+            &base,
+            "device-a",
+            thing_uuid,
+            ThingMarkdownOp::SpliceText {
+                block_id: "main".to_string(),
+                index: 4,
+                delete: 0,
+                insert: "\nA edit".to_string(),
+            },
+        )
+        .unwrap();
+        let b = apply_thing_markdown_op(
+            &base,
+            "device-b",
+            thing_uuid,
+            ThingMarkdownOp::SpliceText {
+                block_id: "main".to_string(),
+                index: 4,
+                delete: 0,
+                insert: "\nB edit".to_string(),
+            },
+        )
+        .unwrap();
+
+        let mut merged = AutoCommit::load(&a).unwrap();
+        let mut incoming = AutoCommit::load(&b).unwrap();
+        merged.merge(&mut incoming).unwrap();
+
+        let view = extract_thing_markdown_view(&merged.save(), thing_uuid).unwrap();
+        let block = view
+            .content
+            .and_then(|content| content.blocks)
+            .and_then(|blocks| blocks.into_iter().find(|block| block.id == "main"))
+            .expect("main block");
+        let text = block.text.expect("main block text");
+        assert!(text.contains("base"), "{text}");
+        assert!(text.contains("A edit"), "{text}");
+        assert!(text.contains("B edit"), "{text}");
     }
 
     #[test]

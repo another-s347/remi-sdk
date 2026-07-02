@@ -905,6 +905,86 @@ fn edit_content_honors_suppress_change_log_policy() -> Result<()> {
 }
 
 #[test]
+fn edit_content_append_uses_mergeable_text_splice() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let base_storage = Storage::new(temp.path().join("base.sqlite"))?;
+    let base_service = ThingsLocalService::new(&base_storage);
+    base_service.upsert_collection("base-device", collection_upsert("inbox"))?;
+    base_service.upsert_thing("base-device", thing_upsert("task-1", "inbox"))?;
+    let base_rows = base_storage.list_crdt_documents()?;
+
+    let storage_a = Storage::new(temp.path().join("a.sqlite"))?;
+    let storage_b = Storage::new(temp.path().join("b.sqlite"))?;
+    for storage in [&storage_a, &storage_b] {
+        for row in &base_rows {
+            storage.save_crdt_document(
+                &row.uuid,
+                &row.data_type,
+                &row.automerge_doc,
+                &row.sync_state,
+                false,
+                row.last_sync_at.as_deref(),
+            )?;
+        }
+    }
+
+    let service_a = ThingsLocalService::new(&storage_a);
+    let service_b = ThingsLocalService::new(&storage_b);
+    service_a.edit_content(
+        "device-a",
+        "task-1",
+        "append",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("\nA edit"),
+    )?;
+    service_b.edit_content(
+        "device-b",
+        "task-1",
+        "append",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("\nB edit"),
+    )?;
+
+    let row_a = storage_a
+        .get_crdt_document("task-1", "thing_markdown")?
+        .expect("a markdown doc");
+    let row_b = storage_b
+        .get_crdt_document("task-1", "thing_markdown")?
+        .expect("b markdown doc");
+    let mut merged = automerge::AutoCommit::load(&row_a.automerge_doc)?;
+    let mut incoming = automerge::AutoCommit::load(&row_b.automerge_doc)?;
+    merged.merge(&mut incoming)?;
+
+    let mut doc_set = ThingsDocumentSet::new("merged-device");
+    doc_set.set(
+        DocumentKey::thing_markdown("task-1"),
+        DocumentState {
+            automerge_doc: merged.save(),
+            sync_state: Vec::new(),
+            dirty: false,
+            last_sync_at: None,
+        },
+    );
+    let text = doc_set
+        .get_thing_markdown_text("task-1")?
+        .expect("merged markdown");
+    assert!(text.contains("hello"), "{text}");
+    assert!(text.contains("A edit"), "{text}");
+    assert!(text.contains("B edit"), "{text}");
+    Ok(())
+}
+
+#[test]
 fn action_bindings_round_trip_through_local_service() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let storage = Storage::new(temp.path().join("things.sqlite"))?;

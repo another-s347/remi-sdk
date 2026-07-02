@@ -267,7 +267,19 @@ impl<'a> ThingsLocalService<'a> {
         }
 
         if !title_only {
-            events.extend(doc_set.replace_thing_markdown_text(thing_uuid, &final_content)?);
+            if operation == "overwrite" {
+                events.extend(doc_set.replace_thing_markdown_text(thing_uuid, &final_content)?);
+            } else if current_markdown != final_content {
+                let (index, delete, insert) = single_text_splice(&current_markdown, &final_content);
+                match doc_set.try_splice_thing_text(thing_uuid, "main", index, delete, &insert)? {
+                    Some(splice_events) => events.extend(splice_events),
+                    None => {
+                        events.extend(
+                            doc_set.replace_thing_markdown_text(thing_uuid, &final_content)?,
+                        );
+                    }
+                }
+            }
         }
 
         let result_content = if title_only {
@@ -315,4 +327,32 @@ impl<'a> ThingsLocalService<'a> {
 
         Ok(result)
     }
+}
+
+fn single_text_splice(before: &str, after: &str) -> (usize, usize, String) {
+    let before_chars = before.chars().collect::<Vec<_>>();
+    let after_chars = after.chars().collect::<Vec<_>>();
+
+    let mut prefix = 0usize;
+    while prefix < before_chars.len()
+        && prefix < after_chars.len()
+        && before_chars[prefix] == after_chars[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < before_chars.len().saturating_sub(prefix)
+        && suffix < after_chars.len().saturating_sub(prefix)
+        && before_chars[before_chars.len() - 1 - suffix]
+            == after_chars[after_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let delete = before_chars.len() - prefix - suffix;
+    let insert = after_chars[prefix..after_chars.len() - suffix]
+        .iter()
+        .collect();
+    (prefix, delete, insert)
 }
