@@ -3,6 +3,7 @@ use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value};
 
 use crate::datatype::{ContentEntryPayload, LocationField, ThingBuiltInFieldsUpdate};
+use crate::domain::{FieldPatch, ThingStatus};
 use crate::schema::Schema;
 use crate::util::{
     collect_list_keys, collect_map_keys, ensure_child_map, ensure_list_key, ensure_map_key,
@@ -58,7 +59,7 @@ pub enum Op {
         status: Option<String>,
         status_timestamp_ms: Option<i64>,
         title: Option<String>,
-        parent_id: Option<String>,
+        parent_id: FieldPatch<String>,
         trigger: TriggerUpdate,
         content: Option<Content>,
     },
@@ -164,7 +165,7 @@ pub fn apply_op(doc_bytes: &[u8], actor: &str, op: Op) -> Result<Vec<u8>> {
                 status.as_deref(),
                 status_timestamp_ms,
                 title.as_deref(),
-                parent_id.as_deref(),
+                parent_id,
                 trigger,
                 content,
             ),
@@ -282,7 +283,10 @@ fn validate_parent_reference(
     thing_id: &str,
     parent_id: Option<&str>,
 ) -> Result<()> {
-    let Some(parent_id) = parent_id.map(str::trim).filter(|parent_id| !parent_id.is_empty()) else {
+    let Some(parent_id) = parent_id
+        .map(str::trim)
+        .filter(|parent_id| !parent_id.is_empty())
+    else {
         return Ok(());
     };
 
@@ -300,7 +304,11 @@ fn validate_parent_reference(
     let mut cursor = Some(parent_obj);
     while let Some(current_obj) = cursor {
         let next_parent = get_string(doc, &current_obj, "parent_id")?;
-        let Some(next_parent_id) = next_parent.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+        let Some(next_parent_id) = next_parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
             break;
         };
 
@@ -460,7 +468,7 @@ fn upsert_thing(
     status: Option<&str>,
     status_timestamp_ms: Option<i64>,
     title: Option<&str>,
-    parent_id: Option<&str>,
+    parent_id: FieldPatch<String>,
     trigger: TriggerUpdate,
     content: Option<Content>,
 ) -> Result<()> {
@@ -485,16 +493,17 @@ fn upsert_thing(
         put_string(doc, &obj, "datatype", dt)?;
     }
     if let Some(st) = status {
-        put_string(doc, &obj, "status", st)?;
+        let status = parse_thing_status(st)?;
+        put_string(doc, &obj, "status", status.as_str())?;
 
         // Handle timestamp
         if let Some(ts) = status_timestamp_ms {
             put_u64(doc, &obj, "status_timestamp_ms", ts as u64)?;
-        } else if status_needs_timestamp(st) {
+        } else if status_needs_timestamp(status) {
             // Auto-set timestamp for statuses that need it
             let now = chrono::Utc::now().timestamp_millis();
             put_u64(doc, &obj, "status_timestamp_ms", now as u64)?;
-        } else if st == "none" {
+        } else if status == ThingStatus::None {
             // Clear timestamp for "none" status
             let _ = doc.delete(&obj, "status_timestamp_ms");
         }
@@ -503,17 +512,14 @@ fn upsert_thing(
         put_string(doc, &obj, "title", t)?;
     }
 
-    // Tri-state: None = no change, Some("") = clear, Some(uuid) = set
     match parent_id {
-        Some(pid) => {
-            let pid = pid.trim();
-            if pid.is_empty() {
-                let _ = doc.delete(&obj, "parent_id");
-            } else {
-                put_string(doc, &obj, "parent_id", pid)?;
-            }
+        FieldPatch::Set(pid) => {
+            put_string(doc, &obj, "parent_id", pid.trim())?;
         }
-        None => {} // no change
+        FieldPatch::Clear => {
+            let _ = doc.delete(&obj, "parent_id");
+        }
+        FieldPatch::Noop => {}
     }
 
     apply_trigger_update(doc, &obj, actor, trigger)?;
@@ -575,9 +581,16 @@ fn move_things(
     Ok(())
 }
 
-/// Check if a status string requires a timestamp
-fn status_needs_timestamp(status: &str) -> bool {
-    matches!(status, "in-progress" | "stalled" | "done")
+fn parse_thing_status(status: &str) -> Result<ThingStatus> {
+    status.parse::<ThingStatus>().map_err(anyhow::Error::msg)
+}
+
+/// Check if a status requires a timestamp
+fn status_needs_timestamp(status: ThingStatus) -> bool {
+    matches!(
+        status,
+        ThingStatus::InProgress | ThingStatus::Stalled | ThingStatus::Done
+    )
 }
 
 fn set_thing_status(
@@ -587,9 +600,10 @@ fn set_thing_status(
     status: &str,
     timestamp_ms: Option<i64>,
 ) -> Result<()> {
+    let status = parse_thing_status(status)?;
     let (_things, obj) = ensure_thing_obj(doc, id)?;
     bump_entity_clock(doc, &obj, actor)?;
-    put_string(doc, &obj, "status", status)?;
+    put_string(doc, &obj, "status", status.as_str())?;
 
     // Store timestamp if provided
     if let Some(ts) = timestamp_ms {
@@ -893,7 +907,7 @@ pub enum CollectionOp {
         status: Option<String>,
         status_timestamp_ms: Option<i64>,
         title: Option<String>,
-        parent_id: Option<String>,
+        parent_id: FieldPatch<String>,
         trigger: TriggerUpdate,
         built_in: Option<ThingBuiltInFieldsUpdate>,
         attrs_json: Option<String>,
@@ -1045,7 +1059,14 @@ pub fn apply_collection_op(
             built_in,
             attrs_json,
         } => {
-            validate_parent_reference(&doc, &thing_id, parent_id.as_deref())?;
+            validate_parent_reference(
+                &doc,
+                &thing_id,
+                match &parent_id {
+                    FieldPatch::Set(parent_id) => Some(parent_id.as_str()),
+                    FieldPatch::Noop | FieldPatch::Clear => None,
+                },
+            )?;
 
             let things_map = ensure_map_key(&mut doc, &automerge::ROOT, Schema::KEY_THING_MAP)?;
             let thing_obj = ensure_child_map(&mut doc, &things_map, &thing_id)?;
@@ -1073,27 +1094,27 @@ pub fn apply_collection_op(
                 put_string(&mut doc, &thing_obj, "datatype", dt.as_str())?;
             }
             if let Some(st) = status {
-                put_string(&mut doc, &thing_obj, "status", &st)?;
+                let status = parse_thing_status(&st)?;
+                put_string(&mut doc, &thing_obj, "status", status.as_str())?;
 
                 if let Some(ts) = status_timestamp_ms {
                     put_u64(&mut doc, &thing_obj, "status_timestamp_ms", ts as u64)?;
-                } else if status_needs_timestamp(&st) {
+                } else if status_needs_timestamp(status) {
                     let now = chrono::Utc::now().timestamp_millis();
                     put_u64(&mut doc, &thing_obj, "status_timestamp_ms", now as u64)?;
-                } else if st == "none" {
+                } else if status == ThingStatus::None {
                     let _ = doc.delete(&thing_obj, "status_timestamp_ms");
                 }
             }
             if let Some(t) = title {
                 put_string(&mut doc, &thing_obj, "title", &t)?;
             }
-            // Tri-state: None = no change, Some("") = clear, Some(uuid) = set
-            match parent_id.as_deref() {
-                Some("") => {
+            match parent_id {
+                FieldPatch::Clear => {
                     let _ = doc.delete(&thing_obj, "parent_id");
                 }
-                Some(pid) => put_string(&mut doc, &thing_obj, "parent_id", pid.trim())?,
-                None => {} // no change
+                FieldPatch::Set(pid) => put_string(&mut doc, &thing_obj, "parent_id", pid.trim())?,
+                FieldPatch::Noop => {}
             }
             if let Some(attrs) = attrs_json {
                 put_string(&mut doc, &thing_obj, "attrs", &attrs)?;
@@ -1584,7 +1605,7 @@ mod tests_v3 {
                 status: Some("in-progress".into()),
                 status_timestamp_ms: None,
                 title: Some("My Task".into()),
-                parent_id: None,
+                parent_id: FieldPatch::Noop,
                 trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
@@ -1596,6 +1617,75 @@ mod tests_v3 {
         assert_eq!(view.things.len(), 1);
         assert_eq!(view.things[0].id, "thing-1");
         assert_eq!(view.things[0].title.as_deref(), Some("My Task"));
+    }
+
+    #[test]
+    fn test_collection_op_rejects_invalid_thing_status() {
+        let doc = Schema::init_collection_doc("test", "coll-1").unwrap();
+        let err = apply_collection_op(
+            &doc,
+            "test",
+            "coll-1",
+            CollectionOp::UpsertThingMeta {
+                thing_id: "thing-1".into(),
+                datatype: Some(ThingDatatype::Markdown),
+                status: Some("blocked".into()),
+                status_timestamp_ms: None,
+                title: Some("My Task".into()),
+                parent_id: FieldPatch::Noop,
+                trigger: TriggerUpdate::Noop,
+                built_in: None,
+                attrs_json: None,
+            },
+        )
+        .expect_err("invalid thing status must be rejected");
+
+        assert!(err.to_string().contains("Invalid thing status"), "{err:?}");
+    }
+
+    #[test]
+    fn test_root_op_rejects_invalid_thing_status() {
+        let doc = Schema::init_root_doc("test").unwrap();
+        let doc = apply_op(
+            &doc,
+            "test",
+            Op::UpsertCollection {
+                id: "coll-1".into(),
+                title: Some("Inbox".into()),
+                status: None,
+                trigger: TriggerUpdate::Noop,
+            },
+        )
+        .unwrap();
+        let doc = apply_op(
+            &doc,
+            "test",
+            Op::UpsertThing {
+                id: "thing-1".into(),
+                collection_id: "coll-1".into(),
+                datatype: Some(ThingDatatype::Markdown),
+                status: Some("none".into()),
+                status_timestamp_ms: None,
+                title: Some("My Task".into()),
+                parent_id: FieldPatch::Noop,
+                trigger: TriggerUpdate::Noop,
+                content: None,
+            },
+        )
+        .unwrap();
+
+        let err = apply_op(
+            &doc,
+            "test",
+            Op::SetThingStatus {
+                id: "thing-1".into(),
+                status: "blocked".into(),
+                timestamp_ms: None,
+            },
+        )
+        .expect_err("invalid thing status must be rejected");
+
+        assert!(err.to_string().contains("Invalid thing status"), "{err:?}");
     }
 
     #[test]
@@ -1611,7 +1701,7 @@ mod tests_v3 {
                 status: Some("none".into()),
                 status_timestamp_ms: None,
                 title: Some("Child".into()),
-                parent_id: Some("missing-parent".into()),
+                parent_id: FieldPatch::Set("missing-parent".into()),
                 trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
@@ -1620,7 +1710,8 @@ mod tests_v3 {
         .expect_err("missing parent must be rejected");
 
         assert!(
-            err.to_string().contains("must already exist in the same collection document"),
+            err.to_string()
+                .contains("must already exist in the same collection document"),
             "{err:?}"
         );
     }
@@ -1638,7 +1729,7 @@ mod tests_v3 {
                 status: Some("none".into()),
                 status_timestamp_ms: None,
                 title: Some("Parent".into()),
-                parent_id: None,
+                parent_id: FieldPatch::Noop,
                 trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
@@ -1655,7 +1746,7 @@ mod tests_v3 {
                 status: Some("none".into()),
                 status_timestamp_ms: None,
                 title: Some("Child".into()),
-                parent_id: Some("parent".into()),
+                parent_id: FieldPatch::Set("parent".into()),
                 trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
@@ -1673,7 +1764,7 @@ mod tests_v3 {
                 status: None,
                 status_timestamp_ms: None,
                 title: None,
-                parent_id: Some("child".into()),
+                parent_id: FieldPatch::Set("child".into()),
                 trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,

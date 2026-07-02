@@ -240,15 +240,22 @@ let result = sdk.things_edit_content(
 ### 操作 trigger 绑定
 
 ```rust
-sdk.things_set_collection_trigger_uuid(device_id, &collection_uuid, Some(&trigger_uuid))?;
-sdk.things_set_thing_trigger_uuid(device_id, &thing_uuid, Some(""))?; // clear
+sdk.things_set_collection_trigger_uuid_patch(
+    device_id,
+    &collection_uuid,
+    FieldPatch::Set(trigger_uuid.clone()),
+)?;
+sdk.things_set_thing_trigger_uuid_patch(device_id, &thing_uuid, FieldPatch::Clear)?;
 ```
 
-trigger 绑定采用 tri-state 语义：
+trigger 绑定在 core 内采用显式 patch 语义：
 
-- `None`: 不改
-- 空字符串: 清除
-- 非空 UUID: 设置
+- `FieldPatch::Noop`: 不改
+- `FieldPatch::Clear`: 清除
+- `FieldPatch::Set(uuid)`: 设置
+
+兼容 facade 仍可接收旧的 `Option<&str>` 参数，但进入 core 前会转换成
+`FieldPatch`，避免把空字符串作为领域语义继续扩散。
 
 ### 事件订阅
 

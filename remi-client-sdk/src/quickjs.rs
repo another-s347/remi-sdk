@@ -2,13 +2,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use async_trait::async_trait;
-use rquickjs_core::{Context, Ctx, Error as QuickJsError, Object, Runtime};
 use rquickjs_core::function::Func;
+use rquickjs_core::{Context, Ctx, Error as QuickJsError, Object, Runtime};
 use serde_json::{Value as JsonValue, json};
-
-use crate::external_tool_handler::ExternalToolHandler;
-use crate::external_tools::ExternalToolExecutor;
 
 pub type QuickJsHostHandler = Arc<dyn Fn(JsonValue) -> Result<JsonValue, String> + Send + Sync>;
 
@@ -72,24 +68,6 @@ impl fmt::Display for QuickJsSmokeError {
 
 impl std::error::Error for QuickJsSmokeError {}
 
-pub struct QuickJsSmokeHandler;
-
-#[async_trait]
-impl ExternalToolHandler for QuickJsSmokeHandler {
-    async fn handle(&self, _tool_call_id: &str, payload: &JsonValue) -> Result<JsonValue, String> {
-        let script = extract_script(payload)?;
-        let output = quickjs_smoke_eval(script).map_err(|error| error.to_string())?;
-        Ok(json!({
-            "json_result": output.json_result,
-            "console_logs": output.console_logs,
-        }))
-    }
-}
-
-pub fn register_quickjs_external_tools(executor: &mut ExternalToolExecutor) {
-    executor.register("quickjs_eval_request", QuickJsSmokeHandler);
-}
-
 pub fn quickjs_smoke_eval(script: &str) -> Result<QuickJsSmokeOutput, QuickJsSmokeError> {
     quickjs_eval_with_bindings(script, QuickJsHostBindings::default())
 }
@@ -99,19 +77,28 @@ pub fn quickjs_eval_with_bindings(
     bindings: QuickJsHostBindings,
 ) -> Result<QuickJsSmokeOutput, QuickJsSmokeError> {
     let started_at = Instant::now();
-    tracing::info!(script_len = script.len(), "[QuickJs] Creating smoke runtime");
+    tracing::info!(
+        script_len = script.len(),
+        "[QuickJs] Creating smoke runtime"
+    );
 
-    let runtime = Runtime::new()
-        .map_err(|error| QuickJsSmokeError::new(format!("failed to create QuickJS runtime: {error}")))?;
+    let runtime = Runtime::new().map_err(|error| {
+        QuickJsSmokeError::new(format!("failed to create QuickJS runtime: {error}"))
+    })?;
     runtime.set_memory_limit(8 * 1024 * 1024);
     runtime.set_max_stack_size(512 * 1024);
 
-    let context = Context::full(&runtime)
-        .map_err(|error| QuickJsSmokeError::new(format!("failed to create QuickJS context: {error}")))?;
+    let context = Context::full(&runtime).map_err(|error| {
+        QuickJsSmokeError::new(format!("failed to create QuickJS context: {error}"))
+    })?;
     let captured_logs = Arc::new(Mutex::new(Vec::new()));
 
-    tracing::info!(script_len = script.len(), "[QuickJs] Starting smoke evaluation");
-    let result = context.with(|ctx| run_eval(ctx, script, Arc::clone(&captured_logs), bindings.clone()));
+    tracing::info!(
+        script_len = script.len(),
+        "[QuickJs] Starting smoke evaluation"
+    );
+    let result =
+        context.with(|ctx| run_eval(ctx, script, Arc::clone(&captured_logs), bindings.clone()));
 
     match &result {
         Ok(output) => tracing::info!(
@@ -160,7 +147,10 @@ fn run_eval(
     })
 }
 
-fn install_console(ctx: Ctx<'_>, captured_logs: Arc<Mutex<Vec<String>>>) -> Result<(), QuickJsSmokeError> {
+fn install_console(
+    ctx: Ctx<'_>,
+    captured_logs: Arc<Mutex<Vec<String>>>,
+) -> Result<(), QuickJsSmokeError> {
     let globals = ctx.globals();
     let console = Object::new(ctx.clone()).map_err(|error| {
         QuickJsSmokeError::new(format!("failed to create QuickJS console object: {error}"))
@@ -176,13 +166,16 @@ fn install_console(ctx: Ctx<'_>, captured_logs: Arc<Mutex<Vec<String>>>) -> Resu
     console
         .set("log", Func::new(log_handler))
         .map_err(|error| QuickJsSmokeError::new(format!("failed to bind console.log: {error}")))?;
-    globals
-        .set("console", console)
-        .map_err(|error| QuickJsSmokeError::new(format!("failed to install console object: {error}")))?;
+    globals.set("console", console).map_err(|error| {
+        QuickJsSmokeError::new(format!("failed to install console object: {error}"))
+    })?;
     Ok(())
 }
 
-fn install_host_bindings(ctx: Ctx<'_>, bindings: QuickJsHostBindings) -> Result<(), QuickJsSmokeError> {
+fn install_host_bindings(
+    ctx: Ctx<'_>,
+    bindings: QuickJsHostBindings,
+) -> Result<(), QuickJsSmokeError> {
     install_json_host_function(ctx.clone(), "__remi_http_request", bindings.http_request)?;
     install_json_host_function(ctx.clone(), "__remi_notify_send", bindings.notify_send)?;
     install_json_host_function(ctx.clone(), "__remi_notify_list", bindings.notify_list)?;
@@ -239,7 +232,9 @@ fn install_json_host_function(
     });
 
     globals.set(name, function).map_err(|error| {
-        QuickJsSmokeError::new(format!("failed to install QuickJS host function '{name}': {error}"))
+        QuickJsSmokeError::new(format!(
+            "failed to install QuickJS host function '{name}': {error}"
+        ))
     })
 }
 
@@ -351,30 +346,11 @@ fn capture_exception(ctx: Ctx<'_>, error: &QuickJsError) -> Option<String> {
     }
 }
 
-fn extract_script(payload: &JsonValue) -> Result<&str, String> {
-    payload
-        .get("script")
-        .and_then(JsonValue::as_str)
-        .or_else(|| {
-            payload
-                .get("arguments")
-                .and_then(|value| value.get("script"))
-                .and_then(JsonValue::as_str)
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "quickjs_eval_request requires a non-empty script".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{
-        QuickJsHostBindings, quickjs_eval_with_bindings, quickjs_smoke_eval,
-        register_quickjs_external_tools,
-    };
-    use crate::external_tools::{ExternalToolCallRequest, ExternalToolExecutor};
+    use super::{QuickJsHostBindings, quickjs_eval_with_bindings, quickjs_smoke_eval};
     use serde_json::json;
 
     #[test]
@@ -482,29 +458,5 @@ return { sent, listed, marked, categoryMarked, allMarked, deleted };
         assert!(output.json_result.contains("\"mode\":\"flat\""));
         assert!(output.json_result.contains("\"category\":\"health\""));
         assert!(output.json_result.contains("\"read\":true"));
-    }
-
-    #[tokio::test]
-    async fn quickjs_smoke_handler_runs_through_executor() {
-        let mut executor = ExternalToolExecutor::new();
-        register_quickjs_external_tools(&mut executor);
-
-        let plan = executor
-            .resolve_calls([ExternalToolCallRequest {
-                tool_call_id: "quickjs:0".to_string(),
-                tool_name: "quickjs_eval".to_string(),
-                arguments: json!({
-                    "type": "quickjs_eval_request",
-                    "script": "console.log(\"executor\"); return { answer: 7 * 6 };"
-                }),
-            }])
-            .await;
-
-        assert!(plan.pending_calls.is_empty());
-        assert_eq!(plan.resolved_results.len(), 1);
-        assert_eq!(
-            plan.resolved_results[0].result.as_deref(),
-            Some("{\"console_logs\":[\"executor\"],\"json_result\":\"{\\\"answer\\\":42}\"}")
-        );
     }
 }

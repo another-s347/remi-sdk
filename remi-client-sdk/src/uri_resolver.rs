@@ -19,9 +19,7 @@ mod proto {
     }
 }
 
-use proto::public_api::v1::{
-    public_service_client::PublicServiceClient, ResolveUriRequest,
-};
+use proto::public_api::v1::{ResolveUriRequest, public_service_client::PublicServiceClient};
 
 use crate::auth::auth_get_bearer_token;
 use crate::things_crdt::{ContentEntryPayload, ContentEntryUpdate, ImageField, UrlField};
@@ -75,10 +73,7 @@ pub async fn resolve_uri(uri: &str, uri_type: &str) -> Result<UriMetadata> {
         .into_inner();
 
     if !response.success {
-        anyhow::bail!(
-            "ResolveUri returned error: {}",
-            response.error
-        );
+        anyhow::bail!("ResolveUri returned error: {}", response.error);
     }
 
     let m = response

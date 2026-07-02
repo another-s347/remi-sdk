@@ -1,11 +1,11 @@
 use crate::types::{
     ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, AgentVersion,
     AgentVersionUpdate, ChatSession, ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow,
-    EvalDataset, EvalDatasetRun, EvalDatasetRunEval, EvalDatasetRunItem, EvalDatasetSession, EvalDatasetUpdate, EventPayload, LocationCacheEntry,
-    NotificationEntry, NotificationGroup, NotificationResponseAction, NotificationSource,
-    StoredEvent, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
-    ThingsOperationType, TriggerInfo, TriggerLogEntry, TriggerLogLevel, TriggerRegistration,
-    TriggerRunType,
+    EvalDataset, EvalDatasetRun, EvalDatasetRunEval, EvalDatasetRunItem, EvalDatasetSession,
+    EvalDatasetUpdate, EventPayload, LocationCacheEntry, NotificationEntry, NotificationGroup,
+    NotificationResponseAction, NotificationSource, StoredEvent, StoredTrigger,
+    ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, TriggerInfo, TriggerLogEntry,
+    TriggerLogLevel, TriggerRegistration, TriggerRunType,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -102,10 +102,6 @@ impl Storage {
         let conn = storage.connection()?;
         storage.bootstrap(&conn)?;
         Ok(storage)
-    }
-
-    pub(crate) fn cache_namespace(&self) -> String {
-        self.db_path.to_string_lossy().into_owned()
     }
 
     fn connection(&self) -> Result<Connection> {
@@ -422,6 +418,25 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_things_content_snapshots_log
                 ON things_content_snapshots(change_log_id);
 
+            CREATE TABLE IF NOT EXISTS things_local_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_uuid TEXT NOT NULL,
+                change_kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                sync_run_id TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_things_local_events_device_id
+                ON things_local_events(device_id, event_id);
+            CREATE INDEX IF NOT EXISTS idx_things_local_events_entity
+                ON things_local_events(entity_type, entity_uuid, event_id);
+            CREATE INDEX IF NOT EXISTS idx_things_local_events_sync_run
+                ON things_local_events(sync_run_id);
+
             -- Location cache for geocoding results
             CREATE TABLE IF NOT EXISTS location_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -657,6 +672,7 @@ impl Storage {
             "actions",
             "chat_messages",
             "chat_sessions",
+            "things_local_events",
             "things_content_snapshots",
             "things_change_log",
             "crdt_documents",
@@ -805,15 +821,6 @@ impl Storage {
             params![key, value, now],
         )?;
         Ok(())
-    }
-
-    pub fn get_crdt_documents_revision(&self) -> Result<u64> {
-        match self.get_internal_kv(CRDT_DOCUMENTS_REVISION_KEY)? {
-            Some(value) => value
-                .parse::<u64>()
-                .with_context(|| format!("Invalid CRDT documents revision value: {value}")),
-            None => Ok(0),
-        }
     }
 
     pub fn delete_internal_kv(&self, key: &str) -> Result<()> {
@@ -1639,9 +1646,17 @@ impl Storage {
                 &record.source_entity_type,
                 &record.source_entity_uuid,
                 serde_json::to_string(&record.args_json)?,
-                record.result_json.as_ref().map(serde_json::to_string).transpose()?,
+                record
+                    .result_json
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
                 serde_json::to_string(&record.console_logs)?,
-                record.error_json.as_ref().map(serde_json::to_string).transpose()?,
+                record
+                    .error_json
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
                 record.started_at.timestamp(),
                 record.finished_at.timestamp(),
                 i64::try_from(record.duration_ms).unwrap_or(i64::MAX),
@@ -1652,7 +1667,10 @@ impl Storage {
         Ok(())
     }
 
-    pub fn latest_action_invocation(&self, action_uuid: &str) -> Result<Option<ActionInvocationRecord>> {
+    pub fn latest_action_invocation(
+        &self,
+        action_uuid: &str,
+    ) -> Result<Option<ActionInvocationRecord>> {
         let conn = self.connection()?;
         let record = conn
             .query_row(
@@ -1910,19 +1928,6 @@ impl Storage {
         .context("Failed to save crdt document")?;
         Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
         tx.commit()?;
-        let revision = self.get_crdt_documents_revision()?;
-        let namespace = self.cache_namespace();
-        crate::crdt_cache::upsert_document(
-            &namespace,
-            revision,
-            uuid,
-            data_type,
-            automerge_doc,
-            sync_state,
-            dirty,
-            last_sync_at,
-        );
-        crate::crdt_cache::invalidate_namespace_revision_older_than(&namespace, revision);
         Ok(())
     }
 
@@ -2020,21 +2025,6 @@ impl Storage {
         .context("Failed to set crdt document dirty")?;
         Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
         tx.commit()?;
-        let revision = self.get_crdt_documents_revision()?;
-        let namespace = self.cache_namespace();
-        if let Some(row) = self.get_crdt_document(uuid, data_type)? {
-            crate::crdt_cache::upsert_document(
-                &namespace,
-                revision,
-                &row.uuid,
-                &row.data_type,
-                &row.automerge_doc,
-                &row.sync_state,
-                row.dirty,
-                row.last_sync_at.as_deref(),
-            );
-        }
-        crate::crdt_cache::invalidate_namespace_revision_older_than(&namespace, revision);
         Ok(())
     }
 
@@ -2049,10 +2039,6 @@ impl Storage {
         .context("Failed to delete crdt document")?;
         Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
         tx.commit()?;
-        let revision = self.get_crdt_documents_revision()?;
-        let namespace = self.cache_namespace();
-        crate::crdt_cache::remove_document(&namespace, revision, uuid, data_type);
-        crate::crdt_cache::invalidate_namespace_revision_older_than(&namespace, revision);
         Ok(())
     }
 
@@ -2064,8 +2050,6 @@ impl Storage {
             .context("Failed to delete all crdt documents")?;
         Self::bump_internal_kv_counter_tx(&tx, CRDT_DOCUMENTS_REVISION_KEY)?;
         tx.commit()?;
-        let revision = self.get_crdt_documents_revision()?;
-        crate::crdt_cache::invalidate_namespace_revision_older_than(&self.cache_namespace(), revision);
         Ok(())
     }
 
@@ -2459,7 +2443,8 @@ impl Storage {
             params![applied_at.timestamp(), version_id],
         )
         .context("Failed to mark agent version as applied")?;
-        tx.commit().context("Failed to commit agent version apply marker")?;
+        tx.commit()
+            .context("Failed to commit agent version apply marker")?;
         Ok(())
     }
 
@@ -2561,7 +2546,8 @@ impl Storage {
             [dataset_id],
         )
         .context("Failed to delete eval dataset")?;
-        tx.commit().context("Failed to commit eval dataset deletion")?;
+        tx.commit()
+            .context("Failed to commit eval dataset deletion")?;
         Ok(())
     }
 
@@ -2580,7 +2566,8 @@ impl Storage {
             params![item.added_at.timestamp(), item.dataset_id],
         )
         .context("Failed to bump eval dataset updated_at after adding session")?;
-        tx.commit().context("Failed to commit dataset session add")?;
+        tx.commit()
+            .context("Failed to commit dataset session add")?;
         Ok(())
     }
 
@@ -2598,7 +2585,8 @@ impl Storage {
             params![now, dataset_id],
         )
         .context("Failed to bump eval dataset updated_at after removing session")?;
-        tx.commit().context("Failed to commit dataset session removal")?;
+        tx.commit()
+            .context("Failed to commit dataset session removal")?;
         Ok(())
     }
 
@@ -2738,7 +2726,8 @@ impl Storage {
             params![updated_at.timestamp(), dataset_id],
         )
         .context("Failed to bump eval dataset updated_at after analysis")?;
-        tx.commit().context("Failed to commit eval dataset run evals")?;
+        tx.commit()
+            .context("Failed to commit eval dataset run evals")?;
         Ok(())
     }
 
@@ -3246,6 +3235,79 @@ impl Storage {
         })
     }
 
+    pub fn insert_things_local_event(
+        &self,
+        device_id: &str,
+        source: &str,
+        entity_type: &str,
+        entity_uuid: &str,
+        change_kind: &str,
+        payload_json: &str,
+        sync_run_id: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.connection()?;
+        let now = Utc::now().timestamp_millis();
+        conn.execute(
+            r#"INSERT INTO things_local_events
+               (device_id, source, entity_type, entity_uuid, change_kind, payload_json, created_at, sync_run_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            params![
+                device_id,
+                source,
+                entity_type,
+                entity_uuid,
+                change_kind,
+                payload_json,
+                now,
+                sync_run_id,
+            ],
+        )
+        .context("Failed to insert Things local event")?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_things_local_events_since(
+        &self,
+        device_id: &str,
+        after_event_id: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::things_local::ThingsLocalEvent>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT event_id, device_id, source, entity_type, entity_uuid, change_kind,
+                      payload_json, created_at, sync_run_id
+               FROM things_local_events
+               WHERE device_id = ?1 AND event_id > ?2
+               ORDER BY event_id ASC
+               LIMIT ?3"#,
+        )?;
+        let rows = stmt.query_map(params![device_id, after_event_id, limit], |row| {
+            Ok(crate::things_local::ThingsLocalEvent {
+                event_id: row.get(0)?,
+                device_id: row.get(1)?,
+                source: row.get(2)?,
+                entity_type: row.get(3)?,
+                entity_uuid: row.get(4)?,
+                change_kind: row.get(5)?,
+                payload_json: row.get(6)?,
+                created_at: row.get(7)?,
+                sync_run_id: row.get(8)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("Failed to list Things local events")
+    }
+
+    pub fn ack_things_local_events(&self, device_id: &str, until_event_id: i64) -> Result<u64> {
+        let conn = self.connection()?;
+        let deleted = conn.execute(
+            "DELETE FROM things_local_events WHERE device_id = ?1 AND event_id <= ?2",
+            params![device_id, until_event_id],
+        )? as u64;
+        Ok(deleted)
+    }
+
     // ===== Things Content Snapshots =====
 
     /// Insert a content snapshot for a thing.
@@ -3613,10 +3675,7 @@ impl Storage {
     // ===== Things Actor Metadata cache =====
 
     /// Batch-upsert actor metadata for things and collections fetched from the server.
-    pub fn upsert_things_actor_meta_batch(
-        &self,
-        items: &[ActorMetaEntry],
-    ) -> Result<()> {
+    pub fn upsert_things_actor_meta_batch(&self, items: &[ActorMetaEntry]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }

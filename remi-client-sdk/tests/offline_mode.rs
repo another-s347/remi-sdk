@@ -14,7 +14,10 @@ fn local_things_work_without_configuring_remote_transport() -> Result<()> {
         ThingCollectionUpsert {
             uuid: "offline-inbox".to_string(),
             title: "Offline Inbox".to_string(),
+            collection_type: Default::default(),
+            app_id: None,
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -28,6 +31,7 @@ fn local_things_work_without_configuring_remote_transport() -> Result<()> {
             data: Some(serde_json::json!({ "markdown": "runs without a server" })),
             collection_uuid: "offline-inbox".to_string(),
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,

@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
-use automerge::{AutoCommit, ObjType, ReadDoc};
 use automerge::transaction::Transactable;
+use automerge::{AutoCommit, ObjType, ReadDoc};
 
 use crate::materialize::materialize_plan;
 use crate::schema::{Schema, CURRENT_SCHEMA_VERSION};
-use crate::util::{ensure_child_map, ensure_list_key, ensure_map_key, put_string, put_u64, set_doc_actor};
+use crate::util::{
+    ensure_child_map, ensure_list_key, ensure_map_key, put_string, put_u64, set_doc_actor,
+};
 use crate::view::View;
 
 /// Compact a document by rebuilding it from the extracted logical view.
@@ -54,8 +56,8 @@ pub fn compact_from_view(view: &View, actor: &str, new_epoch: u64) -> Result<Vec
         if t.tombstone.as_ref().map(|x| x.deleted).unwrap_or(false) {
             continue;
         }
-        let obj = ensure_child_map(&mut doc, &things_map, &t.id)
-            .context("Failed to create thing map")?;
+        let obj =
+            ensure_child_map(&mut doc, &things_map, &t.id).context("Failed to create thing map")?;
         put_string(&mut doc, &obj, "collection_id", &t.collection_id)?;
         put_string(&mut doc, &obj, "datatype", t.datatype.as_str())?;
         put_string(&mut doc, &obj, "status", t.status.as_storage_str())?;
@@ -127,8 +129,11 @@ pub fn compact_from_view(view: &View, actor: &str, new_epoch: u64) -> Result<Vec
 // V3 Multi-Document Compaction
 // ============================================================================
 
-use crate::view::{RootView, CollectionDocView, ThingContentView, ThingMarkdownView};
-use crate::extract::{extract_collection_doc_view_from_doc, extract_root_view_from_doc, extract_thing_content_view_from_doc, extract_thing_markdown_view_from_doc};
+use crate::extract::{
+    extract_collection_doc_view_from_doc, extract_root_view_from_doc,
+    extract_thing_content_view_from_doc, extract_thing_markdown_view_from_doc,
+};
+use crate::view::{CollectionDocView, RootView, ThingContentView, ThingMarkdownView};
 
 /// Default compaction threshold in bytes (64KB)
 pub const DEFAULT_COMPACTION_THRESHOLD: usize = 64 * 1024;
@@ -142,10 +147,10 @@ pub fn needs_compaction(doc_bytes: &[u8], threshold: usize) -> bool {
 pub fn compact_root_doc(doc_bytes: &[u8], actor: &str) -> Result<Vec<u8>> {
     let doc = automerge::AutoCommit::load(doc_bytes)
         .context("Failed to load root document for compaction")?;
-    
-    let view = extract_root_view_from_doc(&doc)
-        .context("Failed to extract root view for compaction")?;
-    
+
+    let view =
+        extract_root_view_from_doc(&doc).context("Failed to extract root view for compaction")?;
+
     rebuild_root_doc(&view, actor)
 }
 
@@ -153,39 +158,50 @@ pub fn compact_root_doc(doc_bytes: &[u8], actor: &str) -> Result<Vec<u8>> {
 fn rebuild_root_doc(view: &RootView, actor: &str) -> Result<Vec<u8>> {
     let mut doc = AutoCommit::new();
     set_doc_actor(&mut doc, actor);
-    
+
     // Create root structure
-    let root = doc.put_object(automerge::ROOT, "root", ObjType::Map)
+    let root = doc
+        .put_object(automerge::ROOT, "root", ObjType::Map)
         .context("Failed to create root map")?;
-    
-    put_u64(&mut doc, &root, "schema_version", view.schema_version as u64)?;
+
+    put_u64(
+        &mut doc,
+        &root,
+        "schema_version",
+        view.schema_version as u64,
+    )?;
     put_u64(&mut doc, &root, "epoch", view.epoch)?;
-    
+
     // Create collection_uuids list
-    let list = doc.put_object(&root, "collection_uuids", ObjType::List)
+    let list = doc
+        .put_object(&root, "collection_uuids", ObjType::List)
         .context("Failed to create collection_uuids list")?;
-    
+
     for (i, uuid) in view.collection_uuids.iter().enumerate() {
         doc.insert(&list, i, uuid.as_str())
             .context("Failed to insert collection uuid")?;
     }
-    
+
     Ok(doc.save())
 }
 
 /// Compact a Collection document by rebuilding from its view
-/// 
+///
 /// # Arguments
 /// * `doc_bytes` - The document bytes to compact
 /// * `collection_uuid` - The collection UUID (used for extraction)
 /// * `actor` - The actor ID for the new document
-pub fn compact_collection_doc(doc_bytes: &[u8], collection_uuid: &str, actor: &str) -> Result<Vec<u8>> {
+pub fn compact_collection_doc(
+    doc_bytes: &[u8],
+    collection_uuid: &str,
+    actor: &str,
+) -> Result<Vec<u8>> {
     let doc = automerge::AutoCommit::load(doc_bytes)
         .context("Failed to load collection document for compaction")?;
-    
+
     let view = extract_collection_doc_view_from_doc(&doc, collection_uuid)
         .context("Failed to extract collection doc view for compaction")?;
-    
+
     rebuild_collection_doc(&view, actor)
 }
 
@@ -193,19 +209,21 @@ pub fn compact_collection_doc(doc_bytes: &[u8], collection_uuid: &str, actor: &s
 fn rebuild_collection_doc(view: &CollectionDocView, actor: &str) -> Result<Vec<u8>> {
     // Start from the init template and update values
     let template = Schema::init_collection_doc(actor, &view.meta.id)?;
-    let mut doc = automerge::AutoCommit::load(&template)
-        .context("Failed to load collection template")?;
-    
+    let mut doc =
+        automerge::AutoCommit::load(&template).context("Failed to load collection template")?;
+
     // Update collection metadata in meta object
-    if let Some((automerge::Value::Object(ObjType::Map), meta_obj)) = doc.get(automerge::ROOT, Schema::KEY_META)? {
+    if let Some((automerge::Value::Object(ObjType::Map), meta_obj)) =
+        doc.get(automerge::ROOT, Schema::KEY_META)?
+    {
         put_string(&mut doc, &meta_obj, "title", &view.meta.title)?;
         put_string(&mut doc, &meta_obj, "status", &view.meta.status)?;
-        
+
         // Edit clock
         let clock = ensure_map_key(&mut doc, &meta_obj, "edit_clock")?;
         put_string(&mut doc, &clock, "actor", &view.meta.edit_clock.actor)?;
         put_u64(&mut doc, &clock, "seq", view.meta.edit_clock.seq)?;
-        
+
         // Trigger
         if let Some(trig) = &view.meta.trigger {
             let t = ensure_map_key(&mut doc, &meta_obj, "trigger")?;
@@ -218,15 +236,17 @@ fn rebuild_collection_doc(view: &CollectionDocView, actor: &str) -> Result<Vec<u
             put_u64(&mut doc, &tc, "seq", trig.clock.seq)?;
         }
     }
-    
+
     // Things metadata
-    if let Some((automerge::Value::Object(ObjType::Map), things_map)) = doc.get(automerge::ROOT, Schema::KEY_THING_MAP)? {
+    if let Some((automerge::Value::Object(ObjType::Map), things_map)) =
+        doc.get(automerge::ROOT, Schema::KEY_THING_MAP)?
+    {
         for thing in &view.things {
             // Skip tombstoned things
             if thing.tombstone.as_ref().map(|t| t.deleted).unwrap_or(false) {
                 continue;
             }
-            
+
             let obj = ensure_child_map(&mut doc, &things_map, &thing.id)?;
             put_string(&mut doc, &obj, "datatype", thing.datatype.as_str())?;
             put_string(&mut doc, &obj, "status", thing.status.as_storage_str())?;
@@ -239,12 +259,12 @@ fn rebuild_collection_doc(view: &CollectionDocView, actor: &str) -> Result<Vec<u
             if let Some(parent_id) = &thing.parent_id {
                 put_string(&mut doc, &obj, "parent_id", parent_id)?;
             }
-            
+
             // Edit clock
             let clock = ensure_map_key(&mut doc, &obj, "edit_clock")?;
             put_string(&mut doc, &clock, "actor", &thing.edit_clock.actor)?;
             put_u64(&mut doc, &clock, "seq", thing.edit_clock.seq)?;
-            
+
             // Trigger
             if let Some(trig) = &thing.trigger {
                 let tr = ensure_map_key(&mut doc, &obj, "trigger")?;
@@ -258,23 +278,27 @@ fn rebuild_collection_doc(view: &CollectionDocView, actor: &str) -> Result<Vec<u
             }
         }
     }
-    
+
     Ok(doc.save())
 }
 
 /// Compact a ThingMarkdown document by rebuilding from its view
-/// 
+///
 /// # Arguments
 /// * `doc_bytes` - The document bytes to compact
 /// * `thing_uuid` - The thing UUID (used for extraction)
 /// * `actor` - The actor ID for the new document
-pub fn compact_thing_markdown_doc(doc_bytes: &[u8], thing_uuid: &str, actor: &str) -> Result<Vec<u8>> {
+pub fn compact_thing_markdown_doc(
+    doc_bytes: &[u8],
+    thing_uuid: &str,
+    actor: &str,
+) -> Result<Vec<u8>> {
     let doc = automerge::AutoCommit::load(doc_bytes)
         .context("Failed to load thing markdown document for compaction")?;
-    
+
     let view = extract_thing_markdown_view_from_doc(&doc, thing_uuid)
         .context("Failed to extract thing markdown view for compaction")?;
-    
+
     rebuild_thing_markdown_doc(&view, actor)
 }
 
@@ -314,18 +338,20 @@ fn rebuild_thing_content_doc(view: &ThingContentView, actor: &str) -> Result<Vec
         &view.thing_uuid,
         &view.content_type,
     )?;
-    let mut doc = automerge::AutoCommit::load(&template)
-        .context("Failed to load thing content template")?;
-    
+    let mut doc =
+        automerge::AutoCommit::load(&template).context("Failed to load thing content template")?;
+
     // If there's content, rebuild it
     if let Some(content) = &view.content {
-        if let Some((automerge::Value::Object(ObjType::Map), content_obj)) = doc.get(automerge::ROOT, Schema::KEY_CONTENT)? {
+        if let Some((automerge::Value::Object(ObjType::Map), content_obj)) =
+            doc.get(automerge::ROOT, Schema::KEY_CONTENT)?
+        {
             put_string(&mut doc, &content_obj, "kind", &content.kind)?;
-            
+
             if let Some(payload) = &content.payload {
                 put_string(&mut doc, &content_obj, "payload", &payload.to_string())?;
             }
-            
+
             if let Some(blocks) = &content.blocks {
                 let list = ensure_list_key(&mut doc, &content_obj, "blocks")?;
                 for (i, b) in blocks.iter().enumerate() {
@@ -348,6 +374,6 @@ fn rebuild_thing_content_doc(view: &ThingContentView, actor: &str) -> Result<Vec
             }
         }
     }
-    
+
     Ok(doc.save())
 }

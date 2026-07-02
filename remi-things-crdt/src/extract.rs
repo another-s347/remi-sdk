@@ -3,14 +3,17 @@ use automerge::{AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value};
 use std::time::Instant;
 use tracing::info;
 
-use crate::datatype::{ContentEntry, ContentEntryPayload, DateField, ImageField, LocationField, UrlField};
+use crate::datatype::{
+    ContentEntry, ContentEntryPayload, DateField, ImageField, LocationField, UrlField,
+};
 use crate::schema::{Schema, CURRENT_SCHEMA_VERSION};
-use crate::util::{collect_list_keys, collect_map_keys, collect_root_maps, get_json_string, get_string, get_u64};
+use crate::util::{
+    collect_list_keys, collect_map_keys, collect_root_maps, get_json_string, get_string, get_u64,
+};
 use crate::view::{
     BlockView, CollectionDocView, CollectionMetaView, CollectionView, ContentView, EditClock,
     RootView, ThingBuiltInFieldsView, ThingContentView, ThingMarkdownView, ThingMetaView,
-    ThingStatus, ThingView,
-    Tombstone, TriggerBinding, View,
+    ThingStatusView, ThingView, Tombstone, TriggerBinding, View,
 };
 use crate::ThingDatatype;
 
@@ -420,13 +423,13 @@ fn read_trigger(doc: &AutoCommit, entity_obj: &ObjId) -> Result<Option<TriggerBi
     Ok(Some(TriggerBinding { state, uuid, clock }))
 }
 
-fn read_thing_status(doc: &AutoCommit, entity_obj: &ObjId) -> Result<ThingStatus> {
+fn read_thing_status(doc: &AutoCommit, entity_obj: &ObjId) -> Result<ThingStatusView> {
     let status_str = get_string(doc, entity_obj, "status")?.unwrap_or_else(|| "none".to_string());
 
     // Try to read timestamp from status_timestamp_ms field
     let timestamp_ms = get_u64(doc, entity_obj, "status_timestamp_ms")?.map(|v| v as i64);
 
-    Ok(ThingStatus::from_storage(&status_str, timestamp_ms))
+    Ok(ThingStatusView::from_storage(&status_str, timestamp_ms))
 }
 
 fn read_content(doc: &AutoCommit, entity_obj: &ObjId) -> Result<Option<ContentView>> {
@@ -637,23 +640,45 @@ pub fn extract_collection_doc_view_from_doc(
         }
     };
 
-    // Read things map
-    let things = if let Some((Value::Object(ObjType::Map), things_map)) =
-        doc.get(automerge::ROOT, Schema::KEY_THING_MAP)?
-    {
-        let mut out = Vec::new();
-        for thing_id in doc.keys(&things_map) {
-            if let Some((Value::Object(ObjType::Map), thing_obj)) =
-                doc.get(&things_map, thing_id.as_str())?
-            {
-                let thing_meta = extract_thing_meta_from_obj(doc, &thing_obj, &thing_id)?;
-                out.push(thing_meta);
+    // Read all conflicting things maps. Devices can independently initialize
+    // the same fixed collection document (for example the default inbox), and
+    // `doc.get()` would expose only one of those maps after merge.
+    let mut things_by_id = std::collections::BTreeMap::new();
+    if let Ok(all_values) = doc.get_all(automerge::ROOT, Schema::KEY_THING_MAP) {
+        for (value, things_map) in all_values {
+            if !matches!(value, Value::Object(ObjType::Map)) {
+                continue;
+            }
+            for thing_id in doc.keys(&things_map) {
+                for (thing_value, thing_obj) in doc.get_all(&things_map, thing_id.as_str())? {
+                    if !matches!(thing_value, Value::Object(ObjType::Map)) {
+                        continue;
+                    }
+                    let thing_meta = extract_thing_meta_from_obj(doc, &thing_obj, &thing_id)?;
+                    let should_replace = things_by_id.get(&thing_meta.id).map_or(
+                        true,
+                        |existing: &ThingMetaView| {
+                            let existing_deleted = existing
+                                .tombstone
+                                .as_ref()
+                                .map(|tombstone| tombstone.deleted)
+                                .unwrap_or(false);
+                            let incoming_deleted = thing_meta
+                                .tombstone
+                                .as_ref()
+                                .map(|tombstone| tombstone.deleted)
+                                .unwrap_or(false);
+                            existing_deleted && !incoming_deleted
+                        },
+                    );
+                    if should_replace {
+                        things_by_id.insert(thing_meta.id.clone(), thing_meta);
+                    }
+                }
             }
         }
-        out
-    } else {
-        Vec::new()
-    };
+    }
+    let things = things_by_id.into_values().collect();
 
     Ok(CollectionDocView {
         schema_version,
@@ -706,11 +731,9 @@ fn extract_built_in_fields(
     doc: &AutoCommit,
     built_in_objs: &[ObjId],
 ) -> Result<ThingBuiltInFieldsView> {
-    let extra = built_in_objs.iter().find_map(|built_in_obj| {
-        get_json_string(doc, built_in_obj, "extra")
-            .ok()
-            .flatten()
-    });
+    let extra = built_in_objs
+        .iter()
+        .find_map(|built_in_obj| get_json_string(doc, built_in_obj, "extra").ok().flatten());
 
     let mut content_entries_by_id = std::collections::BTreeMap::new();
     for built_in_obj in built_in_objs {
@@ -813,10 +836,12 @@ fn extract_content_entry_payload(
         "json_object" => {
             let data_doc_uuid = get_string(doc, payload_obj, "data_doc_uuid")?.unwrap_or_default();
             let schema_doc_uuid = get_string(doc, payload_obj, "schema_doc_uuid")?;
-            Ok(Some(ContentEntryPayload::JsonObject(crate::datatype::JsonObjectField {
-                data_doc_uuid,
-                schema_doc_uuid,
-            })))
+            Ok(Some(ContentEntryPayload::JsonObject(
+                crate::datatype::JsonObjectField {
+                    data_doc_uuid,
+                    schema_doc_uuid,
+                },
+            )))
         }
         "date" => {
             let timestamp_ms = get_u64(doc, payload_obj, "timestamp_ms")?.unwrap_or(0) as i64;
@@ -932,8 +957,8 @@ pub fn extract_thing_content_view_from_doc(
 
     let stored_uuid =
         get_string(doc, &automerge::ROOT, "thing_uuid")?.unwrap_or_else(|| thing_uuid.to_string());
-    let content_type =
-        get_string(doc, &automerge::ROOT, "content_type")?.unwrap_or_else(|| "markdown".to_string());
+    let content_type = get_string(doc, &automerge::ROOT, "content_type")?
+        .unwrap_or_else(|| "markdown".to_string());
 
     // Read content
     let content = if let Some((Value::Object(ObjType::Map), content_obj)) =
@@ -1064,13 +1089,9 @@ mod tests_v3 {
 
     #[test]
     fn test_extract_generic_thing_content_view() {
-        let doc_bytes = Schema::init_thing_content_doc(
-            "test-actor",
-            "content-456",
-            "thing-456",
-            "markdown",
-        )
-        .unwrap();
+        let doc_bytes =
+            Schema::init_thing_content_doc("test-actor", "content-456", "thing-456", "markdown")
+                .unwrap();
         let view = extract_thing_content_view(&doc_bytes, "content-456", "thing-456").unwrap();
         assert_eq!(view.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(view.document_uuid, "content-456");

@@ -1,6 +1,8 @@
 use anyhow::Result;
 
-use remi_things_crdt::{apply_op, extract_view, Block, Content, Op, ThingDatatype, TriggerUpdate};
+use remi_things_crdt::{
+    apply_op, extract_view, Block, Content, FieldPatch, Op, ThingDatatype, TriggerUpdate,
+};
 
 #[test]
 fn batch_upsert_matches_sequential_application() -> Result<()> {
@@ -27,7 +29,7 @@ fn batch_upsert_matches_sequential_application() -> Result<()> {
             status: Some("none".to_string()),
             status_timestamp_ms: None,
             title: Some("Hello".to_string()),
-            parent_id: None,
+            parent_id: FieldPatch::Noop,
             trigger: TriggerUpdate::Noop,
             content: Some(Content::Markdown {
                 blocks: vec![Block {
@@ -59,7 +61,7 @@ fn batch_upsert_matches_sequential_application() -> Result<()> {
                     status: Some("none".to_string()),
                     status_timestamp_ms: None,
                     title: Some("Hello".to_string()),
-                    parent_id: None,
+                    parent_id: FieldPatch::Noop,
                     trigger: TriggerUpdate::Noop,
                     content: Some(Content::Markdown {
                         blocks: vec![Block {

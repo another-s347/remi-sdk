@@ -1,7 +1,6 @@
 use crate::things_crdt::{ThingEntry, ThingsSnapshot};
 use crate::types::TriggerInfo;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,12 +60,6 @@ const MAX_COLLECTIONS: usize = 20;
 const MAX_THINGS_PER_COLLECTION: usize = 50;
 const MAX_SUB_THINGS_PER_THING: usize = 10;
 const MAX_TRIGGERS: usize = 50;
-
-fn parse_rfc3339_ts_millis(input: &str) -> i64 {
-    DateTime::parse_from_rfc3339(input)
-        .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
-        .unwrap_or(0)
-}
 
 fn yaml_quote(s: &str) -> String {
     let escaped = s
@@ -168,15 +161,11 @@ fn build_enabled_events_section(granted_permissions: &[String]) -> String {
 
 fn build_user_data_overview(snapshot: &ThingsSnapshot, triggers: &[TriggerInfo]) -> String {
     let mut collections = snapshot.collections.clone();
-    collections.sort_by(|a, b| {
-        parse_rfc3339_ts_millis(&b.updated_at).cmp(&parse_rfc3339_ts_millis(&a.updated_at))
-    });
+    collections.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     collections.truncate(MAX_COLLECTIONS);
 
     let mut things = snapshot.things.clone();
-    things.sort_by(|a, b| {
-        parse_rfc3339_ts_millis(&b.updated_at).cmp(&parse_rfc3339_ts_millis(&a.updated_at))
-    });
+    things.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
     let mut things_by_collection: BTreeMap<String, Vec<ThingEntry>> = BTreeMap::new();
     for t in things {
@@ -205,9 +194,7 @@ fn build_user_data_overview(snapshot: &ThingsSnapshot, triggers: &[TriggerInfo])
             .into_iter()
             .filter(|t| t.parent_uuid.is_none())
             .collect();
-        top_level.sort_by(|a, b| {
-            parse_rfc3339_ts_millis(&b.updated_at).cmp(&parse_rfc3339_ts_millis(&a.updated_at))
-        });
+        top_level.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         top_level.truncate(MAX_THINGS_PER_COLLECTION);
 
         for t in top_level {
@@ -232,9 +219,7 @@ fn build_user_data_overview(snapshot: &ThingsSnapshot, triggers: &[TriggerInfo])
                 .into_iter()
                 .filter(|child| child.parent_uuid.as_deref() == Some(t.uuid.as_str()))
                 .collect();
-            sub.sort_by(|a, b| {
-                parse_rfc3339_ts_millis(&b.updated_at).cmp(&parse_rfc3339_ts_millis(&a.updated_at))
-            });
+            sub.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
             sub.truncate(MAX_SUB_THINGS_PER_THING);
 
             if !sub.is_empty() {
@@ -296,7 +281,10 @@ fn resolve_active_context_virtual_fs_paths(
             .iter()
             .find(|thing| thing.uuid == uuid)
             .map(|thing| {
-                let dir = format!("/collection/{}/things/{}", thing.collection_uuid, thing.uuid);
+                let dir = format!(
+                    "/collection/{}/things/{}",
+                    thing.collection_uuid, thing.uuid
+                );
                 json!({
                     "dir": dir,
                     "name": format!("{dir}/name"),
@@ -322,7 +310,8 @@ fn enrich_active_context_entry(snapshot: &ThingsSnapshot, entry: &mut Value) {
         return;
     };
 
-    let Some(virtual_fs) = resolve_active_context_virtual_fs_paths(snapshot, entry_type, uuid) else {
+    let Some(virtual_fs) = resolve_active_context_virtual_fs_paths(snapshot, entry_type, uuid)
+    else {
         return;
     };
 
@@ -427,10 +416,15 @@ mod tests {
             collections: vec![crate::things_crdt::ThingCollectionEntry {
                 uuid: "c1".to_string(),
                 title: "Inbox".to_string(),
+                collection_type: Default::default(),
+                app_id: None,
+                archived_at: None,
                 trigger_uuid: Some("tr-1".to_string()),
                 card_jsx: None,
-                created_at: "2026-04-01T00:00:00Z".to_string(),
-                updated_at: "2026-04-01T00:00:00Z".to_string(),
+                created_at: crate::things_crdt::parse_domain_datetime("2026-04-01T00:00:00Z")
+                    .unwrap(),
+                updated_at: crate::things_crdt::parse_domain_datetime("2026-04-01T00:00:00Z")
+                    .unwrap(),
                 actor_type: None,
                 actor_app_id: None,
                 actor_display_name: None,
@@ -443,8 +437,12 @@ mod tests {
                 collection_uuid: "c1".to_string(),
                 parent_uuid: None,
                 trigger_uuid: Some("tr-2".to_string()),
-                created_at: "2026-04-01T00:00:00Z".to_string(),
-                updated_at: "2026-04-01T00:00:00Z".to_string(),
+                archived_at: None,
+                archived_from_collection_uuid: None,
+                created_at: crate::things_crdt::parse_domain_datetime("2026-04-01T00:00:00Z")
+                    .unwrap(),
+                updated_at: crate::things_crdt::parse_domain_datetime("2026-04-01T00:00:00Z")
+                    .unwrap(),
                 status: "none".to_string(),
                 status_timestamp_ms: None,
                 actor_type: None,

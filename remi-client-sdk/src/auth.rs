@@ -806,12 +806,11 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::{
-        AuthCredentials, SecureSessionStore, auth_clear_secure_session_store,
-        auth_is_app_key, auth_set_secure_session_store, clear_credentials_from_store,
-        persist_credentials_to_store, resolve_bearer_token_value,
-        resolve_user_access_token_value, should_clear_session_after_error,
-        should_complete_local_logout_after_error, should_defer_restore_validation_error,
-        should_force_local_logout_after_error,
+        AuthCredentials, SecureSessionStore, auth_clear_secure_session_store, auth_is_app_key,
+        auth_set_secure_session_store, clear_credentials_from_store, persist_credentials_to_store,
+        resolve_bearer_token_value, resolve_user_access_token_value,
+        should_clear_session_after_error, should_complete_local_logout_after_error,
+        should_defer_restore_validation_error, should_force_local_logout_after_error,
     };
 
     #[derive(Default)]

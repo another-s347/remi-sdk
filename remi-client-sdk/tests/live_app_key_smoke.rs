@@ -3,16 +3,15 @@ use std::env;
 use anyhow::{Context, Result};
 use remi_client_sdk::app_keys_client::{self, AppKeysClient};
 use remi_client_sdk::auth::{
-    auth_clear_app_key, auth_get_bearer_auth_mode, auth_insert_bearer_header,
-    auth_set_app_key,
+    auth_clear_app_key, auth_get_bearer_auth_mode, auth_insert_bearer_header, auth_set_app_key,
 };
 use remi_client_sdk::transport::{configure_shared_transport, get_shared_transport};
 use remi_client_sdk::{SdkBearerAuthMode, TriggerClient};
 use serde_json::json;
 
 fn live_transport_config_json() -> String {
-    let grpc_addr = env::var("REMI_PUBLIC_GRPC_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:50051".to_string());
+    let grpc_addr =
+        env::var("REMI_PUBLIC_GRPC_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
 
     json!({
         "transportMode": "tcp",
@@ -39,7 +38,10 @@ async fn live_app_key_smoke() -> Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
 
-    assert_eq!(auth_get_bearer_auth_mode().await, Some(SdkBearerAuthMode::AppKey));
+    assert_eq!(
+        auth_get_bearer_auth_mode().await,
+        Some(SdkBearerAuthMode::AppKey)
+    );
 
     // Positive path: business RPCs should work in app-key-only mode.
     let device_id = format!("copilot-app-key-smoke-{}", std::process::id());
@@ -62,9 +64,11 @@ async fn live_app_key_smoke() -> Result<()> {
         .list_applications()
         .await
         .expect_err("AppKeysClient must reject app keys for application management RPCs");
-    assert!(sdk_err
-        .to_string()
-        .contains("Application API keys cannot be used for application management RPCs"));
+    assert!(
+        sdk_err
+            .to_string()
+            .contains("Application API keys cannot be used for application management RPCs")
+    );
 
     // Server boundary: direct gRPC access with an app key must also be rejected.
     let transport = get_shared_transport().map_err(|err| anyhow::anyhow!(err))?;
@@ -72,7 +76,8 @@ async fn live_app_key_smoke() -> Result<()> {
         .get_channel()
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
-    let mut raw_client = app_keys_client::proto::public_service_client::PublicServiceClient::new(channel);
+    let mut raw_client =
+        app_keys_client::proto::public_service_client::PublicServiceClient::new(channel);
     let mut request = tonic::Request::new(app_keys_client::proto::ListApplicationsRequest {});
     auth_insert_bearer_header(&mut request, &app_key).map_err(|err| anyhow::anyhow!(err))?;
 

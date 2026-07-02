@@ -15,10 +15,9 @@ pub mod proto {
 }
 
 use proto::public_api::v1::{
-    GetAvatarUploadUrlRequest, GetAvatarUploadUrlResponse,
-    GetMediaUploadUrlRequest, GetMediaUploadUrlResponse,
-    GetProfileRequest, ProfileResponse,
-    UpdateProfileRequest, UpdateProfileResponse, public_service_client::PublicServiceClient,
+    GetAvatarUploadUrlRequest, GetAvatarUploadUrlResponse, GetMediaUploadUrlRequest,
+    GetMediaUploadUrlResponse, GetProfileRequest, ProfileResponse, UpdateProfileRequest,
+    UpdateProfileResponse, public_service_client::PublicServiceClient,
 };
 
 use crate::auth::{auth_get_bearer_token, auth_get_user_id};
@@ -61,9 +60,11 @@ impl ProfileClient {
     }
 
     async fn authed_request<T>(&self, inner: T) -> Result<tonic::Request<T>> {
-        let bearer_token = auth_get_bearer_token()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Authentication bearer token is not configured — cannot call profile API"))?;
+        let bearer_token = auth_get_bearer_token().await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Authentication bearer token is not configured — cannot call profile API"
+            )
+        })?;
         let mut req = tonic::Request::new(inner);
         crate::auth::auth_insert_bearer_header(&mut req, &bearer_token)
             .map_err(|err| anyhow::anyhow!(err))?;
@@ -124,7 +125,11 @@ impl ProfileClient {
     }
 
     /// Upload an avatar image to the signed URL and return the public URL
-    pub async fn upload_avatar(&self, file_bytes: Vec<u8>, file_extension: String) -> Result<String> {
+    pub async fn upload_avatar(
+        &self,
+        file_bytes: Vec<u8>,
+        file_extension: String,
+    ) -> Result<String> {
         let urls = self.get_avatar_upload_url(file_extension.clone()).await?;
 
         let content_type = crate::remi_uri::mime_from_extension(&file_extension);
@@ -158,7 +163,10 @@ impl ProfileClient {
         scenario: String,
     ) -> Result<GetMediaUploadUrlResponse> {
         let request = self
-            .authed_request(GetMediaUploadUrlRequest { file_extension, scenario })
+            .authed_request(GetMediaUploadUrlRequest {
+                file_extension,
+                scenario,
+            })
             .await?;
         let channel = self.get_channel().await?;
         let mut client = PublicServiceClient::new(channel);
@@ -173,8 +181,15 @@ impl ProfileClient {
     }
 
     /// Upload a media file to Supabase Storage and return the public URL
-    pub async fn upload_media(&self, file_bytes: Vec<u8>, file_extension: String, scenario: String) -> Result<String> {
-        let urls = self.get_media_upload_url(file_extension.clone(), scenario).await?;
+    pub async fn upload_media(
+        &self,
+        file_bytes: Vec<u8>,
+        file_extension: String,
+        scenario: String,
+    ) -> Result<String> {
+        let urls = self
+            .get_media_upload_url(file_extension.clone(), scenario)
+            .await?;
 
         let content_type = crate::remi_uri::mime_from_extension(&file_extension);
 
@@ -220,7 +235,9 @@ fn profile_info_from_response(resp: ProfileResponse) -> ProfileInfo {
 }
 
 fn profile_info_from_update_response(resp: UpdateProfileResponse) -> Result<ProfileInfo, String> {
-    let profile = resp.profile.ok_or_else(|| "No profile in response".to_string())?;
+    let profile = resp
+        .profile
+        .ok_or_else(|| "No profile in response".to_string())?;
     Ok(ProfileInfo {
         user_id: profile.user_id,
         display_name: profile.display_name,

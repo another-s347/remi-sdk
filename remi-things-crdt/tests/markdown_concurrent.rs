@@ -1,11 +1,11 @@
 use remi_things_crdt::{
-    apply_op, decode_markdown_only_thing, extract_view, Block, Content, MarkdownOnlyDecoded, Op,
-    ThingDatatype, TriggerUpdate,
+    apply_op, decode_markdown_only_thing, extract_view, Block, Content, FieldPatch,
+    MarkdownOnlyDecoded, Op, ThingDatatype, TriggerUpdate,
 };
 
 use anyhow::Result;
-use automerge::{sync, AutoCommit};
 use automerge::sync::SyncDoc;
+use automerge::{sync, AutoCommit};
 
 fn server_apply_and_reply(
     doc_bytes: &[u8],
@@ -76,7 +76,10 @@ fn converge_unary(
             AutoCommit::load(&client_doc)?
         };
         let mut st = client_state.clone();
-        let msg = doc.sync().generate_sync_message(&mut st).map(|m| m.encode());
+        let msg = doc
+            .sync()
+            .generate_sync_message(&mut st)
+            .map(|m| m.encode());
         msg
     };
 
@@ -125,7 +128,7 @@ fn concurrent_editing_markdown_converges() {
             status: Some("none".to_string()),
             status_timestamp_ms: None,
             title: Some("Doc".to_string()),
-            parent_id: None,
+            parent_id: FieldPatch::Noop,
             trigger: TriggerUpdate::Noop,
             content: Some(Content::Markdown {
                 blocks: vec![Block {

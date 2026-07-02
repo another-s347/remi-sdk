@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use remi_client_sdk::things_crdt::{ContentEntry, ContentEntryPayload, ImageField, ThingCollectionUpsert, ThingDatatype, ThingUpsert};
+use remi_client_sdk::things_crdt::{
+    ContentEntry, ContentEntryPayload, ImageField, ThingCollectionUpsert, ThingDatatype,
+    ThingUpsert,
+};
 use remi_client_sdk::{RemiUri, TriggerRegistration, TriggerRule, TriggerSdk};
 use serde_json::{Value as JsonValue, json};
 use tempfile::tempdir;
@@ -32,7 +35,10 @@ fn seed_tree_fixture(sdk: &TriggerSdk, device_id: &str, image_uri: &str) -> Resu
         ThingCollectionUpsert {
             uuid: "c1".to_string(),
             title: "Inbox".to_string(),
+            collection_type: Default::default(),
+            app_id: None,
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -42,7 +48,10 @@ fn seed_tree_fixture(sdk: &TriggerSdk, device_id: &str, image_uri: &str) -> Resu
         ThingCollectionUpsert {
             uuid: "c2".to_string(),
             title: "Later".to_string(),
+            collection_type: Default::default(),
+            app_id: None,
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -59,6 +68,7 @@ fn seed_tree_fixture(sdk: &TriggerSdk, device_id: &str, image_uri: &str) -> Resu
             })),
             collection_uuid: "c1".to_string(),
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -73,6 +83,7 @@ fn seed_tree_fixture(sdk: &TriggerSdk, device_id: &str, image_uri: &str) -> Resu
             data: Some(json!({"markdown": "child"})),
             collection_uuid: "c1".to_string(),
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             parent_uuid: Some("t1".to_string()),
             created_at: None,
             updated_at: None,
@@ -120,7 +131,11 @@ fn seed_tree_fixture(sdk: &TriggerSdk, device_id: &str, image_uri: &str) -> Resu
 
     for index in 1..=6 {
         let trigger_uuid = format!("tr-{index}");
-        sdk.register_trigger(build_registration(&trigger_uuid, &format!("Trigger {index}"), &format!("{} 9 * * *", index % 5)))?;
+        sdk.register_trigger(build_registration(
+            &trigger_uuid,
+            &format!("Trigger {index}"),
+            &format!("{} 9 * * *", index % 5),
+        ))?;
     }
 
     sdk.things_set_collection_trigger_uuid(device_id, "c1", Some("tr-1"))?;
@@ -137,7 +152,8 @@ fn virtual_fs_tree_and_read_cover_root_trigger_and_thing_files() -> Result<()> {
     let device_id = "device-a";
     let image_path = dir.path().join("sample.png");
     std::fs::write(&image_path, [137u8, 80, 78, 71]).context("write image")?;
-    let image_uri = RemiUri::from_local_file(&image_path.to_string_lossy(), "image/png", device_id).to_uri_string();
+    let image_uri = RemiUri::from_local_file(&image_path.to_string_lossy(), "image/png", device_id)
+        .to_uri_string();
     seed_tree_fixture(&sdk, device_id, &image_uri)?;
 
     let tree = sdk.tree_virtual_path(device_id, None)?;
@@ -168,8 +184,16 @@ fn virtual_fs_tree_and_read_cover_root_trigger_and_thing_files() -> Result<()> {
 
     let thing_content = sdk.read_virtual_path(device_id, "/collection/c1/things/t1/content.md")?;
     assert!(thing_content.content.contains("- milk"));
-    assert!(thing_content.content.contains("[内容](/collection/c1/things/t1/entries.0)"));
-    assert!(thing_content.content.contains("[IMG](/collection/c1/things/t1/entries.1)"));
+    assert!(
+        thing_content
+            .content
+            .contains("[内容](/collection/c1/things/t1/entries.0)")
+    );
+    assert!(
+        thing_content
+            .content
+            .contains("[IMG](/collection/c1/things/t1/entries.1)")
+    );
     assert!(!thing_content.content.contains("entries.2"));
 
     let entry = sdk.read_virtual_path(device_id, "/collection/c1/things/t1/entries.0")?;
@@ -194,51 +218,193 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
     let device_id = "device-b";
     let image_path = dir.path().join("sample.png");
     std::fs::write(&image_path, [137u8, 80, 78, 71]).context("write image")?;
-    let image_uri = RemiUri::from_local_file(&image_path.to_string_lossy(), "image/png", device_id).to_uri_string();
+    let image_uri = RemiUri::from_local_file(&image_path.to_string_lossy(), "image/png", device_id)
+        .to_uri_string();
     seed_tree_fixture(&sdk, device_id, &image_uri)?;
 
-    sdk.edit_virtual_path(device_id, "/collection/c1/name", "overwrite", Some(&json!("Inbox Renamed")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/collection/c1/trigger", "overwrite", Some(&json!("tr-3")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/collection/c1/card.jsx", "overwrite", Some(&json!("<Card><Text>{thing.title}</Text></Card>")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/name", "overwrite", Some(&json!("Buy oat milk")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/trigger", "overwrite", Some(&json!("")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/status", "overwrite", Some(&json!("done")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/content.md", "append", Some(&json!("- eggs")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/collection/c1/things/t1/entries.0", "overwrite", Some(&json!({
-        "title": "Updated entry",
-        "payload": {
-            "type": "custom",
-            "content_type": "test-entry",
-            "data": {"foo": 2}
-        }
-    })), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/trigger/tr-1/name", "overwrite", Some(&json!("Morning Trigger")), None, None, None)?;
-    sdk.edit_virtual_path(device_id, "/trigger/tr-1/rule.json", "overwrite", Some(&json!({
-        "version": "1.1",
-        "precondition": [{"rule": "cron('15 9 * * *')", "description": "updated cron"}],
-        "condition": []
-    })), None, None, None)?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/name",
+        "overwrite",
+        Some(&json!("Inbox Renamed")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/trigger",
+        "overwrite",
+        Some(&json!("tr-3")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/card.jsx",
+        "overwrite",
+        Some(&json!("<Card><Text>{thing.title}</Text></Card>")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/things/t1/name",
+        "overwrite",
+        Some(&json!("Buy oat milk")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/things/t1/trigger",
+        "overwrite",
+        Some(&json!("")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/things/t1/status",
+        "overwrite",
+        Some(&json!("done")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/things/t1/content.md",
+        "append",
+        Some(&json!("- eggs")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/collection/c1/things/t1/entries.0",
+        "overwrite",
+        Some(&json!({
+            "title": "Updated entry",
+            "payload": {
+                "type": "custom",
+                "content_type": "test-entry",
+                "data": {"foo": 2}
+            }
+        })),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/trigger/tr-1/name",
+        "overwrite",
+        Some(&json!("Morning Trigger")),
+        None,
+        None,
+        None,
+    )?;
+    sdk.edit_virtual_path(
+        device_id,
+        "/trigger/tr-1/rule.json",
+        "overwrite",
+        Some(&json!({
+            "version": "1.1",
+            "precondition": [{"rule": "cron('15 9 * * *')", "description": "updated cron"}],
+            "condition": []
+        })),
+        None,
+        None,
+        None,
+    )?;
 
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/name")?.content, "Inbox Renamed");
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/trigger")?.content, "tr-3");
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/card.jsx")?.content, "<Card><Text>{thing.title}</Text></Card>");
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t1/name")?.content, "Buy oat milk");
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t1/trigger")?.content, "");
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t1/status")?.content, "done");
-    let updated_content = sdk.read_virtual_path(device_id, "/collection/c1/things/t1/content.md")?.content;
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/name")?
+            .content,
+        "Inbox Renamed"
+    );
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/trigger")?
+            .content,
+        "tr-3"
+    );
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/card.jsx")?
+            .content,
+        "<Card><Text>{thing.title}</Text></Card>"
+    );
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/things/t1/name")?
+            .content,
+        "Buy oat milk"
+    );
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/things/t1/trigger")?
+            .content,
+        ""
+    );
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/things/t1/status")?
+            .content,
+        "done"
+    );
+    let updated_content = sdk
+        .read_virtual_path(device_id, "/collection/c1/things/t1/content.md")?
+        .content;
     assert!(updated_content.contains("- eggs"));
     assert!(updated_content.contains("[内容](/collection/c1/things/t1/entries.0)"));
     assert!(updated_content.contains("[IMG](/collection/c1/things/t1/entries.1)"));
-    assert_eq!(sdk.read_virtual_path(device_id, "/trigger/tr-1/name")?.content, "Morning Trigger");
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/trigger/tr-1/name")?
+            .content,
+        "Morning Trigger"
+    );
 
-    let updated_rule: JsonValue = serde_json::from_str(&sdk.read_virtual_path(device_id, "/trigger/tr-1/rule.json")?.content)?;
+    let updated_rule: JsonValue = serde_json::from_str(
+        &sdk.read_virtual_path(device_id, "/trigger/tr-1/rule.json")?
+            .content,
+    )?;
     assert_eq!(updated_rule["version"], json!("1.1"));
-    assert_eq!(updated_rule["precondition"][0]["rule"], json!("cron('15 9 * * *')"));
+    assert_eq!(
+        updated_rule["precondition"][0]["rule"],
+        json!("cron('15 9 * * *')")
+    );
 
-    sdk.move_virtual_path(device_id, "/collection/c1/things/t1", "/collection/c2/things")?;
+    let last_event_id = sdk
+        .things_watch_since(device_id, 0, 500)?
+        .last()
+        .map(|event| event.event_id)
+        .unwrap_or(0);
+
+    sdk.move_virtual_path(
+        device_id,
+        "/collection/c1/things/t1",
+        "/collection/c2/things",
+    )?;
     let snapshot = sdk.things_list_snapshot_lite(device_id)?;
-    let moved = snapshot.things.iter().find(|item| item.uuid == "t1").context("moved thing")?;
+    let moved = snapshot
+        .things
+        .iter()
+        .find(|item| item.uuid == "t1")
+        .context("moved thing")?;
     assert_eq!(moved.collection_uuid, "c2");
+    let move_events = sdk.things_watch_since(device_id, last_event_id, 100)?;
+    assert!(
+        move_events
+            .iter()
+            .any(|event| event.entity_type == "thing" && event.entity_uuid == "t1")
+    );
+    assert!(
+        sdk.crdt_get_dirty_documents()?
+            .iter()
+            .any(|row| row.uuid == "t1")
+    );
 
     sdk.delete_virtual_path(device_id, "/collection/c2/things/t1/entries.0")?;
     let remaining_entries = sdk.things_get_content_entries(device_id, "t1")?;
@@ -255,24 +421,56 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
     assert!(sdk.things_get_content_entries(device_id, "t1")?.is_empty());
 
     sdk.delete_virtual_path(device_id, "/trigger/tr-1")?;
-    assert!(!sdk.list_triggers()?.iter().any(|item| item.trigger_id == "tr-1"));
+    assert!(
+        !sdk.list_triggers()?
+            .iter()
+            .any(|item| item.trigger_id == "tr-1")
+    );
 
     sdk.delete_virtual_path(device_id, "/collection/c2/things/t1")?;
     assert!(sdk.things_get_thing_markdown(device_id, "t1")?.is_none());
 
-    let created_collection = sdk.create_virtual_path(device_id, "/collection", "collection", None, None, None, None, None, Some("c3"))?;
+    let created_collection = sdk.create_virtual_path(
+        device_id,
+        "/collection",
+        "collection",
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("c3"),
+    )?;
     assert_eq!(created_collection["uuid"], json!("c3"));
     assert_eq!(created_collection["path"], json!("/collection/c3"));
     assert!(created_collection.get("scaffold_tree").is_none());
     assert!(created_collection.get("scaffold_paths").is_none());
 
-    let created_thing = sdk.create_virtual_path(device_id, "/collection/c1/things", "thing", None, Some("Draft"), Some("hello"), None, None, Some("t-new"))?;
+    let created_thing = sdk.create_virtual_path(
+        device_id,
+        "/collection/c1/things",
+        "thing",
+        None,
+        Some("Draft"),
+        Some("hello"),
+        None,
+        None,
+        Some("t-new"),
+    )?;
     assert_eq!(created_thing["uuid"], json!("t-new"));
     assert_eq!(created_thing["path"], json!("/collection/c1/things/t-new"));
     assert!(created_thing.get("scaffold_tree").is_none());
     assert!(created_thing.get("scaffold_paths").is_none());
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t-new/name")?.content, "Draft");
-    assert_eq!(sdk.read_virtual_path(device_id, "/collection/c1/things/t-new/content.md")?.content, "hello");
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/things/t-new/name")?
+            .content,
+        "Draft"
+    );
+    assert_eq!(
+        sdk.read_virtual_path(device_id, "/collection/c1/things/t-new/content.md")?
+            .content,
+        "hello"
+    );
 
     let chat_image_uri = "remi://remote/chat-image.png?type=image%2Fpng";
     let created_image = sdk.create_virtual_path(
@@ -287,9 +485,15 @@ fn virtual_fs_edit_delete_and_move_cover_supported_paths() -> Result<()> {
         Some("entry-chat-image"),
     )?;
     assert_eq!(created_image["uuid"], json!("entry-chat-image"));
-    assert_eq!(created_image["path"], json!("/collection/c1/things/t-new/entries.0"));
+    assert_eq!(
+        created_image["path"],
+        json!("/collection/c1/things/t-new/entries.0")
+    );
     assert_eq!(created_image["source_uri"], json!(chat_image_uri));
-    let created_image_entry: JsonValue = serde_json::from_str(&sdk.read_virtual_path(device_id, "/collection/c1/things/t-new/entries.0")?.content)?;
+    let created_image_entry: JsonValue = serde_json::from_str(
+        &sdk.read_virtual_path(device_id, "/collection/c1/things/t-new/entries.0")?
+            .content,
+    )?;
     assert_eq!(created_image_entry["title"], json!("Chat Snapshot"));
     assert_eq!(created_image_entry["payload"]["type"], json!("image"));
     assert_eq!(created_image_entry["payload"]["uri"], json!(chat_image_uri));
@@ -303,38 +507,95 @@ fn virtual_fs_returns_friendly_errors_for_invalid_and_unsupported_paths() -> Res
     let device_id = "device-c";
     let image_path = dir.path().join("sample.png");
     std::fs::write(&image_path, [137u8, 80, 78, 71]).context("write image")?;
-    let image_uri = RemiUri::from_local_file(&image_path.to_string_lossy(), "image/png", device_id).to_uri_string();
+    let image_uri = RemiUri::from_local_file(&image_path.to_string_lossy(), "image/png", device_id)
+        .to_uri_string();
     seed_tree_fixture(&sdk, device_id, &image_uri)?;
 
-    let err = sdk.move_virtual_path(device_id, "/trigger/tr-1", "/collection/c1/things")
+    let err = sdk
+        .move_virtual_path(device_id, "/trigger/tr-1", "/collection/c1/things")
         .expect_err("trigger move should fail");
     assert!(err.to_string().contains("move_unsupported"));
 
-    let err = sdk.delete_virtual_path(device_id, "/collection/c1/name")
+    let err = sdk
+        .delete_virtual_path(device_id, "/collection/c1/name")
         .expect_err("deleting a file node should fail");
     assert!(err.to_string().contains("delete_unsupported"));
 
-    let err = sdk.read_virtual_path(device_id, "/collection/missing/name")
+    let err = sdk
+        .read_virtual_path(device_id, "/collection/missing/name")
         .expect_err("missing collection should fail");
     assert!(err.to_string().contains("collection_not_found"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection/c1", "trigger", None, Some("Bad Parent"), None, None, None, Some("tr-bad"))
+    let err = sdk
+        .create_virtual_path(
+            device_id,
+            "/collection/c1",
+            "trigger",
+            None,
+            Some("Bad Parent"),
+            None,
+            None,
+            None,
+            Some("tr-bad"),
+        )
         .expect_err("trigger create should now fail at type validation");
     assert!(err.to_string().contains("invalid_type"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection", "collection", None, Some("Bad Bind"), None, None, Some("/collection/c1"), Some("c-bad-bind"))
+    let err = sdk
+        .create_virtual_path(
+            device_id,
+            "/collection",
+            "collection",
+            None,
+            Some("Bad Bind"),
+            None,
+            None,
+            Some("/collection/c1"),
+            Some("c-bad-bind"),
+        )
         .expect_err("create_tool bind_path should be rejected");
     assert!(err.to_string().contains("bind_path_unsupported"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection/c1/things/t1", "image", None, Some("Bad Image"), None, Some("https://example.com/foo.png"), None, Some("entry-bad-image"))
+    let err = sdk
+        .create_virtual_path(
+            device_id,
+            "/collection/c1/things/t1",
+            "image",
+            None,
+            Some("Bad Image"),
+            None,
+            Some("https://example.com/foo.png"),
+            None,
+            Some("entry-bad-image"),
+        )
         .expect_err("image create with non-remi uri should fail");
     assert!(err.to_string().contains("invalid_source_uri"));
 
-    let err = sdk.create_virtual_path(device_id, "/collection/c1/things", "image", None, Some("Bad Parent"), None, Some("remi://remote/chat.png?type=image%2Fpng"), None, Some("entry-bad-parent"))
+    let err = sdk
+        .create_virtual_path(
+            device_id,
+            "/collection/c1/things",
+            "image",
+            None,
+            Some("Bad Parent"),
+            None,
+            Some("remi://remote/chat.png?type=image%2Fpng"),
+            None,
+            Some("entry-bad-parent"),
+        )
         .expect_err("image create under things directory should fail");
     assert!(err.to_string().contains("invalid_parent"));
 
-    let err = sdk.edit_virtual_path(device_id, "/collection/c1/things/t1", "overwrite", Some(&json!("nope")), None, None, None)
+    let err = sdk
+        .edit_virtual_path(
+            device_id,
+            "/collection/c1/things/t1",
+            "overwrite",
+            Some(&json!("nope")),
+            None,
+            None,
+            None,
+        )
         .expect_err("editing a directory path should fail");
     assert!(err.to_string().contains("is_directory"));
 
@@ -351,7 +612,10 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
         ThingCollectionUpsert {
             uuid: "c-json".to_string(),
             title: "Structured".to_string(),
+            collection_type: Default::default(),
+            app_id: None,
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -365,6 +629,7 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
             data: Some(json!({"markdown": "holder"})),
             collection_uuid: "c-json".to_string(),
             trigger_uuid: None,
+            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -382,10 +647,14 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
         None,
         None,
     )?;
-    assert_eq!(created["path"], json!("/collection/c-json/things/t-json/entries.0"));
+    assert_eq!(
+        created["path"],
+        json!("/collection/c-json/things/t-json/entries.0")
+    );
 
     let entry: JsonValue = serde_json::from_str(
-        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?.content,
+        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?
+            .content,
     )?;
     assert_eq!(entry["payload"]["type"], json!("json_object"));
     let data_doc_uuid = entry["payload"]["data_doc_uuid"]
@@ -393,7 +662,11 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
         .context("data_doc_uuid")?;
 
     let data: JsonValue = serde_json::from_str(
-        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0.data.json")?.content,
+        &sdk.read_virtual_path(
+            device_id,
+            "/collection/c-json/things/t-json/entries.0.data.json",
+        )?
+        .content,
     )?;
     assert_eq!(data, json!({"enabled": true}));
 
@@ -420,12 +693,17 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
     )?;
 
     let schema: JsonValue = serde_json::from_str(
-        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0.schema.json")?.content,
+        &sdk.read_virtual_path(
+            device_id,
+            "/collection/c-json/things/t-json/entries.0.schema.json",
+        )?
+        .content,
     )?;
     assert_eq!(schema["type"], json!("object"));
 
     let updated_entry: JsonValue = serde_json::from_str(
-        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?.content,
+        &sdk.read_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?
+            .content,
     )?;
     let schema_doc_uuid = updated_entry["payload"]["schema_doc_uuid"]
         .as_str()
@@ -452,7 +730,11 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
             None,
         )
         .expect_err("invalid data should fail schema validation");
-    assert!(invalid_data_err.to_string().contains("does not satisfy schema"));
+    assert!(
+        invalid_data_err
+            .to_string()
+            .contains("does not satisfy schema")
+    );
 
     let invalid_schema_err = sdk
         .edit_virtual_path(
@@ -469,11 +751,21 @@ fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> R
             None,
         )
         .expect_err("schema that invalidates current data should fail");
-    assert!(invalid_schema_err.to_string().contains("does not satisfy schema"));
+    assert!(
+        invalid_schema_err
+            .to_string()
+            .contains("does not satisfy schema")
+    );
 
     sdk.delete_virtual_path(device_id, "/collection/c-json/things/t-json/entries.0")?;
-    assert!(sdk.crdt_get_document(data_doc_uuid, "thing_markdown")?.is_none());
-    assert!(sdk.crdt_get_document(schema_doc_uuid, "thing_markdown")?.is_none());
+    assert!(
+        sdk.crdt_get_document(data_doc_uuid, "thing_markdown")?
+            .is_none()
+    );
+    assert!(
+        sdk.crdt_get_document(schema_doc_uuid, "thing_markdown")?
+            .is_none()
+    );
 
     Ok(())
 }

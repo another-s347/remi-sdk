@@ -168,7 +168,10 @@ impl LocationService {
     ) -> Result<Vec<NearbyResult>, LocationServiceError> {
         let mut url = format!(
             "https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={},{}&radius={}&key={}",
-            lat, lng, radius_meters.min(50000), self.api_key
+            lat,
+            lng,
+            radius_meters.min(50000),
+            self.api_key
         );
 
         if let Some(t) = place_type {

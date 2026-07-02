@@ -64,8 +64,7 @@ return {
             action_uuid: "builtin.trigger_notification".to_string(),
             name: "trigger_notification".to_string(),
             title: "Trigger Notification".to_string(),
-            description: "Persist the default local notification for a fired trigger."
-                .to_string(),
+            description: "Persist the default local notification for a fired trigger.".to_string(),
             version: "v1".to_string(),
             category: "notification".to_string(),
             enabled: true,

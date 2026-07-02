@@ -144,10 +144,13 @@ impl AppKeysClient {
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     async fn add_auth_header<T>(&self, mut request: Request<T>) -> Result<Request<T>> {
-        let user_access_token = crate::auth::auth_resolve_user_access_token(Some(&self.user_access_token))
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?
-            .ok_or_else(|| anyhow::anyhow!("User access token is required for application management RPCs"))?;
+        let user_access_token =
+            crate::auth::auth_resolve_user_access_token(Some(&self.user_access_token))
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("User access token is required for application management RPCs")
+                })?;
 
         crate::auth::auth_insert_bearer_header(&mut request, &user_access_token)
             .map_err(|err| anyhow::anyhow!(err))?;

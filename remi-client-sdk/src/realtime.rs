@@ -34,10 +34,6 @@ pub enum RemiRealtimeEvent {
         trigger_name: String,
         source_device_id: Option<String>,
     },
-    ChatReply {
-        session_id: String,
-        message_id: String,
-    },
     SyncRequest,
 }
 
@@ -192,7 +188,14 @@ async fn run_realtime_loop(
             return;
         }
 
-        match run_single_connection(ws_url.as_str(), session.clone(), event_tx.clone(), cancel.clone()).await {
+        match run_single_connection(
+            ws_url.as_str(),
+            session.clone(),
+            event_tx.clone(),
+            cancel.clone(),
+        )
+        .await
+        {
             Ok(()) => return,
             Err(error) => {
                 if cancel.is_cancelled() {
@@ -434,7 +437,6 @@ fn describe_realtime_event(event: &RemiRealtimeEvent) -> &'static str {
     match event {
         RemiRealtimeEvent::ThingsDocChanged { .. } => "things_doc_changed",
         RemiRealtimeEvent::TriggerFired { .. } => "trigger_fired",
-        RemiRealtimeEvent::ChatReply { .. } => "chat_reply",
         RemiRealtimeEvent::SyncRequest => "sync_request",
     }
 }
@@ -461,6 +463,9 @@ mod tests {
         })
         .expect("websocket url should be built");
 
-        assert_eq!(url.as_str(), "wss://example.supabase.co/realtime/v1/websocket?apikey=anon-key&vsn=1.0.0");
+        assert_eq!(
+            url.as_str(),
+            "wss://example.supabase.co/realtime/v1/websocket?apikey=anon-key&vsn=1.0.0"
+        );
     }
 }

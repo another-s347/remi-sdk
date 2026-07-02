@@ -1,4 +1,4 @@
-use crate::{TriggerConfig, TriggerRule, EvaluationContext, MonitoringEvent};
+use crate::{EvaluationContext, MonitoringEvent, TriggerConfig, TriggerRule};
 use serde_json::json;
 
 /// Test scenarios based on real-world event patterns from events.json
@@ -34,13 +34,17 @@ mod realworld_scenario_tests {
         }"#;
 
         let config = TriggerConfig::from_json(json);
-        assert!(config.is_ok(), "Failed to parse connectivity loss alert config: {:?}", config);
-        
+        assert!(
+            config.is_ok(),
+            "Failed to parse connectivity loss alert config: {:?}",
+            config
+        );
+
         let config = config.unwrap();
         assert_eq!(config.name, "Connectivity Loss Alert");
         assert_eq!(config.precondition.len(), 1);
         assert_eq!(config.condition.len(), 2);
-        
+
         // Verify cron expression in precondition
         assert!(config.precondition[0].rule.contains("cron"));
         assert!(config.precondition[0].rule.contains("*/10"));
@@ -72,11 +76,11 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert_eq!(config.name, "Location Change Detector");
         assert_eq!(config.condition.len(), 2);
-        
+
         // Verify conditions reference Location events
         assert!(config.condition[0].rule.contains("Location"));
         assert!(config.condition[1].rule.contains("Movement"));
@@ -116,11 +120,11 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert_eq!(config.name, "Work Hours Idle Detection");
         assert_eq!(config.condition.len(), 4);
-        
+
         // Verify time and weekday checks
         assert!(config.condition[0].rule.contains("in_time_range"));
         assert!(config.condition[1].rule.contains("is_weekday"));
@@ -152,7 +156,7 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert!(config.condition[0].rule.contains("event_count"));
         assert!(config.condition[0].rule.contains("> 10"));
@@ -184,7 +188,7 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert!(config.precondition[0].rule.contains("22"));
         assert!(config.condition[1].rule.contains("current_hour"));
@@ -216,7 +220,7 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert!(config.precondition[0].rule.contains("0 9 * * 0"));
         assert!(config.condition[0].rule.contains("10080"));
@@ -244,7 +248,7 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert!(config.condition[0].rule.contains("vpn"));
     }
@@ -275,7 +279,7 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert!(config.condition[0].rule.contains("Starting monitors"));
         assert!(config.condition[1].rule.contains("Rust bridge active"));
@@ -296,7 +300,12 @@ mod realworld_scenario_tests {
 
         for (idx, json) in example_files.iter().enumerate() {
             let config = TriggerConfig::from_json(json);
-            assert!(config.is_ok(), "Example file {} failed to parse: {:?}", idx, config);
+            assert!(
+                config.is_ok(),
+                "Example file {} failed to parse: {:?}",
+                idx,
+                config
+            );
         }
     }
 
@@ -334,10 +343,10 @@ mod realworld_scenario_tests {
 
         let config = TriggerConfig::from_json(json);
         assert!(config.is_ok());
-        
+
         let config = config.unwrap();
         assert_eq!(config.condition.len(), 4);
-        
+
         // Verify complex logic with negation
         assert!(config.condition[3].rule.starts_with("!"));
     }

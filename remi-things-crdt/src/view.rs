@@ -66,31 +66,31 @@ pub struct TriggerBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum ThingStatus {
+pub enum ThingStatusView {
     None,
     InProgress { timestamp_ms: i64 },
     Stalled { timestamp_ms: i64 },
     Done { timestamp_ms: i64 },
 }
 
-impl ThingStatus {
+impl ThingStatusView {
     /// Returns the status as a string for storage in the CRDT
     pub fn as_storage_str(&self) -> &str {
         match self {
-            ThingStatus::None => "none",
-            ThingStatus::InProgress { .. } => "in-progress",
-            ThingStatus::Stalled { .. } => "stalled",
-            ThingStatus::Done { .. } => "done",
+            ThingStatusView::None => "none",
+            ThingStatusView::InProgress { .. } => "in-progress",
+            ThingStatusView::Stalled { .. } => "stalled",
+            ThingStatusView::Done { .. } => "done",
         }
     }
 
     /// Returns the optional timestamp in milliseconds
     pub fn timestamp_ms(&self) -> Option<i64> {
         match self {
-            ThingStatus::None => None,
-            ThingStatus::InProgress { timestamp_ms } => Some(*timestamp_ms),
-            ThingStatus::Stalled { timestamp_ms } => Some(*timestamp_ms),
-            ThingStatus::Done { timestamp_ms } => Some(*timestamp_ms),
+            ThingStatusView::None => None,
+            ThingStatusView::InProgress { timestamp_ms } => Some(*timestamp_ms),
+            ThingStatusView::Stalled { timestamp_ms } => Some(*timestamp_ms),
+            ThingStatusView::Done { timestamp_ms } => Some(*timestamp_ms),
         }
     }
 
@@ -99,23 +99,23 @@ impl ThingStatus {
         let now_ms = || chrono::Utc::now().timestamp_millis();
 
         match status_str {
-            "in-progress" => ThingStatus::InProgress {
+            "in-progress" => ThingStatusView::InProgress {
                 timestamp_ms: timestamp_ms.unwrap_or_else(now_ms),
             },
-            "stalled" => ThingStatus::Stalled {
+            "stalled" => ThingStatusView::Stalled {
                 timestamp_ms: timestamp_ms.unwrap_or_else(now_ms),
             },
-            "done" => ThingStatus::Done {
+            "done" => ThingStatusView::Done {
                 timestamp_ms: timestamp_ms.unwrap_or_else(now_ms),
             },
-            _ => ThingStatus::None,
+            _ => ThingStatusView::None,
         }
     }
 }
 
-impl Default for ThingStatus {
+impl Default for ThingStatusView {
     fn default() -> Self {
-        ThingStatus::None
+        ThingStatusView::None
     }
 }
 
@@ -161,7 +161,7 @@ pub struct ThingView {
     pub id: String,
     pub collection_id: String,
     pub datatype: ThingDatatype,
-    pub status: ThingStatus,
+    pub status: ThingStatusView,
     pub edit_clock: EditClock,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone: Option<Tombstone>,
@@ -229,7 +229,7 @@ pub struct CollectionMetaView {
 pub struct ThingMetaView {
     pub id: String,
     pub datatype: ThingDatatype,
-    pub status: ThingStatus,
+    pub status: ThingStatusView,
     pub edit_clock: EditClock,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone: Option<Tombstone>,
@@ -377,4 +377,3 @@ impl ThingMetaView {
         }
     }
 }
-

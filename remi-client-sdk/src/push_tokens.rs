@@ -3,8 +3,8 @@ use std::{sync::Arc, time::Duration};
 use once_cell::sync::OnceCell;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
-use tonic::transport::Channel;
 use tonic::Request;
+use tonic::transport::Channel;
 
 use crate::transport::{SharedTransport, configure_shared_transport};
 

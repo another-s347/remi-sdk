@@ -237,7 +237,10 @@ impl Schema {
         let doc = AutoCommit::load(doc_bytes).context("Failed to load document")?;
 
         // Check for Root document marker (collection_uuids list)
-        if doc.get(automerge::ROOT, Self::KEY_COLLECTION_UUIDS)?.is_some() {
+        if doc
+            .get(automerge::ROOT, Self::KEY_COLLECTION_UUIDS)?
+            .is_some()
+        {
             return Ok(Some(CrdtDataType::Root));
         }
 

@@ -1,4 +1,7 @@
-use remi_things_crdt::{apply_op, extract_view, materialize::materialize_plan, Block, Content, Op, ThingDatatype, TriggerUpdate};
+use remi_things_crdt::{
+    apply_op, extract_view, materialize::materialize_plan, Block, Content, FieldPatch, Op,
+    ThingDatatype, TriggerUpdate,
+};
 
 #[test]
 fn roundtrip_upsert_extract_materialize() {
@@ -26,7 +29,7 @@ fn roundtrip_upsert_extract_materialize() {
             status: Some("none".to_string()),
             status_timestamp_ms: None,
             title: Some("Hello".to_string()),
-            parent_id: None,
+            parent_id: FieldPatch::Noop,
             trigger: TriggerUpdate::Set("trig-123".to_string()),
             content: Some(Content::Text {
                 blocks: vec![Block {
@@ -60,13 +63,7 @@ fn roundtrip_upsert_extract_materialize() {
     let thing = &view.things[0];
     assert_eq!(thing.id, "t1");
 
-    let blocks = thing
-        .content
-        .as_ref()
-        .unwrap()
-        .blocks
-        .as_ref()
-        .unwrap();
+    let blocks = thing.content.as_ref().unwrap().blocks.as_ref().unwrap();
     assert_eq!(blocks[0].text.as_deref(), Some("aZc"));
 
     let plan = materialize_plan(&view);

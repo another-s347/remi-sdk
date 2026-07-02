@@ -620,9 +620,9 @@ pub fn resolve_timer_literal(
     }
 
     let duration = parse_duration_literal(timer_value)?;
-    anchor
-        .checked_add_signed(duration)
-        .ok_or_else(|| format!("Timer literal '{timer_value}' overflowed when applied to anchor {anchor}"))
+    anchor.checked_add_signed(duration).ok_or_else(|| {
+        format!("Timer literal '{timer_value}' overflowed when applied to anchor {anchor}")
+    })
 }
 
 pub fn normalize_timer_literal(
@@ -889,12 +889,13 @@ fn parse_timing_value(value: &cel::Value) -> Option<TriggerTiming> {
                                 value: value.to_string(),
                             }
                         }),
-                        "event" => json
-                            .get("event_type")
-                            .and_then(|v| v.as_str())
-                            .map(|event_type| TriggerTiming::Event {
-                                event_type: event_type.to_string(),
-                            }),
+                        "event" => {
+                            json.get("event_type")
+                                .and_then(|v| v.as_str())
+                                .map(|event_type| TriggerTiming::Event {
+                                    event_type: event_type.to_string(),
+                                })
+                        }
                         "repeat_frequency" => {
                             if let Some(n) = json.get("per_day").and_then(|v| v.as_i64()) {
                                 Some(TriggerTiming::RepeatFrequency {
@@ -1067,7 +1068,9 @@ fn parse_duration_literal(value: &str) -> Result<chrono::Duration, String> {
             .find(|c: char| !c.is_ascii_digit())
             .ok_or_else(|| format!("Timer literal '{value}' is missing a unit after number"))?;
         if digits_end == 0 {
-            return Err(format!("Timer literal '{value}' must start each segment with digits"));
+            return Err(format!(
+                "Timer literal '{value}' must start each segment with digits"
+            ));
         }
 
         let amount: i64 = remaining[..digits_end]
@@ -1084,7 +1087,11 @@ fn parse_duration_literal(value: &str) -> Result<chrono::Duration, String> {
             "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
             "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
             "d" | "day" | "days" => 86_400_000,
-            _ => return Err(format!("Unsupported timer unit '{unit}' in literal '{value}'")),
+            _ => {
+                return Err(format!(
+                    "Unsupported timer unit '{unit}' in literal '{value}'"
+                ))
+            }
         };
         total_millis = total_millis
             .checked_add(amount.checked_mul(millis_per_unit).ok_or_else(|| {

@@ -13,14 +13,10 @@ pub mod proto {
 
 use proto::{
     CrdtDocumentRef, GetCrdtDocumentSnapshotRequest, GetCrdtDocumentSnapshotsRequest,
-    GetThingsSnapshotRequest, GetThingsSyncStatusRequest, ListCrdtDocumentKeysRequest,
-    ListTriggersRequest, ListTriggersResponse, QueryThingsChangeLogsRequest,
+    ListCrdtDocumentKeysRequest, ListTriggersRequest, ListTriggersResponse,
     ReportTriggerFiredRequest, SyncCrdtDocumentInput, SyncCrdtDocumentRequest,
-    SyncCrdtDocumentsRequest,
-    SyncThingsChangeLogsRequest, SyncThingsChangeLogsResponse, SyncThingsRequest,
-    ThingsChangeLogEntry as ProtoThingsChangeLogEntry,
-    ThingsContentSnapshot as ProtoThingsContentSnapshot, TriggerInfo, UploadTriggerChunk,
-    UploadTriggerResponse, public_service_client::PublicServiceClient,
+    SyncCrdtDocumentsRequest, TriggerInfo, UploadTriggerChunk, UploadTriggerResponse,
+    public_service_client::PublicServiceClient,
 };
 
 const MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -40,7 +36,10 @@ pub struct TriggerClient {
 
 impl TriggerClient {
     /// Create a new trigger client
-    pub async fn new(server_url: impl Into<String>, bearer_token: impl Into<String>) -> Result<Self> {
+    pub async fn new(
+        server_url: impl Into<String>,
+        bearer_token: impl Into<String>,
+    ) -> Result<Self> {
         let channel = Channel::from_shared(server_url.into())
             .context("Invalid server URL")?
             .connect()
@@ -358,27 +357,6 @@ impl CrdtSyncTransport for TriggerClient {
 }
 
 impl TriggerClient {
-    /// Sync things with the server using automerge sync protocol.
-    pub async fn sync_things(
-        &mut self,
-        device_id: String,
-        sync_message: Vec<u8>,
-    ) -> Result<(Vec<Vec<u8>>, String)> {
-        let request = Request::new(SyncThingsRequest {
-            device_id,
-            sync_message,
-        });
-
-        let request = self.add_auth_header(request).await?;
-
-        let response = timeout(self.request_timeout, self.client.sync_things(request))
-            .await
-            .context("Sync things timed out")??
-            .into_inner();
-
-        Ok((response.sync_messages, response.last_sync_at))
-    }
-
     // ========== CRDT V3 Multi-Document Sync ==========
 
     /// Sync a single CRDT document with the server.
@@ -419,11 +397,13 @@ impl TriggerClient {
             device_id,
             documents: documents
                 .into_iter()
-                .map(|(document_uuid, data_type, sync_message)| SyncCrdtDocumentInput {
-                    document_uuid,
-                    data_type,
-                    sync_message,
-                })
+                .map(
+                    |(document_uuid, data_type, sync_message)| SyncCrdtDocumentInput {
+                        document_uuid,
+                        data_type,
+                        sync_message,
+                    },
+                )
                 .collect(),
         });
 
@@ -545,117 +525,5 @@ impl TriggerClient {
                 canonical_head: k.canonical_head,
             })
             .collect())
-    }
-
-    /// Fetch the latest things Automerge document (snapshot/bootstrap).
-    pub async fn get_things_snapshot(
-        &mut self,
-        device_id: String,
-        reset_sync_state: bool,
-    ) -> Result<(Vec<u8>, String)> {
-        let request = Request::new(GetThingsSnapshotRequest {
-            device_id,
-            reset_sync_state,
-        });
-
-        let request = self.add_auth_header(request).await?;
-
-        let response = timeout(
-            self.request_timeout,
-            self.client.get_things_snapshot(request),
-        )
-        .await
-        .context("Get things snapshot timed out")??
-        .into_inner();
-
-        Ok((response.automerge_doc, response.last_sync_at))
-    }
-
-    /// Query sync status for things.
-    pub async fn get_things_sync_status(
-        &mut self,
-        device_id: impl Into<String>,
-        last_synced_server_head: Vec<u8>,
-    ) -> Result<proto::GetThingsSyncStatusResponse> {
-        let request = Request::new(GetThingsSyncStatusRequest {
-            device_id: device_id.into(),
-            last_synced_server_head,
-        });
-
-        let request = self.add_auth_header(request).await?;
-
-        let response = timeout(
-            self.request_timeout,
-            self.client.get_things_sync_status(request),
-        )
-        .await
-        .context("Get things sync status timed out")??
-        .into_inner();
-
-        Ok(response)
-    }
-
-    /// Sync change logs and content snapshots with the server.
-    pub async fn sync_things_change_logs(
-        &mut self,
-        device_id: impl Into<String>,
-        upload_change_logs: Vec<ProtoThingsChangeLogEntry>,
-        upload_snapshots: Vec<ProtoThingsContentSnapshot>,
-        last_synced_log_id: i64,
-        last_synced_snapshot_id: i64,
-    ) -> Result<SyncThingsChangeLogsResponse> {
-        let request = Request::new(SyncThingsChangeLogsRequest {
-            device_id: device_id.into(),
-            upload_change_logs,
-            upload_snapshots,
-            last_synced_log_id,
-            last_synced_snapshot_id,
-        });
-
-        let request = self.add_auth_header(request).await?;
-
-        let response = timeout(
-            self.request_timeout,
-            self.client.sync_things_change_logs(request),
-        )
-        .await
-        .context("Sync things change logs timed out")??
-        .into_inner();
-
-        Ok(response)
-    }
-
-    /// Query change logs from the server with filters.
-    pub async fn query_things_change_logs(
-        &mut self,
-        device_id: impl Into<String>,
-        filter_device: Option<String>,
-        filter_entity: Option<String>,
-        from_timestamp: Option<i64>,
-        to_timestamp: Option<i64>,
-        limit: i32,
-        offset: i32,
-    ) -> Result<proto::QueryThingsChangeLogsResponse> {
-        let request = Request::new(QueryThingsChangeLogsRequest {
-            device_id: device_id.into(),
-            filter_device: filter_device.unwrap_or_default(),
-            filter_entity: filter_entity.unwrap_or_default(),
-            from_timestamp: from_timestamp.unwrap_or(0),
-            to_timestamp: to_timestamp.unwrap_or(0),
-            limit,
-            offset,
-        });
-
-        let request = self.add_auth_header(request).await?;
-
-        let response = timeout(
-            self.request_timeout,
-            self.client.query_things_change_logs(request),
-        )
-        .await
-        .context("Query things change logs timed out")??
-        .into_inner();
-
-        Ok(response)
     }
 }

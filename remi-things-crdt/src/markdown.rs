@@ -39,7 +39,10 @@ pub fn decode_markdown_only_content(content: &ContentView) -> Option<MarkdownOnl
     // Embed convention: first block has attrs = { embed_kind, payload }.
     if let Some(attrs) = blocks[0].attrs.as_ref() {
         if let Some(embed_kind) = attrs.get("embed_kind").and_then(|v| v.as_str()) {
-            let payload = attrs.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            let payload = attrs
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             return Some(MarkdownOnlyDecoded::Embed {
                 kind: ThingDatatype::from_str(embed_kind),
                 payload,

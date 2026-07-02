@@ -1,8 +1,10 @@
 use anyhow::Result;
-use automerge::{sync, AutoCommit};
 use automerge::sync::SyncDoc;
+use automerge::{sync, AutoCommit};
 
-use remi_things_crdt::{apply_op, extract_view, Block, Content, Op, ThingDatatype, TriggerUpdate};
+use remi_things_crdt::{
+    apply_op, extract_view, Block, Content, FieldPatch, Op, ThingDatatype, TriggerUpdate,
+};
 
 fn server_apply_and_reply(
     doc_bytes: &[u8],
@@ -84,12 +86,8 @@ fn converge_unary(
     };
 
     for round in 1..=max_round_trips {
-        let (new_server_doc, replies) = server_apply_and_reply(
-            &server_doc,
-            &mut server_state,
-            next_client_msg.take(),
-            32,
-        )?;
+        let (new_server_doc, replies) =
+            server_apply_and_reply(&server_doc, &mut server_state, next_client_msg.take(), 32)?;
         server_doc = new_server_doc;
 
         let (new_client_doc, next_msg) =
@@ -134,7 +132,7 @@ fn scenario_1_fast_cold_start_bootstrap_client_from_server() {
             status: Some("none".to_string()),
             status_timestamp_ms: None,
             title: Some("Server Thing".to_string()),
-            parent_id: None,
+            parent_id: FieldPatch::Noop,
             trigger: TriggerUpdate::Noop,
             content: Some(Content::Text {
                 blocks: vec![Block {
@@ -150,8 +148,7 @@ fn scenario_1_fast_cold_start_bootstrap_client_from_server() {
 
     let client_doc: Vec<u8> = Vec::new();
 
-    let (client_final, server_final, rounds) =
-        converge_unary(client_doc, server_doc, 8).unwrap();
+    let (client_final, server_final, rounds) = converge_unary(client_doc, server_doc, 8).unwrap();
 
     // “快速冷启动”: should converge in a small number of unary round trips.
     assert!(rounds <= 3, "expected fast bootstrap, got {rounds} rounds");
@@ -189,7 +186,7 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
             status: Some("none".to_string()),
             status_timestamp_ms: None,
             title: Some("Only on server".to_string()),
-            parent_id: None,
+            parent_id: FieldPatch::Noop,
             trigger: TriggerUpdate::Noop,
             content: None,
         },
@@ -221,7 +218,7 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
                 status: Some("none".to_string()),
                 status_timestamp_ms: None,
                 title: Some(format!("Client Thing {i}")),
-                parent_id: None,
+                parent_id: FieldPatch::Noop,
                 trigger: TriggerUpdate::Noop,
                 content: None,
             },
@@ -229,8 +226,7 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
         .unwrap();
     }
 
-    let (client_final, server_final, rounds) =
-        converge_unary(client_doc, server_doc, 8).unwrap();
+    let (client_final, server_final, rounds) = converge_unary(client_doc, server_doc, 8).unwrap();
 
     assert!(rounds <= 4, "expected fast cold merge, got {rounds} rounds");
 
@@ -238,7 +234,8 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
     let v_server = extract_view(&server_final).unwrap();
     assert_eq!(v_client, v_server);
 
-    let ids: std::collections::BTreeSet<_> = v_client.things.iter().map(|t| t.id.as_str()).collect();
+    let ids: std::collections::BTreeSet<_> =
+        v_client.things.iter().map(|t| t.id.as_str()).collect();
     assert!(ids.contains("t_server"));
     assert!(ids.contains("t_client_0"));
     assert!(ids.contains("t_client_1"));
@@ -271,7 +268,7 @@ fn scenario_3_basic_editing_ops_and_sync() {
             status: Some("none".to_string()),
             status_timestamp_ms: None,
             title: Some("Title".to_string()),
-            parent_id: None,
+            parent_id: FieldPatch::Noop,
             trigger: TriggerUpdate::Noop,
             content: Some(Content::Text {
                 blocks: vec![Block {
@@ -346,7 +343,7 @@ fn scenario_3_basic_editing_ops_and_sync() {
             status: None,
             status_timestamp_ms: None,
             title: None,
-            parent_id: None,
+            parent_id: FieldPatch::Noop,
             trigger: TriggerUpdate::Clear,
             content: None,
         },
@@ -364,13 +361,7 @@ fn scenario_3_basic_editing_ops_and_sync() {
     assert_eq!(t1.status.as_storage_str(), "done");
     assert_eq!(t1.status.timestamp_ms(), Some(1234567890));
 
-    let blocks = t1
-        .content
-        .as_ref()
-        .unwrap()
-        .blocks
-        .as_ref()
-        .unwrap();
+    let blocks = t1.content.as_ref().unwrap().blocks.as_ref().unwrap();
     assert_eq!(blocks.len(), 2);
 
     // text splice result on b1
