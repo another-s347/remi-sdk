@@ -6,8 +6,6 @@ fn collection_upsert(uuid: &str) -> ThingCollectionUpsert {
         title: "Inbox".to_string(),
         collection_type: Default::default(),
         app_id: None,
-        trigger_uuid: None,
-        trigger_uuid_patch: Default::default(),
         created_at: None,
         updated_at: None,
     }
@@ -20,8 +18,6 @@ fn thing_upsert(uuid: &str, collection_uuid: &str) -> ThingUpsert {
         datatype: crate::things_crdt::ThingDatatype::Markdown,
         data: Some(json!({ "markdown": "hello" })),
         collection_uuid: collection_uuid.to_string(),
-        trigger_uuid: None,
-        trigger_uuid_patch: Default::default(),
         parent_uuid: None,
         created_at: None,
         updated_at: None,

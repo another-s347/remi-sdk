@@ -47,14 +47,11 @@ impl<'a> ThingsLocalService<'a> {
         } else {
             None
         };
-        let trigger =
-            crate::things_crdt::trigger_update_from_field_patch(upsert.trigger_uuid_patch());
         let mut events = self.ensure_system_collections_in_doc_set(&mut doc_set)?;
         events.extend(doc_set.update_collection_meta_with_timestamps(
             &upsert.uuid,
             Some(upsert.title.clone()),
             None,
-            trigger,
             upsert.created_at.clone(),
             upsert.updated_at.clone(),
         )?);
@@ -98,7 +95,6 @@ impl<'a> ThingsLocalService<'a> {
             "title": upsert.title,
             "collection_type": effective_collection_type.as_str(),
             "app_id": effective_app_id,
-            "trigger_uuid": upsert.trigger_uuid,
         });
 
         self.record_user_change_log(
@@ -180,10 +176,7 @@ impl<'a> ThingsLocalService<'a> {
             &context,
             &mut doc_set,
             events,
-            ThingsDeleteCollectionOutcome {
-                deleted: true,
-                removed_triggers: Vec::new(),
-            },
+            ThingsDeleteCollectionOutcome { deleted: true },
         )?;
 
         let summary = format!("Archived collection '{}'", collection_title);

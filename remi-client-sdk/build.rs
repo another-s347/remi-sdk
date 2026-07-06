@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("PROTOC", protoc_path);
     }
 
-    // Compile public_api.proto (includes auth, telemetry, and triggers)
+    // Compile public_api.proto.
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(false)

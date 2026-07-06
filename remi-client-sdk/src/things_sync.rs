@@ -3,14 +3,14 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::TriggerClient;
-use crate::TriggerSdk;
+use crate::RemiPublicClient;
+use crate::RemiSdk;
 use crate::crdt_sync;
+use crate::public_client::{CrdtSyncTransport, ServerCrdtDocumentKey};
 use crate::things_crdt::{
     DocumentKey, DocumentPersistence, DocumentState, ThingsDocumentSet, ThingsSyncSummary,
     parse_optional_domain_datetime,
 };
-use crate::trigger_client::{CrdtSyncTransport, ServerCrdtDocumentKey};
 
 use remi_things_crdt::CrdtDataType;
 
@@ -120,16 +120,16 @@ impl ThingsSyncMode {
 }
 
 pub async fn sync_things_full(
-    sdk: &TriggerSdk,
-    client: &mut TriggerClient,
+    sdk: &RemiSdk,
+    client: &mut RemiPublicClient,
     device_id: &str,
 ) -> Result<ThingsV3SyncOutput> {
     sync_v3_documents_with_transport_mode(sdk, client, device_id, ThingsSyncMode::Full).await
 }
 
 pub async fn sync_things_incremental(
-    sdk: &TriggerSdk,
-    client: &mut TriggerClient,
+    sdk: &RemiSdk,
+    client: &mut RemiPublicClient,
     device_id: &str,
 ) -> Result<ThingsV3SyncOutput> {
     sync_v3_documents_with_transport_mode(sdk, client, device_id, ThingsSyncMode::Incremental).await
@@ -230,7 +230,7 @@ fn observe_sync_timestamp(observed: &mut Option<String>, candidate: Option<Strin
 }
 
 fn classify_local_bootstrap_state(
-    sdk: &TriggerSdk,
+    sdk: &RemiSdk,
     dirty_docs: &[crate::types::CrdtDocumentRow],
 ) -> LocalBootstrapState {
     if dirty_docs.iter().any(has_sync_history) {
@@ -290,16 +290,16 @@ impl ServerKeyDiscovery {
 ///   download any missing ones via `get_crdt_document_snapshot`, then sync them
 ///   through the Automerge protocol so both sides share a sync state.
 pub async fn sync_v3_documents_with_server(
-    sdk: &TriggerSdk,
-    client: &mut TriggerClient,
+    sdk: &RemiSdk,
+    client: &mut RemiPublicClient,
     device_id: &str,
 ) -> Result<ThingsV3SyncOutput> {
     sync_v3_documents_with_transport_mode(sdk, client, device_id, ThingsSyncMode::Full).await
 }
 
 pub async fn sync_v3_documents_with_server_mode(
-    sdk: &TriggerSdk,
-    client: &mut TriggerClient,
+    sdk: &RemiSdk,
+    client: &mut RemiPublicClient,
     device_id: &str,
     mode: ThingsSyncMode,
 ) -> Result<ThingsV3SyncOutput> {
@@ -307,7 +307,7 @@ pub async fn sync_v3_documents_with_server_mode(
 }
 
 pub async fn sync_v3_documents_with_transport<T>(
-    sdk: &TriggerSdk,
+    sdk: &RemiSdk,
     client: &mut T,
     device_id: &str,
 ) -> Result<ThingsV3SyncOutput>
@@ -318,7 +318,7 @@ where
 }
 
 pub async fn sync_v3_documents_with_transport_mode<T>(
-    sdk: &TriggerSdk,
+    sdk: &RemiSdk,
     client: &mut T,
     device_id: &str,
     mode: ThingsSyncMode,
@@ -898,7 +898,7 @@ fn proto_data_type_to_str(proto_dt: i32) -> &'static str {
 
 /// Load all v3 CRDT documents from storage into a ThingsDocumentSet
 pub(crate) fn load_document_set_from_storage(
-    sdk: &TriggerSdk,
+    sdk: &RemiSdk,
     device_id: &str,
 ) -> Result<ThingsDocumentSet> {
     DocumentPersistence::new(sdk.things_storage()).load_document_set(device_id)

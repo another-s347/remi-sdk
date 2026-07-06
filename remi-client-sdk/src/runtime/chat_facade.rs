@@ -1,6 +1,6 @@
 use super::*;
 
-impl TriggerSdk {
+impl RemiSdk {
     // ===== Chat Session Management =====
 
     /// Create or update a chat session
@@ -18,7 +18,9 @@ impl TriggerSdk {
             last_activity: now,
             message_count,
         };
-        self.storage.upsert_chat_session(&session)
+        self.storage.upsert_chat_session(&session)?;
+        self.enqueue_search_document(SearchDocument::from_chat_session(&session));
+        Ok(())
     }
 
     /// Get a specific chat session
@@ -32,7 +34,9 @@ impl TriggerSdk {
     }
 
     pub fn create_agent_version(&self, version: &crate::types::AgentVersion) -> Result<()> {
-        self.storage.create_agent_version(version)
+        self.storage.create_agent_version(version)?;
+        self.enqueue_search_document(SearchDocument::from_agent_version(version));
+        Ok(())
     }
 
     pub fn get_agent_version(
@@ -47,7 +51,11 @@ impl TriggerSdk {
     }
 
     pub fn update_agent_version(&self, update: &crate::types::AgentVersionUpdate) -> Result<()> {
-        self.storage.update_agent_version(update)
+        self.storage.update_agent_version(update)?;
+        if let Some(version) = self.storage.get_agent_version(&update.version_id)? {
+            self.enqueue_search_document(SearchDocument::from_agent_version(&version));
+        }
+        Ok(())
     }
 
     pub fn mark_agent_version_applied(
@@ -57,11 +65,20 @@ impl TriggerSdk {
         applied_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
         self.storage
-            .mark_agent_version_applied(version_id, agent_id, applied_at)
+            .mark_agent_version_applied(version_id, agent_id, applied_at)?;
+        for version in self.storage.list_agent_versions(agent_id)? {
+            self.enqueue_search_document(SearchDocument::from_agent_version(&version));
+        }
+        Ok(())
     }
 
     pub fn delete_agent_version(&self, version_id: &str) -> Result<()> {
-        self.storage.delete_agent_version(version_id)
+        self.storage.delete_agent_version(version_id)?;
+        self.enqueue_search_actions(vec![SearchIngestAction::delete_entity(
+            crate::search::SearchEntityKind::AgentVersion,
+            version_id,
+        )]);
+        Ok(())
     }
 
     pub fn create_eval_dataset(&self, dataset: &crate::types::EvalDataset) -> Result<()> {
@@ -160,12 +177,27 @@ impl TriggerSdk {
             last_activity: Utc::now(),
             message_count,
         };
-        self.storage.update_session_activity(&update)
+        self.storage.update_session_activity(&update)?;
+        if let Some(session) = self.storage.get_chat_session(&update.session_id)? {
+            self.enqueue_search_document(SearchDocument::from_chat_session(&session));
+        }
+        Ok(())
     }
 
     /// Delete a chat session
     pub fn delete_chat_session(&self, session_id: &str) -> Result<()> {
-        self.storage.delete_chat_session(session_id)
+        self.storage.delete_chat_session(session_id)?;
+        self.enqueue_search_actions(vec![
+            SearchIngestAction::delete_entity(
+                crate::search::SearchEntityKind::ChatSession,
+                session_id,
+            ),
+            SearchIngestAction::DeleteByParent {
+                kind: crate::search::SearchEntityKind::ChatMessage,
+                parent_id: session_id.to_string(),
+            },
+        ]);
+        Ok(())
     }
 
     // ===== Chat Message History =====
@@ -183,7 +215,14 @@ impl TriggerSdk {
             &message_id,
             created_at_ms,
             &message_json,
-        )
+        )?;
+        self.enqueue_search_document(SearchDocument::from_chat_message(
+            &session_id,
+            &message_id,
+            created_at_ms,
+            &message_json,
+        ));
+        Ok(())
     }
 
     /// List chat messages (raw JSON strings) for a session.
@@ -199,7 +238,12 @@ impl TriggerSdk {
 
     /// Delete chat messages for a session (keeps the session record).
     pub fn delete_chat_messages(&self, session_id: &str) -> Result<()> {
-        self.storage.delete_chat_messages(session_id)
+        self.storage.delete_chat_messages(session_id)?;
+        self.enqueue_search_actions(vec![SearchIngestAction::DeleteByParent {
+            kind: crate::search::SearchEntityKind::ChatMessage,
+            parent_id: session_id.to_string(),
+        }]);
+        Ok(())
     }
 
     /// Persist runtime-owned chat protocol state for a session.

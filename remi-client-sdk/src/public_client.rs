@@ -13,10 +13,8 @@ pub mod proto {
 
 use proto::{
     CrdtDocumentRef, GetCrdtDocumentSnapshotRequest, GetCrdtDocumentSnapshotsRequest,
-    ListCrdtDocumentKeysRequest, ListTriggersRequest, ListTriggersResponse,
-    ReportTriggerFiredRequest, SyncCrdtDocumentInput, SyncCrdtDocumentRequest,
-    SyncCrdtDocumentsRequest, TriggerInfo, UploadTriggerChunk, UploadTriggerResponse,
-    public_service_client::PublicServiceClient,
+    ListCrdtDocumentKeysRequest, SyncCrdtDocumentInput, SyncCrdtDocumentRequest,
+    SyncCrdtDocumentsRequest, public_service_client::PublicServiceClient,
 };
 
 const MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -27,15 +25,15 @@ fn configured_public_service_client(channel: Channel) -> PublicServiceClient<Cha
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
 }
 
-/// Client for exploring and installing triggers from the server
-pub struct TriggerClient {
+/// Public client for server-backed Remi APIs that are not covered by specialized clients.
+pub struct RemiPublicClient {
     client: PublicServiceClient<Channel>,
     bearer_token: String,
     request_timeout: Duration,
 }
 
-impl TriggerClient {
-    /// Create a new trigger client
+impl RemiPublicClient {
+    /// Create a new public API client
     pub async fn new(
         server_url: impl Into<String>,
         bearer_token: impl Into<String>,
@@ -55,7 +53,7 @@ impl TriggerClient {
         })
     }
 
-    /// Create a trigger client that reuses the shared transport configured for auth/telemetry
+    /// Create a public API client that reuses the shared transport configured for auth/telemetry
     pub async fn new_with_shared_transport(bearer_token: impl Into<String>) -> Result<Self> {
         let transport =
             crate::transport::get_shared_transport().map_err(|err| anyhow::anyhow!(err))?;
@@ -74,63 +72,6 @@ impl TriggerClient {
         })
     }
 
-    /// List available triggers from the server
-    pub async fn list_triggers(
-        &mut self,
-        device_id: impl Into<String>,
-        search_query: Option<String>,
-        limit: i32,
-        offset: i32,
-    ) -> Result<ListTriggersResponse> {
-        let request = Request::new(ListTriggersRequest {
-            device_id: device_id.into(),
-            search_query: search_query.unwrap_or_default(),
-            limit,
-            offset,
-        });
-
-        let request = self.add_auth_header(request).await?;
-
-        let response = timeout(self.request_timeout, self.client.list_triggers(request))
-            .await
-            .context("List triggers timed out")??
-            .into_inner();
-
-        Ok(response)
-    }
-
-    /// Download a trigger's rule configuration JSON.
-    pub async fn download_trigger_rule_config(
-        &mut self,
-        device_id: impl Into<String>,
-        trigger_uuid: impl Into<String>,
-    ) -> Result<String> {
-        let request = Request::new(proto::GetTriggerRequest {
-            device_id: device_id.into(),
-            uuid: trigger_uuid.into(),
-        });
-
-        let request = self.add_auth_header(request).await?;
-
-        let mut stream = timeout(
-            self.request_timeout,
-            self.client.get_trigger_stream(request),
-        )
-        .await
-        .context("Trigger download timed out")??
-        .into_inner();
-
-        let mut rule_config_json: Option<String> = None;
-
-        while let Some(chunk) = stream.message().await.context("Failed to receive chunk")? {
-            if let Some(meta) = chunk.metadata {
-                rule_config_json = Some(meta.rule_config_json);
-            }
-        }
-
-        rule_config_json.context("No metadata received in stream")
-    }
-
     async fn add_auth_header<T>(&self, mut request: Request<T>) -> Result<Request<T>> {
         let bearer_token = crate::auth::auth_resolve_bearer_token(Some(&self.bearer_token))
             .await
@@ -140,84 +81,6 @@ impl TriggerClient {
             .map_err(|err| anyhow::anyhow!(err))?;
         Ok(request)
     }
-
-    /// Upload a trigger definition (rule_config_json) to the server.
-    ///
-    /// This is used by the mobile app to sync locally-installed triggers back to the server.
-    /// The server implementation is expected to be idempotent for the same (user_id, uuid).
-    pub async fn upload_trigger_rule_config_json(
-        &mut self,
-        device_id: impl Into<String>,
-        trigger_uuid: String,
-        name: String,
-        version: i32,
-        rule_config_json: String,
-    ) -> Result<UploadTriggerResponse> {
-        let metadata = proto::upload_trigger_chunk::Metadata {
-            device_id: device_id.into(),
-            uuid: trigger_uuid,
-            name,
-            user_request: String::new(),
-            event_analysis: String::new(),
-            version,
-            publish_binding: None,
-            rule_config_json,
-        };
-
-        let chunks = vec![UploadTriggerChunk {
-            metadata: Some(metadata),
-        }];
-
-        // Convert the in-memory chunks into a tonic streaming request.
-        let outbound = tokio_stream::iter(chunks);
-        let request = Request::new(outbound);
-        let request = self.add_auth_header(request).await?;
-
-        let response = timeout(
-            self.request_timeout,
-            self.client.upload_trigger_stream(request),
-        )
-        .await
-        .context("Upload trigger timed out")??
-        .into_inner();
-
-        Ok(response)
-    }
-
-    /// Report that a trigger fired on this device so the server can fan-out the event to
-    /// all other devices belonging to the same user.
-    pub async fn report_trigger_fired(
-        &mut self,
-        trigger_id: impl Into<String>,
-        trigger_name: impl Into<String>,
-        device_id: impl Into<String>,
-    ) -> Result<()> {
-        let request = Request::new(ReportTriggerFiredRequest {
-            trigger_id: trigger_id.into(),
-            trigger_name: trigger_name.into(),
-            device_id: device_id.into(),
-        });
-        let request = self.add_auth_header(request).await?;
-        timeout(
-            self.request_timeout,
-            self.client.report_trigger_fired(request),
-        )
-        .await
-        .context("ReportTriggerFired timed out")??;
-        Ok(())
-    }
-}
-
-/// Information about a trigger available on the server
-#[derive(Debug, Clone)]
-pub struct ServerTriggerInfo {
-    pub uuid: String,
-    pub name: String,
-    pub user_request: String,
-    pub event_analysis: String,
-    pub version: i32,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -289,22 +152,8 @@ pub trait CrdtSyncTransport: Send {
     async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>>;
 }
 
-impl From<TriggerInfo> for ServerTriggerInfo {
-    fn from(info: TriggerInfo) -> Self {
-        Self {
-            uuid: info.uuid,
-            name: info.name,
-            user_request: info.user_request,
-            event_analysis: info.event_analysis,
-            version: info.version,
-            created_at: info.created_at,
-            updated_at: info.updated_at,
-        }
-    }
-}
-
 #[async_trait]
-impl CrdtSyncTransport for TriggerClient {
+impl CrdtSyncTransport for RemiPublicClient {
     async fn sync_crdt_document(
         &mut self,
         device_id: String,
@@ -312,8 +161,14 @@ impl CrdtSyncTransport for TriggerClient {
         data_type: i32,
         sync_message: Vec<u8>,
     ) -> Result<(Vec<Vec<u8>>, String)> {
-        TriggerClient::sync_crdt_document(self, device_id, document_uuid, data_type, sync_message)
-            .await
+        RemiPublicClient::sync_crdt_document(
+            self,
+            device_id,
+            document_uuid,
+            data_type,
+            sync_message,
+        )
+        .await
     }
 
     async fn sync_crdt_documents(
@@ -321,7 +176,7 @@ impl CrdtSyncTransport for TriggerClient {
         device_id: String,
         documents: Vec<(String, i32, Vec<u8>)>,
     ) -> Result<Vec<(String, i32, Vec<Vec<u8>>, String)>> {
-        TriggerClient::sync_crdt_documents(self, device_id, documents).await
+        RemiPublicClient::sync_crdt_documents(self, device_id, documents).await
     }
 
     async fn get_crdt_document_snapshot(
@@ -331,7 +186,7 @@ impl CrdtSyncTransport for TriggerClient {
         data_type: i32,
         reset_sync_state: bool,
     ) -> Result<(Vec<u8>, String)> {
-        TriggerClient::get_crdt_document_snapshot(
+        RemiPublicClient::get_crdt_document_snapshot(
             self,
             device_id,
             document_uuid,
@@ -347,16 +202,16 @@ impl CrdtSyncTransport for TriggerClient {
         documents: Vec<(String, i32)>,
         reset_sync_state: bool,
     ) -> Result<Vec<(String, i32, Vec<u8>, String)>> {
-        TriggerClient::get_crdt_document_snapshots(self, device_id, documents, reset_sync_state)
+        RemiPublicClient::get_crdt_document_snapshots(self, device_id, documents, reset_sync_state)
             .await
     }
 
     async fn list_crdt_document_keys(&mut self) -> Result<Vec<ServerCrdtDocumentKey>> {
-        TriggerClient::list_crdt_document_keys(self).await
+        RemiPublicClient::list_crdt_document_keys(self).await
     }
 }
 
-impl TriggerClient {
+impl RemiPublicClient {
     // ========== CRDT V3 Multi-Document Sync ==========
 
     /// Sync a single CRDT document with the server.

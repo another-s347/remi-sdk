@@ -13,7 +13,7 @@ use crate::util::{
 use crate::view::{
     BlockView, CollectionDocView, CollectionMetaView, CollectionView, ContentView, EditClock,
     RootView, ThingBuiltInFieldsView, ThingContentView, ThingMarkdownView, ThingMetaView,
-    ThingStatusView, ThingView, Tombstone, TriggerBinding, View,
+    ThingStatusView, ThingView, Tombstone, View,
 };
 use crate::ThingDatatype;
 
@@ -261,7 +261,6 @@ fn extract_collections(doc: &AutoCommit) -> Result<Vec<CollectionView>> {
         let status = get_string(doc, &obj, "status")?.unwrap_or_else(|| "active".to_string());
         let edit_clock = read_edit_clock(doc, &obj)?;
         let tombstone = read_tombstone(doc, &obj)?;
-        let trigger = read_trigger(doc, &obj)?;
         let attrs = get_json_string(doc, &obj, "attrs")?;
 
         out.push(CollectionView {
@@ -270,7 +269,6 @@ fn extract_collections(doc: &AutoCommit) -> Result<Vec<CollectionView>> {
             status,
             edit_clock,
             tombstone,
-            trigger,
             attrs,
         });
     }
@@ -323,7 +321,6 @@ fn extract_things(doc: &AutoCommit, include_content: bool) -> Result<Vec<ThingVi
         let parent_id = get_string(doc, &obj, "parent_id")?;
         let edit_clock = read_edit_clock(doc, &obj)?;
         let tombstone = read_tombstone(doc, &obj)?;
-        let trigger = read_trigger(doc, &obj)?;
         let attrs = get_json_string(doc, &obj, "attrs")?;
         let content = if include_content {
             read_content(doc, &obj)?
@@ -340,7 +337,6 @@ fn extract_things(doc: &AutoCommit, include_content: bool) -> Result<Vec<ThingVi
             tombstone,
             title,
             parent_id,
-            trigger,
             content,
             attrs,
         });
@@ -399,28 +395,6 @@ fn read_tombstone(doc: &AutoCommit, entity_obj: &ObjId) -> Result<Option<Tombsto
         };
 
     Ok(Some(Tombstone { deleted, clock }))
-}
-
-fn read_trigger(doc: &AutoCommit, entity_obj: &ObjId) -> Result<Option<TriggerBinding>> {
-    let Some((Value::Object(ObjType::Map), trig_obj)) = doc.get(entity_obj, "trigger")? else {
-        return Ok(None);
-    };
-
-    let state = get_string(doc, &trig_obj, "state")?.unwrap_or_else(|| "none".to_string());
-    let uuid = get_string(doc, &trig_obj, "uuid")?
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let clock =
-        if let Some((Value::Object(ObjType::Map), clock_obj)) = doc.get(&trig_obj, "clock")? {
-            EditClock::new(
-                get_string(doc, &clock_obj, "actor")?.unwrap_or_default(),
-                get_u64(doc, &clock_obj, "seq")?.unwrap_or(0),
-            )
-        } else {
-            EditClock::new("", 0)
-        };
-
-    Ok(Some(TriggerBinding { state, uuid, clock }))
 }
 
 fn read_thing_status(doc: &AutoCommit, entity_obj: &ObjId) -> Result<ThingStatusView> {
@@ -588,7 +562,6 @@ pub fn extract_collection_doc_view(
                 status: "active".to_string(),
                 edit_clock: EditClock::zero(),
                 tombstone: None,
-                trigger: None,
                 attrs: None,
             },
             things: Vec::new(),
@@ -616,7 +589,6 @@ pub fn extract_collection_doc_view_from_doc(
         let status = get_string(doc, &meta_obj, "status")?.unwrap_or_else(|| "active".to_string());
         let edit_clock = read_edit_clock(doc, &meta_obj)?;
         let tombstone = read_tombstone(doc, &meta_obj)?;
-        let trigger = read_trigger(doc, &meta_obj)?;
         let attrs = get_json_string(doc, &meta_obj, "attrs")?;
 
         CollectionMetaView {
@@ -625,7 +597,6 @@ pub fn extract_collection_doc_view_from_doc(
             status,
             edit_clock,
             tombstone,
-            trigger,
             attrs,
         }
     } else {
@@ -635,7 +606,6 @@ pub fn extract_collection_doc_view_from_doc(
             status: "active".to_string(),
             edit_clock: EditClock::zero(),
             tombstone: None,
-            trigger: None,
             attrs: None,
         }
     };
@@ -701,7 +671,6 @@ fn extract_thing_meta_from_obj(
     let parent_id = get_string(doc, thing_obj, "parent_id")?;
     let edit_clock = read_edit_clock(doc, thing_obj)?;
     let tombstone = read_tombstone(doc, thing_obj)?;
-    let trigger = read_trigger(doc, thing_obj)?;
     let attrs = get_json_string(doc, thing_obj, "attrs")?;
 
     // Read built_in fields
@@ -720,7 +689,6 @@ fn extract_thing_meta_from_obj(
         tombstone,
         title,
         parent_id,
-        trigger,
         built_in,
         attrs,
     })

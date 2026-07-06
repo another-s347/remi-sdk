@@ -56,14 +56,6 @@ pub struct Tombstone {
     pub clock: EditClock,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TriggerBinding {
-    pub state: String, // "none" | "some"
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uuid: Option<String>,
-    pub clock: EditClock,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ThingStatusView {
@@ -151,8 +143,6 @@ pub struct CollectionView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone: Option<Tombstone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<TriggerBinding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attrs: Option<serde_json::Value>,
 }
 
@@ -169,8 +159,6 @@ pub struct ThingView {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<TriggerBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<ContentView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,8 +207,6 @@ pub struct CollectionMetaView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone: Option<Tombstone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<TriggerBinding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attrs: Option<serde_json::Value>,
 }
 
@@ -237,8 +223,6 @@ pub struct ThingMetaView {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<TriggerBinding>,
     /// Built-in fields (location, date, markdown_doc_uuid, etc.)
     #[serde(default)]
     pub built_in: ThingBuiltInFieldsView,
@@ -352,7 +336,6 @@ impl CollectionMetaView {
             status: self.status.clone(),
             edit_clock: self.edit_clock.clone(),
             tombstone: self.tombstone.clone(),
-            trigger: self.trigger.clone(),
             attrs: self.attrs.clone(),
         }
     }
@@ -371,7 +354,6 @@ impl ThingMetaView {
             tombstone: self.tombstone.clone(),
             title: self.title.clone(),
             parent_id: self.parent_id.clone(),
-            trigger: self.trigger.clone(),
             content: None, // Must be populated separately from ThingMarkdown doc
             attrs: self.attrs.clone(),
         }

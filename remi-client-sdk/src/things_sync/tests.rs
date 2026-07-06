@@ -85,14 +85,14 @@ impl CrdtSyncTransport for MockSyncTransport {
     }
 }
 
-fn test_sdk() -> TriggerSdk {
+fn test_sdk() -> RemiSdk {
     let dir = Builder::new()
         .prefix("remi-things-sync-test-")
         .tempdir()
         .expect("tempdir")
         .keep();
     let db_path: PathBuf = dir.join("sdk.sqlite3");
-    TriggerSdk::initialize(&db_path).expect("sdk init")
+    RemiSdk::initialize(&db_path).expect("sdk init")
 }
 
 fn mutated_root_doc(device_id: &str) -> Vec<u8> {
@@ -108,22 +108,17 @@ fn advanced_sync_state_for(device_id: &str) -> Vec<u8> {
     vec![1, 2, 3]
 }
 
-fn seed_dirty_root_document(sdk: &TriggerSdk, doc: &[u8], sync_state: Vec<u8>) {
+fn seed_dirty_root_document(sdk: &RemiSdk, doc: &[u8], sync_state: Vec<u8>) {
     sdk.crdt_save_document("root", "root", doc, &sync_state, true, None)
         .expect("save dirty root doc");
 }
 
-fn seed_clean_root_document(sdk: &TriggerSdk, doc: &[u8], sync_state: Vec<u8>) {
+fn seed_clean_root_document(sdk: &RemiSdk, doc: &[u8], sync_state: Vec<u8>) {
     sdk.crdt_save_document("root", "root", doc, &sync_state, false, None)
         .expect("save clean root doc");
 }
 
-fn seed_dirty_collection_document(
-    sdk: &TriggerSdk,
-    uuid: &str,
-    device_id: &str,
-    sync_state: Vec<u8>,
-) {
+fn seed_dirty_collection_document(sdk: &RemiSdk, uuid: &str, device_id: &str, sync_state: Vec<u8>) {
     let doc = remi_things_crdt::Schema::init_collection_doc(device_id, uuid)
         .expect("init collection doc");
     sdk.crdt_save_document(uuid, "collection", &doc, &sync_state, true, None)

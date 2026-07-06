@@ -103,7 +103,7 @@ pub async fn resolve_uri(uri: &str, uri_type: &str) -> Result<UriMetadata> {
 /// This function is designed to be called via `tokio::spawn()` from the
 /// Flutter/FRB layer so it doesn't block the caller.
 pub async fn resolve_and_update_entry(
-    sdk: Arc<crate::TriggerSdk>,
+    sdk: Arc<crate::RemiSdk>,
     device_id: String,
     thing_uuid: String,
     entry_id: String,

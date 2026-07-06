@@ -262,7 +262,6 @@ impl<'a> ThingsLocalService<'a> {
                 None,
                 Some(final_title.to_string()),
                 thing.parent_uuid.clone(),
-                remi_things_crdt::TriggerUpdate::Noop,
             )?);
         }
 

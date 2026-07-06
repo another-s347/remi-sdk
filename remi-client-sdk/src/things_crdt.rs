@@ -32,7 +32,6 @@ use remi_things_crdt::{
     ThingContentView,
     ThingMarkdownOp,
     ThingMarkdownView,
-    TriggerUpdate,
     apply_collection_op,
     apply_thing_markdown_op,
     compact_collection_doc,
@@ -69,7 +68,6 @@ impl Default for SnapshotOptions {
 pub struct TreeCollectionData {
     pub uuid: String,
     pub title: String,
-    pub trigger_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +75,6 @@ pub struct TreeThingData {
     pub uuid: String,
     pub title: String,
     pub status: String,
-    pub trigger_uuid: Option<String>,
     pub collection_uuid: String,
     pub parent_uuid: Option<String>,
     pub entries: Vec<ContentEntry>,
@@ -105,25 +102,6 @@ fn normalize_entity_attrs_value(attrs: Option<Value>) -> Option<Value> {
     }
 }
 
-pub fn desired_trigger_uuid(
-    tombstone_deleted: bool,
-    trigger: &Option<remi_things_crdt::view::TriggerBinding>,
-) -> Option<String> {
-    if tombstone_deleted {
-        return None;
-    }
-    let Some(t) = trigger.as_ref() else {
-        return None;
-    };
-    if t.state != "some" {
-        return None;
-    }
-    t.uuid
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 pub fn thing_data_from_view(view: &remi_things_crdt::view::ThingView) -> Value {
     thing_data_from_view_with_options(view, SnapshotOptions::default())
 }
@@ -140,18 +118,6 @@ pub fn thing_data_from_view_with_options(
         obj.insert("content".to_string(), json!(view.content));
     }
     Value::Object(obj)
-}
-
-pub fn trigger_update_from_tri_state(raw: Option<&str>) -> TriggerUpdate {
-    trigger_update_from_field_patch(FieldPatch::from_compat_option_str(raw))
-}
-
-pub fn trigger_update_from_field_patch(patch: FieldPatch<String>) -> TriggerUpdate {
-    match patch {
-        FieldPatch::Noop => TriggerUpdate::Noop,
-        FieldPatch::Clear => TriggerUpdate::Clear,
-        FieldPatch::Set(value) => TriggerUpdate::Set(value),
-    }
 }
 
 mod document_store;
@@ -263,6 +229,16 @@ impl ThingsDocumentSet {
 
     // ===== Collection Operations =====
 
+    #[cfg(test)]
+    pub(crate) fn update_collection_meta(
+        &mut self,
+        collection_uuid: &str,
+        title: Option<String>,
+        status: Option<String>,
+    ) -> Result<Vec<ThingsDocumentEvent>> {
+        self.update_collection_meta_with_timestamps(collection_uuid, title, status, None, None)
+    }
+
     /// Get or create a collection document
     pub(crate) fn get_or_init_collection(
         &mut self,
@@ -274,30 +250,11 @@ impl ThingsDocumentSet {
         Ok(self.documents.get(&key).unwrap())
     }
 
-    /// Update collection metadata
-    pub(crate) fn update_collection_meta(
-        &mut self,
-        collection_uuid: &str,
-        title: Option<String>,
-        status: Option<String>,
-        trigger: TriggerUpdate,
-    ) -> Result<Vec<ThingsDocumentEvent>> {
-        self.update_collection_meta_with_timestamps(
-            collection_uuid,
-            title,
-            status,
-            trigger,
-            None,
-            None,
-        )
-    }
-
     pub(crate) fn update_collection_meta_with_timestamps(
         &mut self,
         collection_uuid: &str,
         title: Option<String>,
         status: Option<String>,
-        trigger: TriggerUpdate,
         created_at: Option<String>,
         updated_at: Option<String>,
     ) -> Result<Vec<ThingsDocumentEvent>> {
@@ -322,7 +279,6 @@ impl ThingsDocumentSet {
             collection_uuid,
             title,
             status,
-            trigger,
             Some(attrs_json),
         )?;
 
@@ -364,7 +320,6 @@ impl ThingsDocumentSet {
             collection_uuid,
             None,
             None,
-            TriggerUpdate::Noop,
             Some(attrs_json),
         )?;
 
@@ -383,7 +338,6 @@ impl ThingsDocumentSet {
         status: Option<String>,
         title: Option<String>,
         parent_uuid: Option<String>,
-        trigger: TriggerUpdate,
     ) -> Result<Vec<ThingsDocumentEvent>> {
         self.upsert_thing_meta_with_timestamps(
             collection_uuid,
@@ -392,7 +346,6 @@ impl ThingsDocumentSet {
             status,
             title,
             parent_uuid,
-            trigger,
             None,
             None,
         )
@@ -406,7 +359,6 @@ impl ThingsDocumentSet {
         status: Option<String>,
         title: Option<String>,
         parent_uuid: Option<String>,
-        trigger: TriggerUpdate,
         created_at: Option<String>,
         updated_at: Option<String>,
     ) -> Result<Vec<ThingsDocumentEvent>> {
@@ -434,7 +386,6 @@ impl ThingsDocumentSet {
             status,
             title,
             parent_uuid,
-            trigger,
             Some(attrs_json),
         )?;
 
@@ -481,7 +432,6 @@ impl ThingsDocumentSet {
             None,
             None,
             None,
-            TriggerUpdate::Noop,
             Some(attrs_json),
         )?;
 
@@ -883,7 +833,6 @@ impl ThingsDocumentSet {
             collections.push(TreeCollectionData {
                 uuid: collection_uuid.clone(),
                 title: coll_view.meta.title.clone(),
-                trigger_uuid: desired_trigger_uuid(deleted, &coll_view.meta.trigger),
             });
 
             for thing_meta in coll_view.things {
@@ -900,7 +849,6 @@ impl ThingsDocumentSet {
                     uuid: thing_meta.id.clone(),
                     title: thing_meta.title.clone().unwrap_or_default(),
                     status: thing_meta.status.as_storage_str().to_string(),
-                    trigger_uuid: desired_trigger_uuid(thing_deleted, &thing_meta.trigger),
                     collection_uuid: collection_uuid.clone(),
                     parent_uuid: thing_meta.parent_id.clone(),
                     entries: thing_meta.built_in.content_entries.clone(),

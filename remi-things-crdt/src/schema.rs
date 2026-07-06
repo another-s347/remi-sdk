@@ -114,7 +114,7 @@ impl Schema {
     ///     title: "",
     ///     status: "active",
     ///     edit_clock: { actor, seq },
-    ///     // trigger, tombstone, attrs as needed
+    ///     // tombstone, attrs as needed
     ///   },
     ///   things: {}  // Map<ThingId, ThingMeta>
     /// }

@@ -2,9 +2,53 @@ use super::*;
 use crate::things_local::{ThingsLocalEvent, ThingsLocalService};
 use crate::types::{EntityActionBinding, ResolvedEntityActionBinding};
 
-impl TriggerSdk {
+impl RemiSdk {
     pub(crate) fn things_local_service(&self) -> ThingsLocalService<'_> {
         ThingsLocalService::with_broadcaster(&self.storage, &self.things_event_tx)
+    }
+
+    fn enqueue_search_collection_by_id(&self, device_id: &str, collection_uuid: &str) {
+        match self.things_get_collection(device_id, collection_uuid) {
+            Ok(Some(collection)) => {
+                self.enqueue_search_document(SearchDocument::from_collection(&collection));
+            }
+            Ok(None) => {
+                self.enqueue_search_actions(vec![SearchIngestAction::delete_entity(
+                    crate::search::SearchEntityKind::Collection,
+                    collection_uuid,
+                )]);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    collection_uuid = %collection_uuid,
+                    error = %error,
+                    "Failed to snapshot collection for search index"
+                );
+            }
+        }
+    }
+
+    fn enqueue_search_thing_by_id(&self, device_id: &str, thing_uuid: &str) {
+        match self.things_get_thing(device_id, thing_uuid, true) {
+            Ok(Some(thing)) => {
+                self.enqueue_search_document(SearchDocument::from_thing(&thing));
+            }
+            Ok(None) => {
+                self.enqueue_search_actions(vec![SearchIngestAction::delete_entity(
+                    crate::search::SearchEntityKind::Thing,
+                    thing_uuid,
+                )]);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    thing_uuid = %thing_uuid,
+                    error = %error,
+                    "Failed to snapshot thing for search index"
+                );
+            }
+        }
     }
 
     /// Compatibility entry point for clients that explicitly request a full
@@ -63,6 +107,9 @@ impl TriggerSdk {
         let context = ThingsMutationContext::remote_sync(device_id, sync_run_id);
         let result = ThingsMutationPipeline::with_broadcaster(&self.storage, &self.things_event_tx)
             .apply_remote_documents(&context, documents)?;
+        if result.event_range.is_some() {
+            self.enqueue_search_rebuild();
+        }
         Ok(result.event_range)
     }
 
@@ -79,6 +126,9 @@ impl TriggerSdk {
         let result = ThingsMutationPipeline::with_broadcaster(&self.storage, &self.things_event_tx)
             .save_synced_document_clean(&context, key, automerge_doc, sync_state, last_sync_at)
             .context("Failed to save synced Things CRDT document clean")?;
+        if result.event_range.is_some() {
+            self.enqueue_search_rebuild();
+        }
         Ok(result.event_range)
     }
 
@@ -92,6 +142,9 @@ impl TriggerSdk {
         let result = ThingsMutationPipeline::with_broadcaster(&self.storage, &self.things_event_tx)
             .delete_raw_document(&context, key)
             .context("Failed to delete raw Things CRDT document through pipeline")?;
+        if result.event_range.is_some() {
+            self.enqueue_search_rebuild();
+        }
         Ok(result.event_range)
     }
 
@@ -136,7 +189,11 @@ impl TriggerSdk {
     pub fn things_upsert_actor_meta(&self, items: &[crate::storage::ActorMetaEntry]) -> Result<()> {
         self.storage
             .upsert_things_actor_meta_batch(items)
-            .context("Failed to store actor meta batch")
+            .context("Failed to store actor meta batch")?;
+        if !items.is_empty() {
+            self.enqueue_search_rebuild();
+        }
+        Ok(())
     }
 
     pub fn things_has_pending_changes(&self, device_id: &str) -> Result<bool> {
@@ -184,6 +241,7 @@ impl TriggerSdk {
             .things_local_service()
             .upsert_collection(device_id, upsert)?;
         let value = result.value;
+        self.enqueue_search_document(SearchDocument::from_collection(&value));
         Ok(value)
     }
 
@@ -196,16 +254,7 @@ impl TriggerSdk {
             return Ok(false);
         }
 
-        for trigger_uuid in outcome.removed_triggers {
-            if let Err(error) = self.delete_trigger_if_unbound(&trigger_uuid) {
-                tracing::warn!(
-                    trigger_uuid = %trigger_uuid,
-                    error = %error,
-                    "Failed to cleanup trigger after collection deletion"
-                );
-            }
-        }
-
+        self.enqueue_search_collection_by_id(device_id, uuid);
         Ok(true)
     }
 
@@ -217,6 +266,9 @@ impl TriggerSdk {
         let result = self
             .things_local_service()
             .restore_collection(device_id, uuid)?;
+        if let Some(collection) = &result.value {
+            self.enqueue_search_document(SearchDocument::from_collection(collection));
+        }
         Ok(result.value)
     }
 
@@ -229,6 +281,7 @@ impl TriggerSdk {
         let result = self
             .things_local_service()
             .ensure_app_collection(device_id, app_id, title)?;
+        self.enqueue_search_document(SearchDocument::from_collection(&result.value));
         Ok(result.value)
     }
 
@@ -237,6 +290,7 @@ impl TriggerSdk {
             .things_local_service()
             .upsert_thing(device_id, upsert)?;
         let value = result.value;
+        self.enqueue_search_document(SearchDocument::from_thing(&value));
         Ok(value)
     }
 
@@ -253,6 +307,7 @@ impl TriggerSdk {
             target_collection_uuid,
             target_parent_uuid,
         )?;
+        self.enqueue_search_document(SearchDocument::from_thing(&result.value));
         Ok(result.value)
     }
 
@@ -273,6 +328,7 @@ impl TriggerSdk {
             title,
             datatype,
         )?;
+        self.enqueue_search_document(SearchDocument::from_thing(&result.value));
         Ok(result.value)
     }
 
@@ -289,6 +345,9 @@ impl TriggerSdk {
             .things_local_service()
             .splice_text(device_id, thing_uuid, block_id, index, delete, insert)?;
         let value = result.value;
+        if value {
+            self.enqueue_search_thing_by_id(device_id, thing_uuid);
+        }
         Ok(value)
     }
 
@@ -341,6 +400,7 @@ impl TriggerSdk {
             append_text,
         )?;
         let value = result.value;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(value)
     }
 
@@ -356,6 +416,9 @@ impl TriggerSdk {
             .things_local_service()
             .set_thing_status(device_id, thing_uuid, status)?;
         let value = result.value;
+        if value {
+            self.enqueue_search_thing_by_id(device_id, thing_uuid);
+        }
         Ok(value)
     }
 
@@ -369,6 +432,9 @@ impl TriggerSdk {
             .things_local_service()
             .delete_thing(device_id, collection_uuid, uuid)?;
         let value = result.value;
+        if value {
+            self.enqueue_search_thing_by_id(device_id, uuid);
+        }
         Ok(value)
     }
 
@@ -385,6 +451,9 @@ impl TriggerSdk {
             target_collection_uuid,
             target_parent_uuid,
         )?;
+        if let Some(thing) = &result.value {
+            self.enqueue_search_document(SearchDocument::from_thing(thing));
+        }
         Ok(result.value)
     }
 
@@ -399,66 +468,8 @@ impl TriggerSdk {
             self.things_local_service()
                 .set_status(device_id, thing_uuid, status, timestamp_ms)?;
         let value = result.value;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(value)
-    }
-
-    /// Set (or clear) a collection's `trigger_uuid` inside the Things CRDT.
-    ///
-    /// This is the canonical source of truth for trigger bindings as surfaced in the UI.
-    /// The SQL `trigger_bindings` table is reconciled from this CRDT state.
-    pub fn things_set_collection_trigger_uuid(
-        &self,
-        device_id: &str,
-        collection_uuid: &str,
-        trigger_uuid: Option<&str>,
-    ) -> Result<()> {
-        self.things_patch_collection_trigger_uuid(
-            device_id,
-            collection_uuid,
-            FieldPatch::from_compat_option_str(trigger_uuid),
-        )
-    }
-
-    pub fn things_patch_collection_trigger_uuid(
-        &self,
-        device_id: &str,
-        collection_uuid: &str,
-        trigger_uuid: FieldPatch<String>,
-    ) -> Result<()> {
-        self.things_local_service().patch_collection_trigger_uuid(
-            device_id,
-            collection_uuid,
-            trigger_uuid,
-        )?;
-        Ok(())
-    }
-
-    /// Set (or clear) a thing's `trigger_uuid` inside the Things CRDT.
-    pub fn things_set_thing_trigger_uuid(
-        &self,
-        device_id: &str,
-        thing_uuid: &str,
-        trigger_uuid: Option<&str>,
-    ) -> Result<()> {
-        self.things_patch_thing_trigger_uuid(
-            device_id,
-            thing_uuid,
-            FieldPatch::from_compat_option_str(trigger_uuid),
-        )
-    }
-
-    pub fn things_patch_thing_trigger_uuid(
-        &self,
-        device_id: &str,
-        thing_uuid: &str,
-        trigger_uuid: FieldPatch<String>,
-    ) -> Result<()> {
-        self.things_local_service().patch_thing_trigger_uuid(
-            device_id,
-            thing_uuid,
-            trigger_uuid,
-        )?;
-        Ok(())
     }
 
     pub fn list_collection_action_bindings(
@@ -528,6 +539,7 @@ impl TriggerSdk {
             collection_uuid,
             bindings,
         )?;
+        self.enqueue_search_collection_by_id(device_id, collection_uuid);
         Ok(())
     }
 
@@ -551,6 +563,7 @@ impl TriggerSdk {
             collection_uuid,
             card_jsx,
         )?;
+        self.enqueue_search_collection_by_id(device_id, collection_uuid);
         Ok(())
     }
 
@@ -562,6 +575,7 @@ impl TriggerSdk {
     ) -> Result<()> {
         self.things_local_service()
             .set_thing_action_bindings(device_id, thing_uuid, bindings)?;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(())
     }
 
@@ -651,6 +665,7 @@ impl TriggerSdk {
             .things_local_service()
             .add_content_entry(device_id, thing_uuid, entry)?;
         let value = result.value;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(value)
     }
 
@@ -669,6 +684,7 @@ impl TriggerSdk {
     ) -> Result<()> {
         self.things_local_service()
             .update_content_entry(device_id, thing_uuid, update)?;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(())
     }
 
@@ -681,6 +697,7 @@ impl TriggerSdk {
     ) -> Result<()> {
         self.things_local_service()
             .delete_content_entry(device_id, thing_uuid, entry_id)?;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(())
     }
 
@@ -696,6 +713,7 @@ impl TriggerSdk {
             .things_local_service()
             .add_json_object_content_entry(device_id, thing_uuid, title, data, schema)?;
         let value = result.value;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(value)
     }
 
@@ -728,6 +746,7 @@ impl TriggerSdk {
     ) -> Result<()> {
         self.things_local_service()
             .set_json_object_entry_data(device_id, thing_uuid, entry_id, data)?;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(())
     }
 
@@ -740,6 +759,7 @@ impl TriggerSdk {
     ) -> Result<()> {
         self.things_local_service()
             .set_json_object_entry_schema(device_id, thing_uuid, entry_id, schema)?;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(())
     }
 
@@ -754,6 +774,7 @@ impl TriggerSdk {
     ) -> Result<()> {
         self.things_local_service()
             .update_json_object_entry(device_id, thing_uuid, entry_id, title, data, schema)?;
+        self.enqueue_search_thing_by_id(device_id, thing_uuid);
         Ok(())
     }
 
@@ -817,125 +838,16 @@ impl TriggerSdk {
         device_id: &str,
         execution: ThingsUndoExecution,
     ) -> Result<String> {
-        self.things_local_service()
-            .execute_undo(device_id, execution)
+        let result = self
+            .things_local_service()
+            .execute_undo(device_id, execution)?;
+        self.enqueue_search_rebuild();
+        Ok(result)
     }
 
     /// Cleanup old change logs and snapshots (retention policy).
     pub fn things_cleanup_change_logs(&self, older_than_days: i64) -> Result<(u64, u64)> {
         self.things_local_service()
             .cleanup_change_logs(older_than_days)
-    }
-
-    /// Reconcile trigger bindings after a sync operation.
-    /// Returns a list of trigger UUIDs that need to be downloaded and installed.
-    pub fn reconcile_trigger_bindings_after_sync(&self, device_id: &str) -> Result<Vec<String>> {
-        let snapshot_state = self.things_local_service().snapshot_lite(device_id)?;
-        let snapshot = ThingsSnapshot {
-            collections: snapshot_state.collections,
-            things: snapshot_state.things,
-        };
-
-        // Desired bindings for *all* non-deleted entities.
-        let mut desired_bindings: std::collections::HashMap<(String, String), Option<String>> =
-            std::collections::HashMap::new();
-
-        for c in &snapshot.collections {
-            desired_bindings.insert(
-                ("collection".to_string(), c.uuid.clone()),
-                c.trigger_uuid.clone(),
-            );
-        }
-
-        for t in &snapshot.things {
-            desired_bindings.insert(
-                ("thing".to_string(), t.uuid.clone()),
-                t.trigger_uuid.clone(),
-            );
-        }
-
-        // Snapshot of existing bound triggers (for uninstall decisions later).
-        let existing_bound_triggers: std::collections::HashSet<String> = self
-            .storage
-            .list_bound_trigger_uuids()?
-            .into_iter()
-            .collect();
-
-        // Apply desired bindings and also delete rows for entities that no longer exist.
-        let existing_rows = self.storage.list_trigger_bindings()?;
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-
-        for (trigger_uuid, entity_type, entity_uuid) in existing_rows {
-            let key = (entity_type.clone(), entity_uuid.clone());
-            seen.insert(key.clone());
-
-            match desired_bindings.get(&key) {
-                None => {
-                    // Entity disappeared (deleted); remove stale binding.
-                    self.storage
-                        .delete_trigger_binding(&entity_type, &entity_uuid)?;
-                }
-                Some(None) => {
-                    // Entity exists but wants no binding.
-                    self.storage
-                        .delete_trigger_binding(&entity_type, &entity_uuid)?;
-                }
-                Some(Some(desired_trigger)) => {
-                    if desired_trigger != &trigger_uuid {
-                        self.storage.upsert_trigger_binding(
-                            desired_trigger,
-                            &entity_type,
-                            &entity_uuid,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        // Insert any bindings for entities we haven't seen yet.
-        for ((entity_type, entity_uuid), trigger_uuid) in &desired_bindings {
-            if seen.contains(&(entity_type.clone(), entity_uuid.clone())) {
-                continue;
-            }
-            if let Some(trigger_uuid) = trigger_uuid {
-                self.storage
-                    .upsert_trigger_binding(trigger_uuid, entity_type, entity_uuid)?;
-            }
-        }
-
-        // Collect all trigger UUIDs that are now bound
-        let mut all_trigger_uuids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for trigger_uuid_opt in desired_bindings.values() {
-            if let Some(trigger_uuid) = trigger_uuid_opt {
-                all_trigger_uuids.insert(trigger_uuid.clone());
-            }
-        }
-
-        // Find triggers that need to be downloaded (not yet installed)
-        let mut triggers_to_download = Vec::new();
-        for trigger_uuid in &all_trigger_uuids {
-            // Check if trigger is already installed
-            if self.storage.fetch_trigger(trigger_uuid)?.is_none() {
-                triggers_to_download.push(trigger_uuid.clone());
-            }
-        }
-
-        // Find triggers that are no longer bound and can be uninstalled
-        for old_trigger_uuid in existing_bound_triggers {
-            if !all_trigger_uuids.contains(&old_trigger_uuid) {
-                // Check if trigger is still bound to anything (shouldn't be, but double-check)
-                if !self.storage.is_trigger_bound(&old_trigger_uuid)? {
-                    info!(trigger_uuid = %old_trigger_uuid, "Uninstalling trigger no longer bound to any entity");
-                    let _ = self.storage.delete_trigger(&old_trigger_uuid);
-                    self.emit_trigger_event(TriggerEvent::TriggerDelete {
-                        trigger_uuid: old_trigger_uuid.clone(),
-                    });
-                }
-            }
-        }
-
-        Ok(triggers_to_download)
     }
 }

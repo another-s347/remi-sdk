@@ -1,11 +1,11 @@
-use super::TriggerSdk;
+use super::RemiSdk;
 use crate::things_crdt::{
-    ContentEntry, ContentEntryPayload, ContentEntryUpdate, FieldPatch, ImageField,
-    ThingCollectionUpsert, ThingDatatype, ThingUpsert,
+    ContentEntry, ContentEntryPayload, ContentEntryUpdate, ImageField, ThingCollectionUpsert,
+    ThingDatatype, ThingUpsert,
 };
 use crate::types::{
-    EntityActionBinding, TriggerRegistration, TriggerRule, VirtualFsNodeKind,
-    VirtualFsProfileResult, VirtualFsProfileStep, VirtualFsReadResult,
+    EntityActionBinding, VirtualFsNodeKind, VirtualFsProfileResult, VirtualFsProfileStep,
+    VirtualFsReadResult,
 };
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value as JsonValue, json};
@@ -15,32 +15,17 @@ use std::time::Instant;
 mod helpers;
 use helpers::{
     collection_dir_children, display_path, friendly_anyhow, normalize_operation, normalize_path,
-    parse_action_args_json, parse_entity_action_bindings_value, parse_rule_json, parse_rules,
-    parse_rules_value, parse_trigger_action_binding_value, parse_virtual_path, push_profile_step,
-    render_action_listing, render_collection_listing, render_thing_nodes, render_tree,
-    render_trigger_listing, thing_dir_children,
+    parse_action_args_json, parse_entity_action_bindings_value, parse_virtual_path,
+    push_profile_step, render_action_listing, render_collection_listing, render_thing_nodes,
+    render_tree, thing_dir_children,
 };
 
 const ROOT_PATH: &str = "/";
-const TRIGGER_PREVIEW_LIMIT: usize = 5;
 const ACTION_PREVIEW_LIMIT: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VirtualPath {
     Root,
-    TriggerRoot,
-    TriggerDir {
-        trigger_uuid: String,
-    },
-    TriggerName {
-        trigger_uuid: String,
-    },
-    TriggerRule {
-        trigger_uuid: String,
-    },
-    TriggerAction {
-        trigger_uuid: String,
-    },
     ActionRoot,
     ActionDir {
         action_uuid: String,
@@ -70,9 +55,6 @@ enum VirtualPath {
     CollectionName {
         collection_uuid: String,
     },
-    CollectionTriggerUuid {
-        collection_uuid: String,
-    },
     CollectionCardJsx {
         collection_uuid: String,
     },
@@ -87,10 +69,6 @@ enum VirtualPath {
         thing_uuid: String,
     },
     ThingName {
-        collection_uuid: String,
-        thing_uuid: String,
-    },
-    ThingTriggerUuid {
         collection_uuid: String,
         thing_uuid: String,
     },
@@ -231,7 +209,7 @@ impl TreeNode {
     }
 }
 
-impl TriggerSdk {
+impl RemiSdk {
     pub fn ls_virtual_path(&self, device_id: &str, path: Option<&str>) -> Result<String> {
         self.tree_virtual_path(device_id, path)
     }
@@ -256,10 +234,6 @@ impl TriggerSdk {
         let parsed = parse_virtual_path(&path)?;
         push_profile_step(&mut steps, "normalize_parse", parse_started.elapsed());
 
-        let triggers_started = Instant::now();
-        let triggers = self.list_triggers()?;
-        push_profile_step(&mut steps, "list_triggers", triggers_started.elapsed());
-
         let actions_started = Instant::now();
         let actions = self.list_actions()?;
         push_profile_step(&mut steps, "list_actions", actions_started.elapsed());
@@ -269,7 +243,7 @@ impl TriggerSdk {
         push_profile_step(&mut steps, "extract_tree_data", tree_data_started.elapsed());
 
         let render_started = Instant::now();
-        let node = self.build_tree_node_from_tree_data(&parsed, &triggers, &actions, &tree_data)?;
+        let node = self.build_tree_node_from_tree_data(&parsed, &actions, &tree_data)?;
         let rendered = render_tree(&node);
         push_profile_step(&mut steps, "render_tree", render_started.elapsed());
 
@@ -393,42 +367,6 @@ impl TriggerSdk {
                     "The /action subtree is read-only in v1.",
                 ));
             }
-            VirtualPath::TriggerName { ref trigger_uuid } => {
-                let new_name = value.and_then(JsonValue::as_str).ok_or_else(|| {
-                    friendly_anyhow(
-                        &path,
-                        "invalid_value",
-                        "Editing trigger name requires a string value.",
-                    )
-                })?;
-                self.update_trigger_name(trigger_uuid, new_name)?;
-                json!({
-                    "ok": true,
-                    "path": path,
-                    "message": format!("Updated trigger name for '{}'", trigger_uuid),
-                    "value": new_name,
-                })
-            }
-            VirtualPath::TriggerRule { ref trigger_uuid } => {
-                let rule = parse_rule_json(&path, value)?;
-                self.update_trigger_rule(trigger_uuid, &rule)?;
-                json!({
-                    "ok": true,
-                    "path": path,
-                    "message": format!("Updated trigger rule for '{}'", trigger_uuid),
-                    "value": rule,
-                })
-            }
-            VirtualPath::TriggerAction { ref trigger_uuid } => {
-                let binding = parse_trigger_action_binding_value(&path, value)?;
-                self.update_trigger_action(trigger_uuid, binding.as_ref())?;
-                json!({
-                    "ok": true,
-                    "path": path,
-                    "message": format!("Updated trigger action binding for '{}'", trigger_uuid),
-                    "value": binding,
-                })
-            }
             VirtualPath::CollectionActions {
                 ref collection_uuid,
             } => {
@@ -473,28 +411,6 @@ impl TriggerSdk {
                     "value": title,
                 })
             }
-            VirtualPath::CollectionTriggerUuid {
-                ref collection_uuid,
-            } => {
-                let trigger_uuid = value
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| friendly_anyhow(&path, "invalid_value", "Editing collection trigger requires a string value. Use an empty string to clear the binding."))?;
-                self.things_patch_collection_trigger_uuid(
-                    device_id,
-                    collection_uuid,
-                    if trigger_uuid.trim().is_empty() {
-                        FieldPatch::Clear
-                    } else {
-                        FieldPatch::Set(trigger_uuid.trim().to_string())
-                    },
-                )?;
-                json!({
-                    "ok": true,
-                    "path": path,
-                    "message": format!("Updated collection trigger binding for '{}'", collection_uuid),
-                    "value": trigger_uuid,
-                })
-            }
             VirtualPath::ThingName { ref thing_uuid, .. } => {
                 let title = value.and_then(JsonValue::as_str).ok_or_else(|| {
                     friendly_anyhow(
@@ -509,26 +425,6 @@ impl TriggerSdk {
                     "path": path,
                     "message": format!("Updated thing name for '{}'", thing_uuid),
                     "value": title,
-                })
-            }
-            VirtualPath::ThingTriggerUuid { ref thing_uuid, .. } => {
-                let trigger_uuid = value
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| friendly_anyhow(&path, "invalid_value", "Editing thing trigger requires a string value. Use an empty string to clear the binding."))?;
-                self.things_patch_thing_trigger_uuid(
-                    device_id,
-                    thing_uuid,
-                    if trigger_uuid.trim().is_empty() {
-                        FieldPatch::Clear
-                    } else {
-                        FieldPatch::Set(trigger_uuid.trim().to_string())
-                    },
-                )?;
-                json!({
-                    "ok": true,
-                    "path": path,
-                    "message": format!("Updated thing trigger binding for '{}'", thing_uuid),
-                    "value": trigger_uuid,
                 })
             }
             VirtualPath::ThingActions { ref thing_uuid, .. } => {
@@ -597,8 +493,6 @@ impl TriggerSdk {
                 device_id, &path, thing_uuid, index, operation, value,
             )?,
             VirtualPath::Root
-            | VirtualPath::TriggerRoot
-            | VirtualPath::TriggerDir { .. }
             | VirtualPath::CollectionRoot
             | VirtualPath::CollectionDir { .. }
             | VirtualPath::CollectionThingsDir { .. }
@@ -628,7 +522,6 @@ impl TriggerSdk {
             | VirtualPath::ActionOutputSchema { .. }
             | VirtualPath::ActionScript { .. }
             | VirtualPath::ActionLatestInvocation { .. }
-            | VirtualPath::TriggerAction { .. }
             | VirtualPath::CollectionActions { .. }
             | VirtualPath::ThingActions { .. } => {
                 return Err(friendly_anyhow(
@@ -636,18 +529,6 @@ impl TriggerSdk {
                     "read_only_action_path",
                     "The /action subtree is read-only in v1.",
                 ));
-            }
-            VirtualPath::TriggerDir { ref trigger_uuid } => {
-                let deleted = self.delete_trigger_and_bindings(device_id, trigger_uuid)?;
-                json!({
-                    "ok": deleted,
-                    "path": path,
-                    "message": if deleted {
-                        format!("Deleted trigger '{}'", trigger_uuid)
-                    } else {
-                        format!("Trigger '{}' was already absent", trigger_uuid)
-                    },
-                })
             }
             VirtualPath::CollectionDir {
                 ref collection_uuid,
@@ -702,23 +583,18 @@ impl TriggerSdk {
                 ));
             }
             VirtualPath::Root
-            | VirtualPath::TriggerRoot
-            | VirtualPath::TriggerName { .. }
-            | VirtualPath::TriggerRule { .. }
             | VirtualPath::CollectionRoot
             | VirtualPath::CollectionName { .. }
-            | VirtualPath::CollectionTriggerUuid { .. }
             | VirtualPath::CollectionCardJsx { .. }
             | VirtualPath::CollectionThingsDir { .. }
             | VirtualPath::ThingName { .. }
-            | VirtualPath::ThingTriggerUuid { .. }
             | VirtualPath::ThingStatus { .. }
             | VirtualPath::ThingContent { .. }
             | VirtualPath::ThingChildrenDir { .. } => {
                 return Err(friendly_anyhow(
                     &path,
                     "delete_unsupported",
-                    "Delete only supports entity directories (/trigger/{uuid}, /collection/{uuid}, /collection/{collection_uuid}/things/{thing_uuid}) or entry files (/entries.{idx}).",
+                    "Delete only supports entity directories (/collection/{uuid}, /collection/{collection_uuid}/things/{thing_uuid}) or entry files (/entries.{idx}).",
                 ));
             }
         };
@@ -742,15 +618,6 @@ impl TriggerSdk {
                 collection_uuid,
                 thing_uuid,
             } => (collection_uuid, thing_uuid),
-            VirtualPath::TriggerDir { .. }
-            | VirtualPath::TriggerName { .. }
-            | VirtualPath::TriggerRule { .. } => {
-                return Err(friendly_anyhow(
-                    &from_path,
-                    "move_unsupported",
-                    "Trigger paths do not support move. Edit name or rule.json, or delete and recreate the trigger binding instead.",
-                ));
-            }
             VirtualPath::CollectionDir { .. } | VirtualPath::CollectionName { .. } => {
                 return Err(friendly_anyhow(
                     &from_path,
@@ -837,15 +704,7 @@ impl TriggerSdk {
         let parent_path = normalize_path(parent_path)?;
         let parent = parse_virtual_path(&parent_path)?;
         let kind = kind.trim().to_ascii_lowercase();
-        let bind_path = bind_path.map(normalize_path).transpose()?;
-
-        if bind_path.is_some() {
-            return Err(friendly_anyhow(
-                bind_path.as_deref().unwrap_or(ROOT_PATH),
-                "bind_path_unsupported",
-                "bind_path is no longer supported by create_tool. Use create_trigger or create_timer_trigger for trigger creation and binding.",
-            ));
-        }
+        let _bind_path = bind_path.map(normalize_path).transpose()?;
 
         if kind != "image" && source_uri.is_some() {
             return Err(friendly_anyhow(
@@ -873,8 +732,6 @@ impl TriggerSdk {
                         title: title.unwrap_or("New Collection").to_string(),
                         collection_type: Default::default(),
                         app_id: None,
-                        trigger_uuid: None,
-                        trigger_uuid_patch: Default::default(),
                         created_at: None,
                         updated_at: None,
                     },
@@ -898,8 +755,6 @@ impl TriggerSdk {
                         datatype: ThingDatatype::Markdown,
                         data: Some(json!({ "markdown": content.unwrap_or("") })),
                         collection_uuid: collection_uuid.clone(),
-                        trigger_uuid: None,
-                        trigger_uuid_patch: Default::default(),
                         parent_uuid: None,
                         created_at: None,
                         updated_at: None,
@@ -930,8 +785,6 @@ impl TriggerSdk {
                         datatype: ThingDatatype::Markdown,
                         data: Some(json!({ "markdown": content.unwrap_or("") })),
                         collection_uuid: collection_uuid.clone(),
-                        trigger_uuid: None,
-                        trigger_uuid_patch: Default::default(),
                         parent_uuid: Some(parent_uuid.clone()),
                         created_at: None,
                         updated_at: None,
@@ -941,42 +794,6 @@ impl TriggerSdk {
                     format!("/collection/{collection_uuid}/things/{thing_uuid}"),
                     thing_uuid,
                     JsonValue::Null,
-                )
-            }
-            ("action_binding", VirtualPath::TriggerDir { trigger_uuid }) => {
-                let action_uuid = normalized_action_uuid.clone().ok_or_else(|| {
-                    friendly_anyhow(
-                        &parent_path,
-                        "missing_action_uuid",
-                        "Creating an action binding requires action_uuid.",
-                    )
-                })?;
-                let existing = self.fetch_trigger_or_err(&trigger_uuid, &parent_path)?;
-                if existing
-                    .action_uuid
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .is_some()
-                {
-                    return Err(friendly_anyhow(
-                        &parent_path,
-                        "trigger_action_exists",
-                        "Trigger already has an action binding. Use edit_path_tool on action.json to replace it.",
-                    ));
-                }
-                let args_json = parse_action_args_json(&parent_path, content)?;
-                self.update_trigger_action(
-                    &trigger_uuid,
-                    Some(&(action_uuid.clone(), args_json.clone())),
-                )?;
-                (
-                    format!("/trigger/{trigger_uuid}/action.json"),
-                    action_uuid.clone(),
-                    json!({
-                        "trigger_uuid": trigger_uuid,
-                        "action_uuid": action_uuid,
-                        "args_json": args_json,
-                    }),
                 )
             }
             ("action_binding", VirtualPath::CollectionDir { collection_uuid }) => {
@@ -1223,14 +1040,14 @@ impl TriggerSdk {
                 return Err(friendly_anyhow(
                     &parent_path,
                     "invalid_parent",
-                    "action_binding can only be created under '/trigger/{trigger_uuid}', '/collection/{collection_uuid}', or '/collection/{collection_uuid}/things/{thing_uuid}'.",
+                    "action_binding can only be created under '/collection/{collection_uuid}' or '/collection/{collection_uuid}/things/{thing_uuid}'.",
                 ));
             }
             _ => {
                 return Err(friendly_anyhow(
                     &parent_path,
                     "invalid_type",
-                    "create_tool type must be 'collection', 'thing', 'image', 'json_object', or 'action_binding'. Use create_trigger or create_timer_trigger for trigger creation.",
+                    "create_tool type must be 'collection', 'thing', 'image', 'json_object', or 'action_binding'.",
                 ));
             }
         };
@@ -1250,17 +1067,15 @@ impl TriggerSdk {
     }
 
     fn build_tree_node(&self, device_id: &str, path: &VirtualPath) -> Result<TreeNode> {
-        let triggers = self.list_triggers()?;
         let actions = self.list_actions()?;
         let tree_data = self.things_local_service().tree_data(device_id)?;
 
-        self.build_tree_node_from_tree_data(path, &triggers, &actions, &tree_data)
+        self.build_tree_node_from_tree_data(path, &actions, &tree_data)
     }
 
     fn build_tree_node_from_tree_data(
         &self,
         path: &VirtualPath,
-        triggers: &[crate::types::TriggerInfo],
         actions: &[crate::types::ActionDefinition],
         tree_data: &crate::things_crdt::ThingsTreeData,
     ) -> Result<TreeNode> {
@@ -1268,34 +1083,13 @@ impl TriggerSdk {
 
         match path {
             VirtualPath::Root => {
-                let trigger_children = render_trigger_listing(triggers, true);
                 let collection_children = render_collection_listing(tree_data, &index, None, true);
                 Ok(TreeNode::with_children(
                     ROOT_PATH,
                     vec![
-                        TreeNode::with_children("trigger/", trigger_children),
                         TreeNode::with_children("action/", render_action_listing(actions, true)),
                         TreeNode::with_children("collection/", collection_children),
                     ],
-                ))
-            }
-            VirtualPath::TriggerRoot => Ok(TreeNode::with_children(
-                "/trigger/",
-                render_trigger_listing(triggers, false),
-            )),
-            VirtualPath::TriggerDir { trigger_uuid } => {
-                let trigger = self.fetch_trigger_or_err(trigger_uuid, "/trigger")?;
-                let mut children = vec![
-                    TreeNode::new(format!("name [value=\"{}\"]", trigger.name)),
-                    TreeNode::new("rule.json"),
-                ];
-                children.push(TreeNode::new(format!(
-                    "action.json [value=\"{}\"]",
-                    trigger.action_uuid.clone().unwrap_or_default()
-                )));
-                Ok(TreeNode::with_children(
-                    format!("/trigger/{trigger_uuid}/"),
-                    children,
                 ))
             }
             VirtualPath::ActionRoot => Ok(TreeNode::with_children(
@@ -1348,72 +1142,60 @@ impl TriggerSdk {
             _ => Err(friendly_anyhow(
                 &display_path(path),
                 "tree_unsupported",
-                "tree_tool expects a directory path such as /, /trigger, /action, /collection, /collection/{collection_uuid}, or /collection/{collection_uuid}/things/{thing_uuid}.",
+                "tree_tool expects a directory path such as /, /action, /collection, /collection/{collection_uuid}, or /collection/{collection_uuid}/things/{thing_uuid}.",
             )),
         }
     }
 
     fn read_virtual_path_inner(&self, device_id: &str, path: &VirtualPath) -> Result<String> {
         match path {
-            VirtualPath::TriggerName { trigger_uuid } => {
-                Ok(self.fetch_trigger_or_err(trigger_uuid, "/trigger")?.name)
-            }
-            VirtualPath::TriggerRule { trigger_uuid } => {
-                let trigger = self.fetch_trigger_or_err(trigger_uuid, "/trigger")?;
-                let rule = json!({
-                    "version": trigger.version,
-                    "precondition": parse_rules(&trigger.precondition_json)?,
-                    "condition": parse_rules(&trigger.condition_json)?,
-                    "action_uuid": trigger.action_uuid,
-                    "action_args": serde_json::from_str::<JsonValue>(&trigger.action_args_json)
-                        .unwrap_or_else(|_| JsonValue::Object(Default::default())),
-                });
-                serde_json::to_string_pretty(&rule).context("Failed to serialize trigger rule.json")
-            }
-            VirtualPath::TriggerAction { trigger_uuid } => {
-                let trigger = self.fetch_trigger_or_err(trigger_uuid, "/trigger")?;
-                let action_value = trigger
-                    .action_uuid
-                    .as_ref()
-                    .filter(|value| !value.is_empty())
-                    .map(|action_uuid| {
-                        json!({
-                            "action_uuid": action_uuid,
-                            "args_json": serde_json::from_str::<JsonValue>(&trigger.action_args_json)
-                                .unwrap_or_else(|_| JsonValue::Object(Default::default())),
-                        })
-                    })
-                    .unwrap_or(JsonValue::Null);
-                serde_json::to_string_pretty(&action_value)
-                    .context("Failed to serialize trigger action binding")
-            }
             VirtualPath::ActionName { action_uuid } => {
-                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                let action = self.fetch_action_or_err(action_uuid, &display_path(path))?;
                 Ok(action.title)
             }
             VirtualPath::ActionMetadata { action_uuid } => {
-                let action = self.fetch_action_or_err(action_uuid, "/action")?;
-                serde_json::to_string_pretty(&action.metadata_json)
+                let action = self.fetch_action_or_err(action_uuid, &display_path(path))?;
+                let mut metadata = match action.metadata_json {
+                    JsonValue::Object(object) => object,
+                    other => {
+                        let mut object = serde_json::Map::new();
+                        object.insert("metadata".to_string(), other);
+                        object
+                    }
+                };
+                metadata.insert("action_uuid".to_string(), json!(action.action_uuid));
+                metadata.insert("name".to_string(), json!(action.name));
+                metadata.insert("title".to_string(), json!(action.title));
+                metadata.insert("description".to_string(), json!(action.description));
+                metadata.insert("version".to_string(), json!(action.version));
+                metadata.insert("category".to_string(), json!(action.category));
+                metadata.insert("enabled".to_string(), json!(action.enabled));
+                serde_json::to_string_pretty(&metadata)
                     .context("Failed to serialize action metadata")
             }
             VirtualPath::ActionInputSchema { action_uuid } => {
-                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                let action = self.fetch_action_or_err(action_uuid, &display_path(path))?;
                 serde_json::to_string_pretty(&action.input_schema_json)
                     .context("Failed to serialize action input schema")
             }
             VirtualPath::ActionOutputSchema { action_uuid } => {
-                let action = self.fetch_action_or_err(action_uuid, "/action")?;
-                serde_json::to_string_pretty(&action.output_schema_json.unwrap_or(JsonValue::Null))
+                let action = self.fetch_action_or_err(action_uuid, &display_path(path))?;
+                serde_json::to_string_pretty(
+                    &action.output_schema_json.unwrap_or(JsonValue::Null),
+                )
                     .context("Failed to serialize action output schema")
             }
             VirtualPath::ActionScript { action_uuid } => {
-                let action = self.fetch_action_or_err(action_uuid, "/action")?;
+                let action = self.fetch_action_or_err(action_uuid, &display_path(path))?;
                 Ok(action.script_source)
             }
             VirtualPath::ActionLatestInvocation { action_uuid } => {
-                let record = self.storage.latest_action_invocation(action_uuid)?;
-                serde_json::to_string_pretty(&record)
-                    .context("Failed to serialize latest action invocation")
+                self.latest_action_invocation_json(action_uuid)?
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        serde_json::to_string_pretty(&JsonValue::Null)
+                            .context("Failed to serialize empty action invocation")
+                    })
             }
             VirtualPath::CollectionActions { collection_uuid } => {
                 let bindings =
@@ -1439,21 +1221,6 @@ impl TriggerSdk {
                     })?;
                 Ok(collection.title)
             }
-            VirtualPath::CollectionTriggerUuid { collection_uuid } => {
-                let snapshot = self.things_list_snapshot_lite(device_id)?;
-                let collection = snapshot
-                    .collections
-                    .into_iter()
-                    .find(|item| item.uuid == *collection_uuid)
-                    .ok_or_else(|| {
-                        friendly_anyhow(
-                            &display_path(path),
-                            "collection_not_found",
-                            &format!("Collection '{}' was not found.", collection_uuid),
-                        )
-                    })?;
-                Ok(collection.trigger_uuid.unwrap_or_default())
-            }
             VirtualPath::ThingName { thing_uuid, .. } => {
                 let snapshot = self.things_list_snapshot_lite(device_id)?;
                 let thing = snapshot
@@ -1468,21 +1235,6 @@ impl TriggerSdk {
                         )
                     })?;
                 Ok(thing.title)
-            }
-            VirtualPath::ThingTriggerUuid { thing_uuid, .. } => {
-                let snapshot = self.things_list_snapshot_lite(device_id)?;
-                let thing = snapshot
-                    .things
-                    .into_iter()
-                    .find(|item| item.uuid == *thing_uuid)
-                    .ok_or_else(|| {
-                        friendly_anyhow(
-                            &display_path(path),
-                            "thing_not_found",
-                            &format!("Thing '{}' was not found.", thing_uuid),
-                        )
-                    })?;
-                Ok(thing.trigger_uuid.unwrap_or_default())
             }
             VirtualPath::ThingActions { thing_uuid, .. } => {
                 let bindings = self.resolve_thing_action_bindings(device_id, thing_uuid)?;
@@ -1536,7 +1288,7 @@ impl TriggerSdk {
             _ => Err(friendly_anyhow(
                 &display_path(path),
                 "read_unsupported",
-                "cat_tool only supports file nodes such as name, trigger, card.jsx, status, content.md, entries.{idx}, entries.{idx}.data.json, entries.{idx}.schema.json, rule.json, metadata.json, input.schema.json, output.schema.json, script.js, and latest-invocation.json.",
+                "cat_tool only supports file nodes such as name, card.jsx, status, content.md, entries.{idx}, entries.{idx}.data.json, entries.{idx}.schema.json, metadata.json, input.schema.json, output.schema.json, script.js, and latest-invocation.json.",
             )),
         }
     }
@@ -1742,8 +1494,6 @@ impl TriggerSdk {
                 title: title.to_string(),
                 collection_type: collection.collection_type,
                 app_id: collection.app_id.clone(),
-                trigger_uuid: collection.trigger_uuid.clone(),
-                trigger_uuid_patch: Default::default(),
                 created_at: None,
                 updated_at: None,
             },
@@ -1774,8 +1524,6 @@ impl TriggerSdk {
                 datatype: thing.datatype,
                 data: None,
                 collection_uuid: thing.collection_uuid,
-                trigger_uuid: thing.trigger_uuid,
-                trigger_uuid_patch: Default::default(),
                 parent_uuid: thing.parent_uuid,
                 created_at: None,
                 updated_at: None,
@@ -1803,20 +1551,6 @@ impl TriggerSdk {
         })
     }
 
-    fn fetch_trigger_or_err(
-        &self,
-        trigger_uuid: &str,
-        path: &str,
-    ) -> Result<crate::types::StoredTrigger> {
-        self.storage.fetch_trigger(trigger_uuid)?.ok_or_else(|| {
-            friendly_anyhow(
-                path,
-                "trigger_not_found",
-                &format!("Trigger '{}' was not found.", trigger_uuid),
-            )
-        })
-    }
-
     fn fetch_action_or_err(
         &self,
         action_uuid: &str,
@@ -1829,69 +1563,5 @@ impl TriggerSdk {
                 &format!("Action '{}' was not found.", action_uuid),
             )
         })
-    }
-
-    fn update_trigger_name(&self, trigger_uuid: &str, name: &str) -> Result<()> {
-        let existing =
-            self.fetch_trigger_or_err(trigger_uuid, &format!("/trigger/{trigger_uuid}/name"))?;
-        let registration = TriggerRegistration {
-            trigger_uuid: existing.trigger_uuid.clone(),
-            name: name.to_string(),
-            version: existing.version.clone(),
-            precondition: parse_rules(&existing.precondition_json)?,
-            condition: parse_rules(&existing.condition_json)?,
-            action_uuid: existing.action_uuid.clone(),
-            action_args: serde_json::from_str(&existing.action_args_json)
-                .unwrap_or_else(|_| JsonValue::Object(Default::default())),
-        };
-        self.register_trigger(registration)?;
-        Ok(())
-    }
-
-    fn update_trigger_rule(&self, trigger_uuid: &str, rule: &JsonValue) -> Result<()> {
-        let existing =
-            self.fetch_trigger_or_err(trigger_uuid, &format!("/trigger/{trigger_uuid}/rule.json"))?;
-        let registration = TriggerRegistration {
-            trigger_uuid: existing.trigger_uuid.clone(),
-            name: existing.name,
-            version: rule
-                .get("version")
-                .and_then(JsonValue::as_str)
-                .unwrap_or(existing.version.as_str())
-                .to_string(),
-            precondition: parse_rules_value(rule.get("precondition"))?,
-            condition: parse_rules_value(rule.get("condition"))?,
-            action_uuid: existing.action_uuid.clone(),
-            action_args: serde_json::from_str(&existing.action_args_json)
-                .unwrap_or_else(|_| JsonValue::Object(Default::default())),
-        };
-        self.register_trigger(registration)?;
-        Ok(())
-    }
-
-    fn update_trigger_action(
-        &self,
-        trigger_uuid: &str,
-        binding: Option<&(String, JsonValue)>,
-    ) -> Result<()> {
-        let existing = self.fetch_trigger_or_err(
-            trigger_uuid,
-            &format!("/trigger/{trigger_uuid}/action.json"),
-        )?;
-        let (action_uuid, action_args) = match binding {
-            Some((action_uuid, action_args)) => (Some(action_uuid.clone()), action_args.clone()),
-            None => (None, JsonValue::Object(Default::default())),
-        };
-        let registration = TriggerRegistration {
-            trigger_uuid: existing.trigger_uuid.clone(),
-            name: existing.name,
-            version: existing.version,
-            precondition: parse_rules(&existing.precondition_json)?,
-            condition: parse_rules(&existing.condition_json)?,
-            action_uuid,
-            action_args,
-        };
-        self.register_trigger(registration)?;
-        Ok(())
     }
 }

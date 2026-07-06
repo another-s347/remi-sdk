@@ -1,7 +1,7 @@
 use remi_things_crdt::{
     format_domain_datetime, parse_domain_datetime, CollectionId, ContentEntry, ContentEntryId,
-    ContentEntryPayload, FieldPatch, ThingCollectionEntry, ThingCollectionUpsert, ThingDatatype,
-    ThingEntry, ThingId, ThingStatus, ThingUpsert, ThingsChangeLogEntry, ThingsOperationType,
+    ContentEntryPayload, ThingCollectionEntry, ThingCollectionUpsert, ThingDatatype, ThingEntry,
+    ThingId, ThingStatus, ThingUpsert, ThingsChangeLogEntry, ThingsOperationType,
     ThingsSnapshotState, ThingsSyncSummary, ThingsUndoPreview,
 };
 use serde_json::json;
@@ -12,14 +12,13 @@ fn dt(raw: &str) -> chrono::DateTime<chrono::Utc> {
 }
 
 #[test]
-fn sdk_facing_domain_models_keep_legacy_json_shape() {
+fn sdk_facing_domain_models_ignore_legacy_trigger_json_fields() {
     let collection = ThingCollectionEntry {
         uuid: "collection-1".to_string(),
         title: "Inbox".to_string(),
         collection_type: Default::default(),
         app_id: None,
         archived_at: None,
-        trigger_uuid: None,
         card_jsx: Some("<Card />".to_string()),
         created_at: dt("2026-01-01T00:00:00Z"),
         updated_at: dt("2026-01-02T00:00:00Z"),
@@ -33,7 +32,6 @@ fn sdk_facing_domain_models_keep_legacy_json_shape() {
         datatype: ThingDatatype::Text,
         data: json!({ "content": { "kind": "markdown" } }),
         collection_uuid: "collection-1".to_string(),
-        trigger_uuid: Some("trigger-1".to_string()),
         parent_uuid: None,
         archived_at: None,
         archived_from_collection_uuid: None,
@@ -55,94 +53,13 @@ fn sdk_facing_domain_models_keep_legacy_json_shape() {
     let encoded = serde_json::to_value(snapshot).unwrap();
     assert_eq!(encoded["collections"][0]["uuid"], "collection-1");
     assert_eq!(encoded["collections"][0]["card_jsx"], "<Card />");
-    assert!(encoded["collections"][0].get("trigger_uuid").is_none());
+    let legacy_binding_key = ["trigger", "uuid"].join("_");
+    assert!(encoded["collections"][0].get(&legacy_binding_key).is_none());
     assert_eq!(encoded["things"][0]["datatype"], "text");
-    assert_eq!(encoded["things"][0]["trigger_uuid"], "trigger-1");
+    assert!(encoded["things"][0].get(&legacy_binding_key).is_none());
     assert!(encoded["things"][0].get("parent_uuid").is_some());
     assert_eq!(encoded["dirty"], true);
     assert_eq!(encoded["last_sync_at"], "2026-01-03T00:00:00Z");
-}
-
-#[test]
-fn upsert_models_keep_compatibility_tri_state_fields() {
-    let collection = ThingCollectionUpsert {
-        uuid: "collection-1".to_string(),
-        title: "Inbox".to_string(),
-        collection_type: Default::default(),
-        app_id: None,
-        trigger_uuid_patch: FieldPatch::Noop,
-        trigger_uuid: Some(String::new()),
-        created_at: None,
-        updated_at: None,
-    };
-    let thing = ThingUpsert {
-        uuid: "thing-1".to_string(),
-        title: "Read plan".to_string(),
-        datatype: ThingDatatype::Text,
-        data: None,
-        collection_uuid: "collection-1".to_string(),
-        trigger_uuid_patch: FieldPatch::Noop,
-        trigger_uuid: Some(String::new()),
-        parent_uuid: None,
-        created_at: None,
-        updated_at: None,
-    };
-
-    let collection_json = serde_json::to_value(collection).unwrap();
-    let thing_json = serde_json::to_value(thing).unwrap();
-
-    assert_eq!(collection_json["trigger_uuid"], "");
-    assert!(collection_json.get("created_at").is_some());
-    assert_eq!(thing_json["trigger_uuid"], "");
-    assert!(thing_json.get("data").is_none());
-}
-
-#[test]
-fn compat_trigger_uuid_fields_adapt_to_explicit_patch() {
-    let noop = ThingCollectionUpsert {
-        uuid: "collection-1".to_string(),
-        title: "Inbox".to_string(),
-        collection_type: Default::default(),
-        app_id: None,
-        trigger_uuid_patch: FieldPatch::Noop,
-        trigger_uuid: None,
-        created_at: None,
-        updated_at: None,
-    };
-    assert_eq!(noop.trigger_uuid_patch(), FieldPatch::Noop);
-
-    let clear = ThingCollectionUpsert {
-        trigger_uuid: Some("  ".to_string()),
-        ..noop.clone()
-    };
-    assert_eq!(clear.trigger_uuid_patch(), FieldPatch::Clear);
-
-    let explicit_set = ThingCollectionUpsert {
-        trigger_uuid_patch: FieldPatch::Set("explicit-trigger".to_string()),
-        trigger_uuid: Some("legacy-trigger".to_string()),
-        ..noop.clone()
-    };
-    assert_eq!(
-        explicit_set.trigger_uuid_patch(),
-        FieldPatch::Set("explicit-trigger".to_string())
-    );
-
-    let set = ThingUpsert {
-        uuid: "thing-1".to_string(),
-        title: "Read plan".to_string(),
-        datatype: ThingDatatype::Text,
-        data: None,
-        collection_uuid: "collection-1".to_string(),
-        trigger_uuid_patch: FieldPatch::Noop,
-        trigger_uuid: Some(" trigger-1 ".to_string()),
-        parent_uuid: None,
-        created_at: None,
-        updated_at: None,
-    };
-    assert_eq!(
-        set.trigger_uuid_patch(),
-        FieldPatch::Set("trigger-1".to_string())
-    );
 }
 
 #[test]
@@ -164,7 +81,6 @@ fn thing_status_parses_and_serializes_storage_strings() {
         datatype: ThingDatatype::Text,
         data: json!({}),
         collection_uuid: "collection-1".to_string(),
-        trigger_uuid: None,
         parent_uuid: None,
         archived_at: None,
         archived_from_collection_uuid: None,
@@ -201,7 +117,6 @@ fn domain_id_newtypes_are_json_compatible_and_adapt_legacy_fields() {
         collection_type: Default::default(),
         app_id: None,
         archived_at: None,
-        trigger_uuid: None,
         card_jsx: None,
         created_at: dt("2026-01-01T00:00:00Z"),
         updated_at: dt("2026-01-02T00:00:00Z"),
@@ -217,7 +132,6 @@ fn domain_id_newtypes_are_json_compatible_and_adapt_legacy_fields() {
         datatype: ThingDatatype::Text,
         data: json!({}),
         collection_uuid: collection_id.to_string(),
-        trigger_uuid: None,
         archived_at: None,
         archived_from_collection_uuid: None,
         parent_uuid: Some("parent-1".to_string()),
@@ -253,7 +167,6 @@ fn domain_time_adapters_parse_rfc3339_without_changing_json_shape() {
         collection_type: Default::default(),
         app_id: None,
         archived_at: None,
-        trigger_uuid: None,
         card_jsx: None,
         created_at: dt("2026-01-01T08:00:00+08:00"),
         updated_at: dt("2026-01-02T00:00:00Z"),
@@ -276,7 +189,6 @@ fn domain_time_adapters_parse_rfc3339_without_changing_json_shape() {
         datatype: ThingDatatype::Text,
         data: json!({}),
         collection_uuid: "collection-1".to_string(),
-        trigger_uuid: None,
         parent_uuid: None,
         archived_at: None,
         archived_from_collection_uuid: None,
@@ -299,8 +211,6 @@ fn domain_time_adapters_parse_rfc3339_without_changing_json_shape() {
         datatype: ThingDatatype::Text,
         data: None,
         collection_uuid: "collection-1".to_string(),
-        trigger_uuid_patch: FieldPatch::Noop,
-        trigger_uuid: None,
         parent_uuid: None,
         created_at: Some("2026-01-01T00:00:00Z".to_string()),
         updated_at: None,
@@ -336,8 +246,6 @@ fn domain_time_adapters_reject_invalid_timestamps() {
         title: "Inbox".to_string(),
         collection_type: Default::default(),
         app_id: None,
-        trigger_uuid_patch: FieldPatch::Noop,
-        trigger_uuid: None,
         created_at: Some("2026-99-99T00:00:00Z".to_string()),
         updated_at: None,
     };

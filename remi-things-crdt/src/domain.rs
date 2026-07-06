@@ -285,8 +285,6 @@ pub struct ThingCollectionEntry {
     )]
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_uuid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card_jsx: Option<String>,
     #[serde(with = "rfc3339_utc")]
     pub created_at: DateTime<Utc>,
@@ -311,15 +309,6 @@ pub struct ThingCollectionUpsert {
     pub collection_type: CollectionType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
-    /// Explicit trigger binding patch. Prefer this over `trigger_uuid`.
-    #[serde(default, skip_serializing_if = "FieldPatch::is_noop")]
-    pub trigger_uuid_patch: FieldPatch<String>,
-    /// Deprecated compatibility field:
-    /// - key omitted / null => no change
-    /// - empty string => clear
-    /// - UUID string => set
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_uuid: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
     #[serde(default)]
@@ -337,10 +326,6 @@ impl ThingCollectionEntry {
 
     pub fn updated_at_utc(&self) -> Result<DateTime<Utc>, String> {
         Ok(self.updated_at)
-    }
-
-    pub fn trigger_uuid_patch(&self) -> FieldPatch<String> {
-        FieldPatch::from_compat_option_str(self.trigger_uuid.as_deref())
     }
 
     pub fn is_system_collection(&self) -> bool {
@@ -363,13 +348,6 @@ impl ThingCollectionUpsert {
     pub fn updated_at_utc(&self) -> Result<Option<DateTime<Utc>>, String> {
         parse_optional_domain_datetime(self.updated_at.as_deref())
     }
-
-    pub fn trigger_uuid_patch(&self) -> FieldPatch<String> {
-        match &self.trigger_uuid_patch {
-            FieldPatch::Noop => FieldPatch::from_compat_option_str(self.trigger_uuid.as_deref()),
-            patch => patch.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -379,8 +357,6 @@ pub struct ThingEntry {
     pub datatype: ThingDatatype,
     pub data: Value,
     pub collection_uuid: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_uuid: Option<String>,
     #[serde(default)]
     pub parent_uuid: Option<String>,
     #[serde(
@@ -440,10 +416,6 @@ impl ThingEntry {
             .and_then(DateTime::<Utc>::from_timestamp_millis)
     }
 
-    pub fn trigger_uuid_patch(&self) -> FieldPatch<String> {
-        FieldPatch::from_compat_option_str(self.trigger_uuid.as_deref())
-    }
-
     pub fn status_enum(&self) -> Result<ThingStatus, String> {
         ThingStatus::from_str(&self.status)
     }
@@ -459,15 +431,6 @@ pub struct ThingUpsert {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
     pub collection_uuid: String,
-    /// Explicit trigger binding patch. Prefer this over `trigger_uuid`.
-    #[serde(default, skip_serializing_if = "FieldPatch::is_noop")]
-    pub trigger_uuid_patch: FieldPatch<String>,
-    /// Deprecated compatibility field:
-    /// - key omitted / null => no change
-    /// - empty string => clear
-    /// - UUID string => set
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_uuid: Option<String>,
     #[serde(default)]
     pub parent_uuid: Option<String>,
     #[serde(default)]
@@ -497,13 +460,6 @@ impl ThingUpsert {
 
     pub fn updated_at_utc(&self) -> Result<Option<DateTime<Utc>>, String> {
         parse_optional_domain_datetime(self.updated_at.as_deref())
-    }
-
-    pub fn trigger_uuid_patch(&self) -> FieldPatch<String> {
-        match &self.trigger_uuid_patch {
-            FieldPatch::Noop => FieldPatch::from_compat_option_str(self.trigger_uuid.as_deref()),
-            patch => patch.clone(),
-        }
     }
 }
 

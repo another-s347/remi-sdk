@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use super::TriggerSdk;
+use super::RemiSdk;
 use crate::things_local::BootstrapStashedDocument;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,7 +11,7 @@ struct BootstrapStashPayload {
     documents: Vec<BootstrapStashedDocument>,
 }
 
-impl TriggerSdk {
+impl RemiSdk {
     /// Get a single CRDT document by key (uuid + data_type).
     pub fn crdt_get_document(
         &self,

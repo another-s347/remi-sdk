@@ -1,4 +1,4 @@
-use remi_things_crdt::{Block, Content, FieldPatch, Op, ThingDatatype, TriggerUpdate};
+use remi_things_crdt::{Block, Content, FieldPatch, Op, ThingDatatype};
 
 #[test]
 fn splice_text_missing_block_id_returns_error() {
@@ -16,7 +16,6 @@ fn splice_text_missing_block_id_returns_error() {
             status_timestamp_ms: None,
             title: Some("t".to_string()),
             parent_id: FieldPatch::Noop,
-            trigger: TriggerUpdate::Noop,
             content: Some(Content::Markdown {
                 blocks: vec![Block {
                     id: "b1".to_string(),

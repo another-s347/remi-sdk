@@ -52,19 +52,6 @@ pub(super) fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
         .collect::<Vec<_>>();
 
     match segments.as_slice() {
-        ["trigger"] => Ok(VirtualPath::TriggerRoot),
-        ["trigger", trigger_uuid] => Ok(VirtualPath::TriggerDir {
-            trigger_uuid: (*trigger_uuid).to_string(),
-        }),
-        ["trigger", trigger_uuid, "name"] => Ok(VirtualPath::TriggerName {
-            trigger_uuid: (*trigger_uuid).to_string(),
-        }),
-        ["trigger", trigger_uuid, "rule.json"] => Ok(VirtualPath::TriggerRule {
-            trigger_uuid: (*trigger_uuid).to_string(),
-        }),
-        ["trigger", trigger_uuid, "action.json"] => Ok(VirtualPath::TriggerAction {
-            trigger_uuid: (*trigger_uuid).to_string(),
-        }),
         ["action"] => Ok(VirtualPath::ActionRoot),
         ["action", action_uuid] => Ok(VirtualPath::ActionDir {
             action_uuid: (*action_uuid).to_string(),
@@ -96,12 +83,6 @@ pub(super) fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
         ["collection", collection_uuid, "name"] => Ok(VirtualPath::CollectionName {
             collection_uuid: (*collection_uuid).to_string(),
         }),
-        ["collection", collection_uuid, "trigger"]
-        | ["collection", collection_uuid, "trigger_uuid"] => {
-            Ok(VirtualPath::CollectionTriggerUuid {
-                collection_uuid: (*collection_uuid).to_string(),
-            })
-        }
         ["collection", collection_uuid, "card.jsx"] => Ok(VirtualPath::CollectionCardJsx {
             collection_uuid: (*collection_uuid).to_string(),
         }),
@@ -121,23 +102,6 @@ pub(super) fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
                 thing_uuid: (*thing_uuid).to_string(),
             })
         }
-        [
-            "collection",
-            collection_uuid,
-            "things",
-            thing_uuid,
-            "trigger",
-        ]
-        | [
-            "collection",
-            collection_uuid,
-            "things",
-            thing_uuid,
-            "trigger_uuid",
-        ] => Ok(VirtualPath::ThingTriggerUuid {
-            collection_uuid: (*collection_uuid).to_string(),
-            thing_uuid: (*thing_uuid).to_string(),
-        }),
         [
             "collection",
             collection_uuid,
@@ -245,42 +209,9 @@ pub(super) fn parse_virtual_path(path: &str) -> Result<VirtualPath> {
         _ => Err(friendly_anyhow(
             path,
             "invalid_path",
-            "Unsupported path. Expected /trigger/..., /action/..., or /collection/... according to the virtual filesystem contract.",
+            "Unsupported path. Expected /action/... or /collection/... according to the virtual filesystem contract.",
         )),
     }
-}
-
-pub(super) fn render_trigger_listing(
-    triggers: &[crate::types::TriggerInfo],
-    limit_preview: bool,
-) -> Vec<TreeNode> {
-    let mut nodes = triggers
-        .iter()
-        .take(if limit_preview {
-            TRIGGER_PREVIEW_LIMIT
-        } else {
-            triggers.len()
-        })
-        .map(|trigger| TreeNode::new(format!("{}/", trigger.trigger_id)))
-        .collect::<Vec<_>>();
-
-    if limit_preview && triggers.len() > TRIGGER_PREVIEW_LIMIT {
-        nodes.push(TreeNode::new(format!(
-            "Has {} More",
-            triggers.len() - TRIGGER_PREVIEW_LIMIT
-        )));
-    }
-
-    if !limit_preview {
-        for (node, trigger) in nodes.iter_mut().zip(triggers.iter()) {
-            node.children = vec![
-                TreeNode::new(format!("name [value=\"{}\"]", trigger.name)),
-                TreeNode::new("rule.json"),
-            ];
-        }
-    }
-
-    nodes
 }
 
 pub(super) fn render_action_listing(
@@ -338,10 +269,6 @@ pub(super) fn render_collection_listing(
         .map(|collection| {
             let mut children = vec![
                 TreeNode::new(format!("name [value=\"{}\"]", collection.title)),
-                TreeNode::new(format!(
-                    "trigger [value=\"{}\"]",
-                    collection.trigger_uuid.clone().unwrap_or_default()
-                )),
                 TreeNode::new("card.jsx"),
                 TreeNode::new("actions.json"),
             ];
@@ -375,10 +302,6 @@ pub(super) fn collection_dir_children(
 
     Ok(vec![
         TreeNode::new(format!("name [value=\"{}\"]", collection.title)),
-        TreeNode::new(format!(
-            "trigger [value=\"{}\"]",
-            collection.trigger_uuid.clone().unwrap_or_default()
-        )),
         TreeNode::new("card.jsx"),
         TreeNode::new("actions.json"),
         TreeNode::with_children(
@@ -421,10 +344,6 @@ pub(super) fn thing_dir_children(
 
     let mut children = vec![
         TreeNode::new(format!("name [value=\"{}\"]", thing.title)),
-        TreeNode::new(format!(
-            "trigger [value=\"{}\"]",
-            thing.trigger_uuid.clone().unwrap_or_default()
-        )),
         TreeNode::new("actions.json"),
         thing_status_node(&thing.status),
         TreeNode::new("content.md"),
@@ -458,10 +377,6 @@ pub(super) fn render_thing_nodes(
         .iter()
         .map(|thing| {
             let mut children = vec![
-                TreeNode::new(format!(
-                    "trigger [value=\"{}\"]",
-                    thing.trigger_uuid.clone().unwrap_or_default()
-                )),
                 TreeNode::new("actions.json"),
                 thing_status_node(&thing.status),
             ];
@@ -517,41 +432,6 @@ pub(super) fn render_tree_child(
     }
 }
 
-pub(super) fn parse_rule_json(path: &str, value: Option<&JsonValue>) -> Result<JsonValue> {
-    let Some(value) = value else {
-        return Err(friendly_anyhow(
-            path,
-            "invalid_value",
-            "Editing rule.json requires an object value or a JSON string.",
-        ));
-    };
-
-    match value {
-        JsonValue::Object(_) => Ok(value.clone()),
-        JsonValue::String(text) => serde_json::from_str::<JsonValue>(text).map_err(|error| {
-            friendly_anyhow(
-                path,
-                "invalid_rule_json",
-                &format!("rule.json must be valid JSON: {error}"),
-            )
-        }),
-        _ => Err(friendly_anyhow(
-            path,
-            "invalid_value",
-            "rule.json requires a JSON object or string.",
-        )),
-    }
-}
-
-pub(super) fn parse_rules(raw: &str) -> Result<Vec<TriggerRule>> {
-    serde_json::from_str(raw).context("Failed to decode stored trigger rules")
-}
-
-pub(super) fn parse_rules_value(value: Option<&JsonValue>) -> Result<Vec<TriggerRule>> {
-    let value = value.ok_or_else(|| anyhow!("Missing trigger rule section"))?;
-    serde_json::from_value(value.clone()).context("Failed to decode trigger rules")
-}
-
 pub(super) fn parse_action_args_json(path: &str, content: Option<&str>) -> Result<JsonValue> {
     match content.map(str::trim).filter(|value| !value.is_empty()) {
         Some(raw) => serde_json::from_str::<JsonValue>(raw).map_err(|error| {
@@ -563,64 +443,6 @@ pub(super) fn parse_action_args_json(path: &str, content: Option<&str>) -> Resul
         }),
         None => Ok(JsonValue::Object(Default::default())),
     }
-}
-
-pub(super) fn parse_trigger_action_binding_value(
-    path: &str,
-    value: Option<&JsonValue>,
-) -> Result<Option<(String, JsonValue)>> {
-    let Some(value) = value else {
-        return Err(friendly_anyhow(
-            path,
-            "invalid_value",
-            "Editing action.json requires null, a JSON object, or a JSON string.",
-        ));
-    };
-
-    if value.is_null() {
-        return Ok(None);
-    }
-
-    if let Some(text) = value.as_str() {
-        if text.trim().is_empty() {
-            return Ok(None);
-        }
-        let parsed = serde_json::from_str::<JsonValue>(text).map_err(|error| {
-            friendly_anyhow(
-                path,
-                "invalid_value",
-                &format!("action.json string value must be valid JSON: {error}"),
-            )
-        })?;
-        return parse_trigger_action_binding_value(path, Some(&parsed));
-    }
-
-    let object = value.as_object().ok_or_else(|| {
-        friendly_anyhow(
-            path,
-            "invalid_value",
-            "action.json must be null or an object like { action_uuid, args_json }.",
-        )
-    })?;
-
-    let action_uuid = object
-        .get("action_uuid")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            friendly_anyhow(
-                path,
-                "missing_action_uuid",
-                "action.json requires a non-empty action_uuid when setting a binding.",
-            )
-        })?
-        .to_string();
-    let args_json = object
-        .get("args_json")
-        .cloned()
-        .unwrap_or_else(|| JsonValue::Object(Default::default()));
-    Ok(Some((action_uuid, args_json)))
 }
 
 pub(super) fn parse_entity_action_bindings_value(
@@ -687,13 +509,6 @@ pub(super) fn normalize_operation(operation: &str) -> &str {
 pub(super) fn display_path(path: &VirtualPath) -> String {
     match path {
         VirtualPath::Root => ROOT_PATH.to_string(),
-        VirtualPath::TriggerRoot => "/trigger".to_string(),
-        VirtualPath::TriggerDir { trigger_uuid } => format!("/trigger/{trigger_uuid}"),
-        VirtualPath::TriggerName { trigger_uuid } => format!("/trigger/{trigger_uuid}/name"),
-        VirtualPath::TriggerRule { trigger_uuid } => format!("/trigger/{trigger_uuid}/rule.json"),
-        VirtualPath::TriggerAction { trigger_uuid } => {
-            format!("/trigger/{trigger_uuid}/action.json")
-        }
         VirtualPath::ActionRoot => "/action".to_string(),
         VirtualPath::ActionDir { action_uuid } => format!("/action/{action_uuid}"),
         VirtualPath::ActionName { action_uuid } => format!("/action/{action_uuid}/name"),
@@ -715,9 +530,6 @@ pub(super) fn display_path(path: &VirtualPath) -> String {
         VirtualPath::CollectionName { collection_uuid } => {
             format!("/collection/{collection_uuid}/name")
         }
-        VirtualPath::CollectionTriggerUuid { collection_uuid } => {
-            format!("/collection/{collection_uuid}/trigger")
-        }
         VirtualPath::CollectionCardJsx { collection_uuid } => {
             format!("/collection/{collection_uuid}/card.jsx")
         }
@@ -735,10 +547,6 @@ pub(super) fn display_path(path: &VirtualPath) -> String {
             collection_uuid,
             thing_uuid,
         } => format!("/collection/{collection_uuid}/things/{thing_uuid}/name"),
-        VirtualPath::ThingTriggerUuid {
-            collection_uuid,
-            thing_uuid,
-        } => format!("/collection/{collection_uuid}/things/{thing_uuid}/trigger"),
         VirtualPath::ThingActions {
             collection_uuid,
             thing_uuid,

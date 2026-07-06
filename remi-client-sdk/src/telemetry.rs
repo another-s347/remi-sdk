@@ -33,14 +33,13 @@ struct ReportPayload {
     generated_at: String,
     #[serde(rename = "eventCount")]
     event_count: u64,
-    events: Vec<EventPayload>,
+    events: Vec<TelemetryEventPayload>,
     manual: bool,
-    trigger: String,
 }
 
 /// Internal event payload structure for JSON deserialization
 #[derive(Debug, Deserialize)]
-struct EventPayload {
+struct TelemetryEventPayload {
     #[serde(rename = "type")]
     event_type: String,
     #[serde(deserialize_with = "deserialize_event_timestamp")]
@@ -128,7 +127,6 @@ fn map_report_payload(payload: ReportPayload) -> Result<TelemetryReport, String>
         event_count: payload.event_count,
         events,
         manual: payload.manual,
-        trigger: payload.trigger,
     })
 }
 

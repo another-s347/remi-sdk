@@ -1,4 +1,4 @@
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 pub use remi_things_crdt::{
     ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
     ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption,
@@ -11,72 +11,6 @@ use std::str::FromStr;
 // ============================================================================
 // Things Change Log Types
 // ============================================================================
-
-/// Generic event payload - event type definitions are decoupled from SDK.
-/// The SDK stores and manages abstract events; concrete event types (schemas,
-/// validation, special handling) are defined on the application side.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventPayload {
-    /// Event type identifier (e.g., "Connectivity", "Location", "System")
-    #[serde(rename = "type")]
-    pub event_type: String,
-    /// Timestamp when the event occurred
-    #[serde(with = "event_timestamp")]
-    pub timestamp: DateTime<Utc>,
-    /// Event metadata as JSON object - structure is defined by event type
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-/// Stored event representation (from database)
-#[derive(Debug, Clone)]
-pub struct StoredEvent {
-    pub event_type: String,
-    pub timestamp: DateTime<Utc>,
-    pub metadata: Value,
-}
-
-impl From<StoredEvent> for EventPayload {
-    fn from(value: StoredEvent) -> Self {
-        Self {
-            event_type: value.event_type,
-            timestamp: value.timestamp,
-            metadata: value.metadata,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerRule {
-    pub rule: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerRegistration {
-    pub trigger_uuid: String,
-    pub name: String,
-    #[serde(default)]
-    pub version: String,
-    pub precondition: Vec<TriggerRule>,
-    pub condition: Vec<TriggerRule>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action_uuid: Option<String>,
-    #[serde(default = "default_empty_object")]
-    pub action_args: Value,
-}
-
-#[derive(Debug, Clone)]
-pub struct StoredTrigger {
-    pub trigger_uuid: String,
-    pub name: String,
-    pub version: String,
-    pub precondition_json: String,
-    pub condition_json: String,
-    pub next_fire: Option<DateTime<Utc>>,
-    pub action_uuid: Option<String>,
-    pub action_args_json: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionDefinition {
@@ -97,7 +31,6 @@ pub struct ActionDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionInvocationSourceKind {
-    Trigger,
     CollectionManual,
     ThingManual,
     System,
@@ -106,7 +39,6 @@ pub enum ActionInvocationSourceKind {
 impl ActionInvocationSourceKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Trigger => "trigger",
             Self::CollectionManual => "collection_manual",
             Self::ThingManual => "thing_manual",
             Self::System => "system",
@@ -125,7 +57,6 @@ impl FromStr for ActionInvocationSourceKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "trigger" => Ok(Self::Trigger),
             "collection_manual" => Ok(Self::CollectionManual),
             "thing_manual" => Ok(Self::ThingManual),
             "system" => Ok(Self::System),
@@ -182,108 +113,12 @@ pub struct ResolvedEntityActionBinding {
     pub action_missing: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TriggerRunType {
-    Automatic,
-    Manual,
-    Replay,
-}
-
-impl TriggerRunType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TriggerRunType::Automatic => "automatic",
-            TriggerRunType::Manual => "manual",
-            TriggerRunType::Replay => "replay",
-        }
-    }
-}
-
-impl fmt::Display for TriggerRunType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for TriggerRunType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "automatic" => Ok(Self::Automatic),
-            "manual" => Ok(Self::Manual),
-            "replay" => Ok(Self::Replay),
-            other => Err(format!("Unsupported trigger run type '{other}'")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerExecutionSummary {
-    pub trigger_id: String,
-    pub name: String,
-    pub fired_at: DateTime<Utc>,
-    pub result: bool,
-    pub run_type: TriggerRunType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notification_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum TriggerLogLevel {
-    Info,
-    Warning,
-    Error,
-}
-
-impl TriggerLogLevel {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TriggerLogLevel::Info => "info",
-            TriggerLogLevel::Warning => "warning",
-            TriggerLogLevel::Error => "error",
-        }
-    }
-}
-
-impl fmt::Display for TriggerLogLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for TriggerLogLevel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "info" => Ok(Self::Info),
-            "warning" => Ok(Self::Warning),
-            "error" => Ok(Self::Error),
-            other => Err(format!("Unsupported trigger log level '{other}'")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerLogEntry {
-    pub trigger_id: String,
-    pub level: TriggerLogLevel,
-    pub message: String,
-    pub fire_time: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-    pub run_type: TriggerRunType,
-}
-
 // ===== Notification Types =====
 
 /// The originating subsystem of a notification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationSource {
-    Trigger,
     Push,
     System,
     Chat,
@@ -292,7 +127,6 @@ pub enum NotificationSource {
 impl NotificationSource {
     pub fn as_str(&self) -> &'static str {
         match self {
-            NotificationSource::Trigger => "trigger",
             NotificationSource::Push => "push",
             NotificationSource::System => "system",
             NotificationSource::Chat => "chat",
@@ -311,7 +145,6 @@ impl FromStr for NotificationSource {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "trigger" => Ok(Self::Trigger),
             "push" => Ok(Self::Push),
             "system" => Ok(Self::System),
             "chat" => Ok(Self::Chat),
@@ -361,7 +194,7 @@ impl FromStr for NotificationResponseAction {
 pub struct NotificationEntry {
     pub id: i64,
     pub source: NotificationSource,
-    /// Grouping key – for trigger notifications this is the trigger_uuid.
+    /// Grouping key for related notifications.
     pub category: String,
     /// Human-readable title for the notification (e.g. trigger name).
     pub title: String,
@@ -385,42 +218,6 @@ pub struct NotificationGroup {
     pub unread_count: i64,
     pub total_count: i64,
     pub items: Vec<NotificationEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerReplaySummary {
-    pub trigger_id: String,
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
-    pub runs_considered: u32,
-    pub runs_executed: u32,
-    pub runs_succeeded: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerInfo {
-    pub trigger_id: String,
-    pub name: String,
-    pub version: String,
-    pub precondition: Vec<TriggerRule>,
-    pub condition: Vec<TriggerRule>,
-    pub next_fire: Option<DateTime<Utc>>,
-    pub last_result: Option<bool>,
-    /// Whether this trigger is paused (won't fire even when due).
-    #[serde(default)]
-    pub is_paused: bool,
-    /// The entity type this trigger is currently bound to ("thing" or "collection"), if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bind_type: Option<String>,
-    /// The UUID of the entity this trigger is currently bound to, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bind_uuid: Option<String>,
-    /// The UUID of the action bound to this trigger, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_uuid: Option<String>,
-    /// Trigger-owned action invocation arguments.
-    #[serde(default = "default_empty_object")]
-    pub action_args: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -566,77 +363,6 @@ pub struct EvalDatasetRunEval {
     pub rationale: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-mod event_timestamp {
-    use super::*;
-    use serde::de::{Error as DeError, Visitor};
-    use serde::{Deserializer, Serializer};
-
-    pub fn serialize<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_i64(value.timestamp())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct TsVisitor;
-
-        impl<'de> Visitor<'de> for TsVisitor {
-            type Value = DateTime<Utc>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a unix timestamp in seconds or RFC3339 string")
-            }
-
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                timestamp_from_seconds(value)
-                    .ok_or_else(|| DeError::custom(format!("Invalid unix timestamp: {value}")))
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                let secs = i64::try_from(value).map_err(|_| {
-                    DeError::custom(format!("Unix timestamp out of range: {value}"))
-                })?;
-                self.visit_i64(secs)
-            }
-
-            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                self.visit_i64(value as i64)
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                if let Ok(int_val) = value.parse::<i64>() {
-                    return self.visit_i64(int_val);
-                }
-                DateTime::parse_from_rfc3339(value)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|err| DeError::custom(format!("Invalid timestamp '{value}': {err}")))
-            }
-        }
-
-        deserializer.deserialize_any(TsVisitor)
-    }
-
-    fn timestamp_from_seconds(secs: i64) -> Option<DateTime<Utc>> {
-        Utc.timestamp_opt(secs, 0).single()
-    }
 }
 
 // ============================================================================

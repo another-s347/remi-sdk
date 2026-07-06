@@ -57,8 +57,8 @@ pub use extract::{
     ExtractOptions,
 };
 pub use markdown::{decode_markdown_only_content, decode_markdown_only_thing, MarkdownOnlyDecoded};
-pub use materialize::{BindingRow, CollectionRow, MaterializePlan, ThingRow, View};
-pub use ops::{apply_op, Block, Content, Op, TriggerUpdate};
+pub use materialize::{CollectionRow, MaterializePlan, ThingRow, View};
+pub use ops::{apply_op, Block, Content, Op};
 // V3 operations
 pub use ops::{
     apply_collection_op, apply_root_op, apply_thing_markdown_op, CollectionOp, RootOp,

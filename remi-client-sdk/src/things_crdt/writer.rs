@@ -205,7 +205,6 @@ impl<'a> ThingsDomainWriter<'a> {
         collection_uuid: &str,
         title: Option<String>,
         status: Option<String>,
-        trigger: TriggerUpdate,
         attrs_json: Option<String>,
     ) -> Result<()> {
         self.apply_collection_update(
@@ -213,7 +212,6 @@ impl<'a> ThingsDomainWriter<'a> {
             CollectionOp::UpdateMeta {
                 title,
                 status,
-                trigger,
                 attrs_json,
             },
         )
@@ -250,7 +248,6 @@ impl<'a> ThingsDomainWriter<'a> {
         status: Option<String>,
         title: Option<String>,
         parent_uuid: Option<String>,
-        trigger: TriggerUpdate,
         attrs_json: Option<String>,
     ) -> Result<()> {
         self.ensure_live_collection_exists(collection_uuid)?;
@@ -263,7 +260,6 @@ impl<'a> ThingsDomainWriter<'a> {
                 status_timestamp_ms: None,
                 title,
                 parent_id: FieldPatch::from_compat_option_str(parent_uuid.as_deref()),
-                trigger,
                 built_in: None,
                 attrs_json,
             },
@@ -306,7 +302,6 @@ impl<'a> ThingsDomainWriter<'a> {
                 status_timestamp_ms: None,
                 title: None,
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 built_in: Some(built_in),
                 attrs_json: None,
             },
@@ -343,7 +338,6 @@ impl<'a> ThingsDomainWriter<'a> {
                 status_timestamp_ms: None,
                 title: None,
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 built_in: Some(built_in),
                 attrs_json: None,
             },
@@ -370,7 +364,6 @@ impl<'a> ThingsDomainWriter<'a> {
                 status_timestamp_ms: None,
                 title: None,
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 built_in: Some(built_in),
                 attrs_json: None,
             },

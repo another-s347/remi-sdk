@@ -1,6 +1,6 @@
 use super::{DocumentPersistence, SnapshotOptions, ThingsDocumentSet, format_domain_datetime};
 use crate::things_events::{ThingsDocumentChangeKind, ThingsDocumentEvent};
-use remi_things_crdt::{ContentEntry, ContentEntryPayload, ThingDatatype, TriggerUpdate};
+use remi_things_crdt::{ContentEntry, ContentEntryPayload, ThingDatatype};
 use serde_json::{Value, json};
 
 #[test]
@@ -26,7 +26,6 @@ fn test_document_set_basic() {
         Some("none".to_string()),
         Some("My Task".to_string()),
         None,
-        TriggerUpdate::Noop,
     )
     .unwrap();
 
@@ -57,7 +56,6 @@ fn test_document_set_snapshot() {
         "coll-1",
         Some("My Collection".to_string()),
         None,
-        TriggerUpdate::Noop,
         Some("2026-01-01T00:00:00Z".to_string()),
         Some("2026-01-02T00:00:00Z".to_string()),
     )
@@ -69,7 +67,6 @@ fn test_document_set_snapshot() {
         Some("none".to_string()),
         Some("Task 1".to_string()),
         None,
-        TriggerUpdate::Noop,
         Some("2026-01-03T00:00:00Z".to_string()),
         Some("2026-01-04T00:00:00Z".to_string()),
     )
@@ -110,7 +107,6 @@ fn test_document_set_normalizes_rfc3339_timestamps_to_utc() {
         "coll-1",
         Some("My Collection".to_string()),
         None,
-        TriggerUpdate::Noop,
         Some("2026-01-01T08:00:00+08:00".to_string()),
         Some("2026-01-02T08:00:00+08:00".to_string()),
     )
@@ -135,7 +131,6 @@ fn test_document_set_rejects_invalid_timestamps_before_writing() {
             "coll-1",
             Some("My Collection".to_string()),
             None,
-            TriggerUpdate::Noop,
             Some("not-a-date".to_string()),
             None,
         )
@@ -151,7 +146,6 @@ fn test_document_set_rejects_invalid_timestamps_before_writing() {
             Some("none".to_string()),
             Some("Task 1".to_string()),
             None,
-            TriggerUpdate::Noop,
             None,
             Some("2026-99-99T00:00:00Z".to_string()),
         )
@@ -170,7 +164,6 @@ fn test_document_set_preserves_created_at_across_updates() {
         Some("none".to_string()),
         Some("Task 1".to_string()),
         None,
-        TriggerUpdate::Noop,
         Some("2026-01-03T00:00:00Z".to_string()),
         Some("2026-01-04T00:00:00Z".to_string()),
     )
@@ -182,7 +175,6 @@ fn test_document_set_preserves_created_at_across_updates() {
         Some("none".to_string()),
         Some("Task 1 renamed".to_string()),
         None,
-        TriggerUpdate::Noop,
         None,
         Some("2026-01-05T00:00:00Z".to_string()),
     )
@@ -205,12 +197,7 @@ fn test_document_events_follow_crdt_mutations() {
     let mut docs = ThingsDocumentSet::new("test-device");
 
     let collection_events = docs
-        .update_collection_meta(
-            "coll-1",
-            Some("Inbox".to_string()),
-            None,
-            TriggerUpdate::Noop,
-        )
+        .update_collection_meta("coll-1", Some("Inbox".to_string()), None)
         .unwrap();
     assert_eq!(
         collection_events,
@@ -228,7 +215,6 @@ fn test_document_events_follow_crdt_mutations() {
             Some("none".to_string()),
             Some("Task".to_string()),
             None,
-            TriggerUpdate::Noop,
         )
         .unwrap();
     assert_eq!(
@@ -331,7 +317,6 @@ fn first_splice_creates_main_markdown_block() {
             Some("none".to_string()),
             Some("Empty".to_string()),
             None,
-            TriggerUpdate::Noop,
         )
         .unwrap();
     assert_eq!(
@@ -373,7 +358,6 @@ fn replace_markdown_text_creates_main_block_when_missing() {
         Some("none".to_string()),
         Some("Overwrite".to_string()),
         None,
-        TriggerUpdate::Noop,
     )
     .unwrap();
 
@@ -405,7 +389,6 @@ fn test_upsert_thing_requires_existing_collection() {
             Some("none".to_string()),
             Some("Task 1".to_string()),
             None,
-            TriggerUpdate::Noop,
         )
         .expect_err("thing upsert without collection should fail");
 
@@ -427,7 +410,6 @@ fn test_live_reachability_skips_deleted_things() {
         Some("none".to_string()),
         Some("Task 1".to_string()),
         None,
-        TriggerUpdate::Noop,
     )
     .unwrap();
     docs.set_thing_markdown_text("thing-1", "hello").unwrap();

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use remi_client_sdk::TriggerSdk;
+use remi_client_sdk::RemiSdk;
 use remi_client_sdk::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
 use remi_client_sdk::things_local::SYSTEM_TRASH_COLLECTION_ID;
 use remi_things_crdt::{ROOT_DOC_UUID, extract_collection_doc_view, extract_root_view};
@@ -12,7 +12,7 @@ fn temp_db_path() -> Result<String> {
     Ok(path_str)
 }
 
-fn parse_snapshot(sdk: &TriggerSdk, device_id: &str) -> Result<serde_json::Value> {
+fn parse_snapshot(sdk: &RemiSdk, device_id: &str) -> Result<serde_json::Value> {
     let snapshot = sdk.things_list_snapshot(device_id)?;
     serde_json::to_value(snapshot).context("serialize snapshot")
 }
@@ -20,7 +20,7 @@ fn parse_snapshot(sdk: &TriggerSdk, device_id: &str) -> Result<serde_json::Value
 #[test]
 fn delete_collection_archives_metadata_and_survives_reload() -> Result<()> {
     let db_path = temp_db_path()?;
-    let sdk = TriggerSdk::initialize(&db_path).context("init sdk")?;
+    let sdk = RemiSdk::initialize(&db_path).context("init sdk")?;
     let device_id = "device-a";
 
     sdk.things_upsert_collection(
@@ -30,8 +30,6 @@ fn delete_collection_archives_metadata_and_survives_reload() -> Result<()> {
             title: "Inbox".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -44,8 +42,6 @@ fn delete_collection_archives_metadata_and_survives_reload() -> Result<()> {
             datatype: ThingDatatype::Markdown,
             data: Some(serde_json::json!({"markdown": "hello world"})),
             collection_uuid: "c1".to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -93,7 +89,7 @@ fn delete_collection_archives_metadata_and_survives_reload() -> Result<()> {
 
     drop(sdk);
 
-    let sdk = TriggerSdk::initialize(&db_path).context("re-init sdk")?;
+    let sdk = RemiSdk::initialize(&db_path).context("re-init sdk")?;
     let reloaded = parse_snapshot(&sdk, device_id)?;
     assert_eq!(reloaded["collections"].as_array().unwrap().len(), 3);
     assert_eq!(reloaded["things"].as_array().unwrap().len(), 1);
@@ -108,7 +104,7 @@ fn delete_collection_archives_metadata_and_survives_reload() -> Result<()> {
 #[test]
 fn delete_thing_archives_to_trash_and_keeps_content_after_reload() -> Result<()> {
     let db_path = temp_db_path()?;
-    let sdk = TriggerSdk::initialize(&db_path).context("init sdk")?;
+    let sdk = RemiSdk::initialize(&db_path).context("init sdk")?;
     let device_id = "device-a";
 
     sdk.things_upsert_collection(
@@ -118,8 +114,6 @@ fn delete_thing_archives_to_trash_and_keeps_content_after_reload() -> Result<()>
             title: "Inbox".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -132,8 +126,6 @@ fn delete_thing_archives_to_trash_and_keeps_content_after_reload() -> Result<()>
             datatype: ThingDatatype::Markdown,
             data: Some(serde_json::json!({"markdown": "hello world"})),
             collection_uuid: "c1".to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -158,7 +150,7 @@ fn delete_thing_archives_to_trash_and_keeps_content_after_reload() -> Result<()>
 
     drop(sdk);
 
-    let sdk = TriggerSdk::initialize(&db_path).context("re-init sdk")?;
+    let sdk = RemiSdk::initialize(&db_path).context("re-init sdk")?;
     let reloaded = parse_snapshot(&sdk, device_id)?;
     assert_eq!(reloaded["things"].as_array().unwrap().len(), 1);
     assert_eq!(

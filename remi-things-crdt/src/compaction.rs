@@ -35,17 +35,6 @@ pub fn compact_from_view(view: &View, actor: &str, new_epoch: u64) -> Result<Vec
         put_string(&mut doc, &clock, "actor", &c.edit_clock.actor)?;
         put_u64(&mut doc, &clock, "seq", c.edit_clock.seq)?;
 
-        if let Some(trig) = &c.trigger {
-            let t = ensure_map_key(&mut doc, &obj, "trigger")?;
-            put_string(&mut doc, &t, "state", &trig.state)?;
-            if let Some(uuid) = &trig.uuid {
-                put_string(&mut doc, &t, "uuid", uuid)?;
-            }
-            let tc = ensure_map_key(&mut doc, &t, "clock")?;
-            put_string(&mut doc, &tc, "actor", &trig.clock.actor)?;
-            put_u64(&mut doc, &tc, "seq", trig.clock.seq)?;
-        }
-
         if let Some(attrs) = &c.attrs {
             put_string(&mut doc, &obj, "attrs", &attrs.to_string())?;
         }
@@ -74,17 +63,6 @@ pub fn compact_from_view(view: &View, actor: &str, new_epoch: u64) -> Result<Vec
         let clock = ensure_map_key(&mut doc, &obj, "edit_clock")?;
         put_string(&mut doc, &clock, "actor", &t.edit_clock.actor)?;
         put_u64(&mut doc, &clock, "seq", t.edit_clock.seq)?;
-
-        if let Some(trig) = &t.trigger {
-            let tr = ensure_map_key(&mut doc, &obj, "trigger")?;
-            put_string(&mut doc, &tr, "state", &trig.state)?;
-            if let Some(uuid) = &trig.uuid {
-                put_string(&mut doc, &tr, "uuid", uuid)?;
-            }
-            let tc = ensure_map_key(&mut doc, &tr, "clock")?;
-            put_string(&mut doc, &tc, "actor", &trig.clock.actor)?;
-            put_u64(&mut doc, &tc, "seq", trig.clock.seq)?;
-        }
 
         if let Some(attrs) = &t.attrs {
             put_string(&mut doc, &obj, "attrs", &attrs.to_string())?;
@@ -223,18 +201,6 @@ fn rebuild_collection_doc(view: &CollectionDocView, actor: &str) -> Result<Vec<u
         let clock = ensure_map_key(&mut doc, &meta_obj, "edit_clock")?;
         put_string(&mut doc, &clock, "actor", &view.meta.edit_clock.actor)?;
         put_u64(&mut doc, &clock, "seq", view.meta.edit_clock.seq)?;
-
-        // Trigger
-        if let Some(trig) = &view.meta.trigger {
-            let t = ensure_map_key(&mut doc, &meta_obj, "trigger")?;
-            put_string(&mut doc, &t, "state", &trig.state)?;
-            if let Some(uuid) = &trig.uuid {
-                put_string(&mut doc, &t, "uuid", uuid)?;
-            }
-            let tc = ensure_map_key(&mut doc, &t, "clock")?;
-            put_string(&mut doc, &tc, "actor", &trig.clock.actor)?;
-            put_u64(&mut doc, &tc, "seq", trig.clock.seq)?;
-        }
     }
 
     // Things metadata
@@ -264,18 +230,6 @@ fn rebuild_collection_doc(view: &CollectionDocView, actor: &str) -> Result<Vec<u
             let clock = ensure_map_key(&mut doc, &obj, "edit_clock")?;
             put_string(&mut doc, &clock, "actor", &thing.edit_clock.actor)?;
             put_u64(&mut doc, &clock, "seq", thing.edit_clock.seq)?;
-
-            // Trigger
-            if let Some(trig) = &thing.trigger {
-                let tr = ensure_map_key(&mut doc, &obj, "trigger")?;
-                put_string(&mut doc, &tr, "state", &trig.state)?;
-                if let Some(uuid) = &trig.uuid {
-                    put_string(&mut doc, &tr, "uuid", uuid)?;
-                }
-                let tc = ensure_map_key(&mut doc, &tr, "clock")?;
-                put_string(&mut doc, &tc, "actor", &trig.clock.actor)?;
-                put_u64(&mut doc, &tc, "seq", trig.clock.seq)?;
-            }
         }
     }
 

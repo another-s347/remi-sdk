@@ -12,13 +12,6 @@ use crate::util::{
 use crate::ThingDatatype;
 
 #[derive(Debug, Clone)]
-pub enum TriggerUpdate {
-    Noop,
-    Clear,
-    Set(String),
-}
-
-#[derive(Debug, Clone)]
 pub struct Block {
     pub id: String,
     pub r#type: String,
@@ -46,7 +39,6 @@ pub enum Op {
         id: String,
         title: Option<String>,
         status: Option<String>,
-        trigger: TriggerUpdate,
     },
     DeleteCollection {
         id: String,
@@ -60,7 +52,6 @@ pub enum Op {
         status_timestamp_ms: Option<i64>,
         title: Option<String>,
         parent_id: FieldPatch<String>,
-        trigger: TriggerUpdate,
         content: Option<Content>,
     },
     DeleteThing {
@@ -131,19 +122,9 @@ pub fn apply_op(doc_bytes: &[u8], actor: &str, op: Op) -> Result<Vec<u8>> {
                 Ok(())
             }
 
-            Op::UpsertCollection {
-                id,
-                title,
-                status,
-                trigger,
-            } => upsert_collection(
-                doc,
-                actor,
-                &id,
-                title.as_deref(),
-                status.as_deref(),
-                trigger,
-            ),
+            Op::UpsertCollection { id, title, status } => {
+                upsert_collection(doc, actor, &id, title.as_deref(), status.as_deref())
+            }
             Op::DeleteCollection { id } => delete_collection(doc, actor, &id),
 
             Op::UpsertThing {
@@ -154,7 +135,6 @@ pub fn apply_op(doc_bytes: &[u8], actor: &str, op: Op) -> Result<Vec<u8>> {
                 status_timestamp_ms,
                 title,
                 parent_id,
-                trigger,
                 content,
             } => upsert_thing(
                 doc,
@@ -166,7 +146,6 @@ pub fn apply_op(doc_bytes: &[u8], actor: &str, op: Op) -> Result<Vec<u8>> {
                 status_timestamp_ms,
                 title.as_deref(),
                 parent_id,
-                trigger,
                 content,
             ),
             Op::DeleteThing { id } => delete_thing(doc, actor, &id),
@@ -325,46 +304,12 @@ fn validate_parent_reference(
     Ok(())
 }
 
-fn apply_trigger_update(
-    doc: &mut AutoCommit,
-    entity_obj: &ObjId,
-    actor: &str,
-    update: TriggerUpdate,
-) -> Result<()> {
-    match update {
-        TriggerUpdate::Noop => Ok(()),
-        TriggerUpdate::Clear => {
-            bump_entity_clock(doc, entity_obj, actor)?;
-            let trig = ensure_map_key(doc, entity_obj, "trigger")?;
-            put_string(doc, &trig, "state", "none")?;
-            let clock = ensure_map_key(doc, &trig, "clock")?;
-            let prev_seq = get_u64(doc, &clock, "seq")?.unwrap_or(0);
-            put_string(doc, &clock, "actor", actor)?;
-            put_u64(doc, &clock, "seq", prev_seq.saturating_add(1))?;
-            let _ = doc.delete(&trig, "uuid");
-            Ok(())
-        }
-        TriggerUpdate::Set(uuid) => {
-            bump_entity_clock(doc, entity_obj, actor)?;
-            let trig = ensure_map_key(doc, entity_obj, "trigger")?;
-            put_string(doc, &trig, "state", "some")?;
-            put_string(doc, &trig, "uuid", uuid.trim())?;
-            let clock = ensure_map_key(doc, &trig, "clock")?;
-            let prev_seq = get_u64(doc, &clock, "seq")?.unwrap_or(0);
-            put_string(doc, &clock, "actor", actor)?;
-            put_u64(doc, &clock, "seq", prev_seq.saturating_add(1))?;
-            Ok(())
-        }
-    }
-}
-
 fn upsert_collection(
     doc: &mut AutoCommit,
     actor: &str,
     id: &str,
     title: Option<&str>,
     status: Option<&str>,
-    trigger: TriggerUpdate,
 ) -> Result<()> {
     let collections = ensure_root_map(doc, &automerge::ROOT, Schema::KEY_COLLECTIONS)?;
     let obj = ensure_child_map(doc, &collections, id)?;
@@ -387,8 +332,6 @@ fn upsert_collection(
     if let Some(s) = status {
         put_string(doc, &obj, "status", s)?;
     }
-
-    apply_trigger_update(doc, &obj, actor, trigger)?;
 
     Ok(())
 }
@@ -469,7 +412,6 @@ fn upsert_thing(
     status_timestamp_ms: Option<i64>,
     title: Option<&str>,
     parent_id: FieldPatch<String>,
-    trigger: TriggerUpdate,
     content: Option<Content>,
 ) -> Result<()> {
     let (_things, obj) = ensure_thing_obj(doc, id)?;
@@ -521,8 +463,6 @@ fn upsert_thing(
         }
         FieldPatch::Noop => {}
     }
-
-    apply_trigger_update(doc, &obj, actor, trigger)?;
 
     if let Some(content) = content {
         set_content(doc, &obj, content)?;
@@ -890,7 +830,6 @@ pub enum CollectionOp {
     UpdateMeta {
         title: Option<String>,
         status: Option<String>,
-        trigger: TriggerUpdate,
         attrs_json: Option<String>,
     },
     /// Delete the collection (set tombstone)
@@ -903,7 +842,6 @@ pub enum CollectionOp {
         status_timestamp_ms: Option<i64>,
         title: Option<String>,
         parent_id: FieldPatch<String>,
-        trigger: TriggerUpdate,
         built_in: Option<ThingBuiltInFieldsUpdate>,
         attrs_json: Option<String>,
     },
@@ -1021,7 +959,6 @@ pub fn apply_collection_op(
         CollectionOp::UpdateMeta {
             title,
             status,
-            trigger,
             attrs_json,
         } => {
             let meta_obj = ensure_map_key(&mut doc, &automerge::ROOT, Schema::KEY_META)?;
@@ -1037,7 +974,6 @@ pub fn apply_collection_op(
             if let Some(attrs) = attrs_json {
                 put_string(&mut doc, &meta_obj, "attrs", &attrs)?;
             }
-            apply_trigger_update(&mut doc, &meta_obj, actor, trigger)?;
         }
         CollectionOp::Delete => {
             let meta_obj = ensure_map_key(&mut doc, &automerge::ROOT, Schema::KEY_META)?;
@@ -1050,7 +986,6 @@ pub fn apply_collection_op(
             status_timestamp_ms,
             title,
             parent_id,
-            trigger,
             built_in,
             attrs_json,
         } => {
@@ -1114,8 +1049,6 @@ pub fn apply_collection_op(
             if let Some(attrs) = attrs_json {
                 put_string(&mut doc, &thing_obj, "attrs", &attrs)?;
             }
-            apply_trigger_update(&mut doc, &thing_obj, actor, trigger)?;
-
             // Handle built_in fields
             if let Some(bi) = built_in {
                 apply_built_in_fields(&mut doc, &thing_obj, bi)?;
@@ -1600,7 +1533,6 @@ mod tests_v3 {
                 status_timestamp_ms: None,
                 title: Some("My Task".into()),
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
             },
@@ -1627,7 +1559,6 @@ mod tests_v3 {
                 status_timestamp_ms: None,
                 title: Some("My Task".into()),
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
             },
@@ -1708,7 +1639,6 @@ mod tests_v3 {
                 id: "coll-1".into(),
                 title: Some("Inbox".into()),
                 status: None,
-                trigger: TriggerUpdate::Noop,
             },
         )
         .unwrap();
@@ -1723,7 +1653,6 @@ mod tests_v3 {
                 status_timestamp_ms: None,
                 title: Some("My Task".into()),
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 content: None,
             },
         )
@@ -1757,7 +1686,6 @@ mod tests_v3 {
                 status_timestamp_ms: None,
                 title: Some("Child".into()),
                 parent_id: FieldPatch::Set("missing-parent".into()),
-                trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
             },
@@ -1785,7 +1713,6 @@ mod tests_v3 {
                 status_timestamp_ms: None,
                 title: Some("Parent".into()),
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
             },
@@ -1802,7 +1729,6 @@ mod tests_v3 {
                 status_timestamp_ms: None,
                 title: Some("Child".into()),
                 parent_id: FieldPatch::Set("parent".into()),
-                trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
             },
@@ -1820,7 +1746,6 @@ mod tests_v3 {
                 status_timestamp_ms: None,
                 title: None,
                 parent_id: FieldPatch::Set("child".into()),
-                trigger: TriggerUpdate::Noop,
                 built_in: None,
                 attrs_json: None,
             },

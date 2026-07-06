@@ -2,10 +2,9 @@ use crate::types::{
     ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, AgentVersion,
     AgentVersionUpdate, ChatSession, ChatSessionUpdate, CoordinateSystem, CrdtDocumentRow,
     EvalDataset, EvalDatasetRun, EvalDatasetRunEval, EvalDatasetRunItem, EvalDatasetSession,
-    EvalDatasetUpdate, EventPayload, LocationCacheEntry, NotificationEntry, NotificationGroup,
-    NotificationResponseAction, NotificationSource, StoredEvent, StoredTrigger,
-    ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, TriggerInfo, TriggerLogEntry,
-    TriggerLogLevel, TriggerRegistration, TriggerRunType,
+    EvalDatasetUpdate, LocationCacheEntry, NotificationEntry, NotificationGroup,
+    NotificationResponseAction, NotificationSource, ThingsChangeLogEntry, ThingsContentSnapshot,
+    ThingsOperationType,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -73,6 +72,14 @@ pub struct Storage {
     db_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StoredChatMessage {
+    pub session_id: String,
+    pub message_id: String,
+    pub created_at_ms: i64,
+    pub message_json: String,
+}
+
 impl Storage {
     fn bump_internal_kv_counter_tx(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
@@ -132,21 +139,6 @@ impl Storage {
     fn bootstrap(&self, conn: &Connection) -> Result<()> {
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS triggers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trigger_uuid TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT 'v1',
-                precondition_json TEXT NOT NULL,
-                condition_json TEXT NOT NULL,
-                action_uuid TEXT,
-                action_args_json TEXT NOT NULL DEFAULT '{}',
-                next_fire_utc INTEGER,
-                last_result INTEGER,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS actions (
                 action_uuid TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -183,18 +175,6 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_action_invocations_action_time
                 ON action_invocations(action_uuid, started_at DESC);
 
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                timestamp_utc INTEGER NOT NULL,
-                metadata_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_triggers_next_fire ON triggers(next_fire_utc);
-            CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp_utc DESC);
-
             CREATE TABLE IF NOT EXISTS preferences (
                 key TEXT PRIMARY KEY,
                 display_name TEXT,
@@ -219,33 +199,6 @@ impl Storage {
                 dirty INTEGER NOT NULL DEFAULT 0,
                 last_sync_at TEXT
             );
-
-            CREATE TABLE IF NOT EXISTS trigger_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trigger_uuid TEXT NOT NULL,
-                level TEXT NOT NULL,
-                message TEXT NOT NULL,
-                fire_time_utc INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                run_type TEXT NOT NULL DEFAULT 'automatic'
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_trigger_logs_uuid_time
-                ON trigger_logs(trigger_uuid, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS trigger_bindings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trigger_uuid TEXT NOT NULL,
-                entity_type TEXT NOT NULL,
-                entity_uuid TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                UNIQUE(entity_type, entity_uuid)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_trigger_bindings_trigger
-                ON trigger_bindings(trigger_uuid);
-            CREATE INDEX IF NOT EXISTS idx_trigger_bindings_entity
-                ON trigger_bindings(entity_type, entity_uuid);
 
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 session_id TEXT PRIMARY KEY,
@@ -472,10 +425,10 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_crdt_documents_type
                 ON crdt_documents(data_type);
 
-            -- Notifications (aggregated by category / trigger_uuid)
+            -- Notifications grouped by category.
             CREATE TABLE IF NOT EXISTS notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL DEFAULT 'trigger',
+                source TEXT NOT NULL DEFAULT 'system',
                 category TEXT NOT NULL,
                 title TEXT NOT NULL,
                 body TEXT NOT NULL,
@@ -503,36 +456,15 @@ impl Storage {
         )
         .context("Failed to run migrations")?;
 
+        conn.execute_batch(
+            r#"
+            DROP INDEX IF EXISTS idx_events_timestamp;
+            DROP TABLE IF EXISTS events;
+            "#,
+        )
+        .context("Failed to remove legacy events table")?;
+
         // Best-effort schema upgrade for deployments created before newer columns existed.
-        let _ = conn.execute(
-            "ALTER TABLE triggers ADD COLUMN version TEXT NOT NULL DEFAULT 'v1'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE triggers ADD COLUMN precondition_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE triggers ADD COLUMN condition_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE triggers ADD COLUMN action_uuid TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE triggers ADD COLUMN action_args_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE triggers ADD COLUMN api_version TEXT NOT NULL DEFAULT 'unknown'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE trigger_logs ADD COLUMN run_type TEXT NOT NULL DEFAULT 'automatic'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE triggers ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
         let _ = conn.execute(
             "ALTER TABLE notifications ADD COLUMN response_action TEXT",
             [],
@@ -566,14 +498,10 @@ impl Storage {
         // Add user_id to all user-scoped tables for anonymous-to-authenticated data migration.
         // NULL means data was created while not logged in (anonymous).
         let user_id_tables = &[
-            "triggers",
             "actions",
             "action_invocations",
-            "events",
             "preferences",
             "things_state",
-            "trigger_logs",
-            "trigger_bindings",
             "chat_sessions",
             "chat_messages",
             "things_change_log",
@@ -624,12 +552,8 @@ impl Storage {
     pub fn claim_anonymous_data(&self, user_id: &str) -> Result<usize> {
         let conn = self.connection()?;
         let tables = &[
-            "triggers",
-            "events",
             "preferences",
             "things_state",
-            "trigger_logs",
-            "trigger_bindings",
             "chat_sessions",
             "chat_messages",
             "agent_versions",
@@ -676,10 +600,6 @@ impl Storage {
             "things_content_snapshots",
             "things_change_log",
             "crdt_documents",
-            "trigger_logs",
-            "trigger_bindings",
-            "triggers",
-            "events",
             "preferences",
             "preference_sync_state",
             "things_state",
@@ -698,103 +618,6 @@ impl Storage {
     /// Get the database file path
     pub fn db_path(&self) -> &Path {
         &self.db_path
-    }
-
-    pub fn insert_trigger(
-        &self,
-        params: TriggerRegistration,
-        next_fire: Option<DateTime<Utc>>,
-    ) -> Result<String> {
-        let TriggerRegistration {
-            trigger_uuid,
-            name,
-            version,
-            precondition,
-            condition,
-            action_uuid,
-            action_args,
-        } = params;
-
-        let precondition_json =
-            serde_json::to_string(&precondition).context("Failed to serialize precondition")?;
-        let condition_json =
-            serde_json::to_string(&condition).context("Failed to serialize condition")?;
-        let action_args_json =
-            serde_json::to_string(&action_args).context("Failed to serialize action args")?;
-
-        let now = Utc::now().timestamp();
-        let next_fire_ts = next_fire.map(|dt| dt.timestamp());
-        // Cron registration id: stable trigger uuid + computed next expected execution time.
-        let cron_registration_id = format!("{}:{}", trigger_uuid, next_fire_ts.unwrap_or(0));
-
-        let conn = self.connection()?;
-        conn.execute(
-            r#"INSERT INTO triggers
-            (trigger_uuid, name, version, precondition_json, condition_json, action_uuid, action_args_json, next_fire_utc, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-            ON CONFLICT(trigger_uuid) DO UPDATE SET
-                name = excluded.name,
-                version = excluded.version,
-                precondition_json = excluded.precondition_json,
-                condition_json = excluded.condition_json,
-                action_uuid = excluded.action_uuid,
-                action_args_json = excluded.action_args_json,
-                next_fire_utc = excluded.next_fire_utc,
-                last_result = NULL,
-                updated_at = excluded.updated_at
-            "#,
-            params![
-                trigger_uuid,
-                name,
-                version,
-                precondition_json,
-                condition_json,
-                action_uuid,
-                action_args_json,
-                next_fire_ts,
-                now
-            ],
-        )
-        .context("Failed to insert trigger")?;
-
-        Ok(cron_registration_id)
-    }
-
-    pub fn update_next_fire(
-        &self,
-        trigger_uuid: &str,
-        fired_at: DateTime<Utc>,
-        next_fire: Option<DateTime<Utc>>,
-        last_result: bool,
-    ) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute(
-            r#"UPDATE triggers SET
-                next_fire_utc = ?1,
-                last_result = ?2,
-                updated_at = ?3
-              WHERE trigger_uuid = ?4"#,
-            params![
-                next_fire.map(|dt| dt.timestamp()),
-                if last_result { 1 } else { 0 },
-                fired_at.timestamp(),
-                trigger_uuid
-            ],
-        )
-        .context("Failed to update trigger schedule")?;
-        Ok(())
-    }
-
-    /// Pause or resume a trigger. Paused triggers are skipped by the scheduler.
-    pub fn set_trigger_paused(&self, trigger_uuid: &str, paused: bool) -> Result<()> {
-        let conn = self.connection()?;
-        let now = Utc::now().timestamp();
-        conn.execute(
-            "UPDATE triggers SET is_paused = ?1, updated_at = ?2 WHERE trigger_uuid = ?3",
-            params![if paused { 1 } else { 0 }, now, trigger_uuid],
-        )
-        .context("Failed to set trigger paused state")?;
-        Ok(())
     }
 
     pub fn get_internal_kv(&self, key: &str) -> Result<Option<String>> {
@@ -857,295 +680,6 @@ impl Storage {
 
         tx.commit()?;
         Ok(())
-    }
-
-    pub fn fetch_due_triggers(&self, now: DateTime<Utc>) -> Result<Vec<StoredTrigger>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-                        r#"SELECT trigger_uuid, name, version, precondition_json, condition_json, action_uuid, action_args_json, next_fire_utc
-               FROM triggers
-               WHERE next_fire_utc IS NOT NULL AND next_fire_utc <= ?1
-                 AND (is_paused = 0 OR is_paused IS NULL)
-               ORDER BY next_fire_utc ASC"#,
-        )?;
-        let rows = stmt
-            .query_map([now.timestamp()], |row| {
-                let next_fire = row
-                    .get::<_, Option<i64>>(7)?
-                    .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-                Ok(StoredTrigger {
-                    trigger_uuid: row.get(0)?,
-                    name: row.get(1)?,
-                    version: row.get(2)?,
-                    precondition_json: row.get(3)?,
-                    condition_json: row.get(4)?,
-                    action_uuid: row.get(5)?,
-                    action_args_json: row.get(6)?,
-                    next_fire,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to read due triggers")?;
-        Ok(rows)
-    }
-
-    pub fn fetch_trigger(&self, trigger_uuid: &str) -> Result<Option<StoredTrigger>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT trigger_uuid, name, version, precondition_json, condition_json, action_uuid, action_args_json, next_fire_utc
-               FROM triggers
-               WHERE trigger_uuid = ?1
-               LIMIT 1"#,
-        )?;
-        let trigger = stmt
-            .query_row([trigger_uuid], |row| {
-                let next_fire = row
-                    .get::<_, Option<i64>>(7)?
-                    .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-                Ok(StoredTrigger {
-                    trigger_uuid: row.get(0)?,
-                    name: row.get(1)?,
-                    version: row.get(2)?,
-                    precondition_json: row.get(3)?,
-                    condition_json: row.get(4)?,
-                    action_uuid: row.get(5)?,
-                    action_args_json: row.get(6)?,
-                    next_fire,
-                })
-            })
-            .optional()
-            .context("Failed to fetch trigger by uuid")?;
-        Ok(trigger)
-    }
-
-    pub fn insert_event(&self, event: &EventPayload) -> Result<()> {
-        let conn = self.connection()?;
-        let metadata_json = serde_json::to_string(&event.metadata).unwrap_or_else(|_| "{}".into());
-        conn.execute(
-            r#"INSERT INTO events
-            (event_type, timestamp, timestamp_utc, metadata_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)"#,
-            params![
-                event.event_type,
-                event.timestamp.to_rfc3339(),
-                event.timestamp.timestamp(),
-                metadata_json,
-                Utc::now().timestamp()
-            ],
-        )
-        .context("Failed to insert event")?;
-        Ok(())
-    }
-
-    pub fn mark_trigger_due(&self, trigger_uuid: &str, due_at: DateTime<Utc>) -> Result<()> {
-        let conn = self.connection()?;
-        let now = Utc::now().timestamp();
-        conn.execute(
-            r#"UPDATE triggers SET
-                next_fire_utc = ?1,
-                updated_at = ?2
-              WHERE trigger_uuid = ?3"#,
-            params![due_at.timestamp(), now, trigger_uuid],
-        )
-        .context("Failed to mark trigger due")?;
-        Ok(())
-    }
-
-    pub fn insert_trigger_log(
-        &self,
-        trigger_uuid: &str,
-        level: TriggerLogLevel,
-        message: &str,
-        fire_time: DateTime<Utc>,
-        run_type: TriggerRunType,
-    ) -> Result<()> {
-        let conn = self.connection()?;
-        let now = Utc::now().timestamp();
-        conn.execute(
-            r#"INSERT INTO trigger_logs
-            (trigger_uuid, level, message, fire_time_utc, created_at, run_type)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-            params![
-                trigger_uuid,
-                level.as_str(),
-                message,
-                fire_time.timestamp(),
-                now,
-                run_type.as_str()
-            ],
-        )
-        .context("Failed to insert trigger log")?;
-        Ok(())
-    }
-
-    pub fn fetch_events_recent(
-        &self,
-        cutoff: DateTime<Utc>,
-        past_minutes: u32,
-    ) -> Result<Vec<StoredEvent>> {
-        let window_start = cutoff - Duration::minutes(i64::from(past_minutes));
-
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT event_type, timestamp, metadata_json
-               FROM events
-               WHERE timestamp_utc BETWEEN ?1 AND ?2
-               ORDER BY timestamp_utc DESC"#,
-        )?;
-
-        let events = stmt
-            .query_map(
-                params![window_start.timestamp(), cutoff.timestamp()],
-                |row| Self::map_event_row(row),
-            )?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to fetch recent events")?;
-
-        Ok(events)
-    }
-
-    pub fn next_deadline(&self, now_unix: Option<i64>) -> Result<Option<DateTime<Utc>>> {
-        let conn = self.connection()?;
-        let ts = match now_unix {
-            Some(now) => conn
-                .query_row(
-                    "SELECT next_fire_utc FROM triggers WHERE next_fire_utc IS NOT NULL AND next_fire_utc > ?1 ORDER BY next_fire_utc ASC LIMIT 1",
-                    params![now],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .context("Failed to read next deadline")?,
-            None => conn
-                .query_row(
-                    "SELECT next_fire_utc FROM triggers WHERE next_fire_utc IS NOT NULL ORDER BY next_fire_utc ASC LIMIT 1",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .context("Failed to read next deadline")?,
-        };
-        Ok(ts.and_then(|val| Utc.timestamp_opt(val, 0).single()))
-    }
-
-    pub fn list_events(&self, limit: Option<u32>, offset: u32) -> Result<Vec<StoredEvent>> {
-        let conn = self.connection()?;
-        let base_query =
-            "SELECT event_type, timestamp, metadata_json FROM events ORDER BY timestamp_utc ASC";
-
-        let rows = if let Some(limit) = limit.filter(|value| *value > 0) {
-            let mut stmt = conn.prepare(&format!("{base_query} LIMIT ? OFFSET ?"))?;
-            stmt.query_map(params![limit as i64, offset as i64], |row| {
-                Self::map_event_row(row)
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to fetch limited events")?
-        } else {
-            let mut stmt = conn.prepare(base_query)?;
-            stmt.query_map([], |row| Self::map_event_row(row))?
-                .collect::<Result<Vec<_>, _>>()
-                .context("Failed to fetch events")?
-        };
-
-        Ok(rows)
-    }
-
-    pub fn list_events_between_utc(
-        &self,
-        start_ts_utc: i64,
-        end_ts_utc: i64,
-    ) -> Result<Vec<StoredEvent>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT event_type, timestamp, metadata_json
-               FROM events
-               WHERE timestamp_utc BETWEEN ?1 AND ?2
-               ORDER BY timestamp_utc ASC"#,
-        )?;
-
-        let rows = stmt
-            .query_map(params![start_ts_utc, end_ts_utc], |row| {
-                Self::map_event_row(row)
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to fetch events in range")?;
-
-        Ok(rows)
-    }
-
-    pub fn list_trigger_logs(
-        &self,
-        trigger_uuid: &str,
-        limit: Option<u32>,
-        run_type: Option<TriggerRunType>,
-    ) -> Result<Vec<TriggerLogEntry>> {
-        let conn = self.connection()?;
-        let limited = limit.filter(|v| *v > 0);
-
-        let rows = match (run_type, limited) {
-            (Some(run_type), Some(limit)) => {
-                let mut stmt = conn.prepare(
-                    "SELECT trigger_uuid, level, message, fire_time_utc, created_at, run_type
-                     FROM trigger_logs
-                     WHERE trigger_uuid = ?1 AND run_type = ?2
-                     ORDER BY created_at DESC
-                     LIMIT ?3",
-                )?;
-                stmt.query_map(
-                    params![trigger_uuid, run_type.as_str(), limit as i64],
-                    |row| Self::map_trigger_log_row(row),
-                )?
-                .collect::<Result<Vec<_>, _>>()
-                .context("Failed to fetch filtered trigger logs")?
-            }
-            (Some(run_type), None) => {
-                let mut stmt = conn.prepare(
-                    "SELECT trigger_uuid, level, message, fire_time_utc, created_at, run_type
-                     FROM trigger_logs
-                     WHERE trigger_uuid = ?1 AND run_type = ?2
-                     ORDER BY created_at DESC",
-                )?;
-                stmt.query_map(params![trigger_uuid, run_type.as_str()], |row| {
-                    Self::map_trigger_log_row(row)
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .context("Failed to fetch filtered trigger logs")?
-            }
-            (None, Some(limit)) => {
-                let mut stmt = conn.prepare(
-                    "SELECT trigger_uuid, level, message, fire_time_utc, created_at, run_type
-                     FROM trigger_logs
-                     WHERE trigger_uuid = ?1
-                     ORDER BY created_at DESC
-                     LIMIT ?2",
-                )?;
-                stmt.query_map(params![trigger_uuid, limit as i64], |row| {
-                    Self::map_trigger_log_row(row)
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .context("Failed to fetch limited trigger logs")?
-            }
-            (None, None) => {
-                let mut stmt = conn.prepare(
-                    "SELECT trigger_uuid, level, message, fire_time_utc, created_at, run_type
-                     FROM trigger_logs
-                     WHERE trigger_uuid = ?1
-                     ORDER BY created_at DESC",
-                )?;
-                stmt.query_map([trigger_uuid], |row| Self::map_trigger_log_row(row))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("Failed to fetch trigger logs")?
-            }
-        };
-
-        Ok(rows)
-    }
-
-    pub fn export_trigger_logs(
-        &self,
-        trigger_uuid: &str,
-        run_type: Option<TriggerRunType>,
-    ) -> Result<Vec<TriggerLogEntry>> {
-        self.list_trigger_logs(trigger_uuid, None, run_type)
     }
 
     // ===== Notification CRUD =====
@@ -1219,7 +753,7 @@ impl Storage {
         let mut result = Vec::with_capacity(groups.len());
         for (category, title, source_str, latest_ts, unread, total) in groups {
             let source =
-                NotificationSource::from_str(&source_str).unwrap_or(NotificationSource::Trigger);
+                NotificationSource::from_str(&source_str).unwrap_or(NotificationSource::System);
             let latest_at = Utc
                 .timestamp_opt(latest_ts, 0)
                 .single()
@@ -1281,6 +815,21 @@ impl Storage {
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to list flat notifications")?;
         Ok(rows)
+    }
+
+    pub fn get_notification(&self, notification_id: i64) -> Result<Option<NotificationEntry>> {
+        let conn = self.connection()?;
+        let entry = conn
+            .query_row(
+                r#"SELECT id, source, category, title, body, is_read, response_action, responded_at, created_at
+                   FROM notifications
+                   WHERE id = ?1"#,
+                [notification_id],
+                |row| Self::map_notification_row(row),
+            )
+            .optional()
+            .context("Failed to get notification")?;
+        Ok(entry)
     }
 
     /// Get the latest single unread notification (for Overview banner).
@@ -1374,7 +923,7 @@ impl Storage {
             .single()
             .unwrap_or_else(Utc::now);
         let source =
-            NotificationSource::from_str(&source_str).unwrap_or(NotificationSource::Trigger);
+            NotificationSource::from_str(&source_str).unwrap_or(NotificationSource::System);
         Ok(NotificationEntry {
             id,
             source,
@@ -1386,134 +935,6 @@ impl Storage {
             responded_at,
             created_at,
         })
-    }
-
-    pub fn events_count(&self) -> Result<i64> {
-        let conn = self.connection()?;
-        let count = conn
-            .query_row("SELECT COUNT(*) FROM events", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .context("Failed to count events")?;
-        Ok(count)
-    }
-
-    pub fn events_time_range(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT MIN(timestamp_utc) as start_ts, MAX(timestamp_utc) as end_ts FROM events",
-        )?;
-        let result = stmt.query_row([], |row| {
-            let start = row.get::<_, Option<i64>>(0)?;
-            let end = row.get::<_, Option<i64>>(1)?;
-            Ok((start, end))
-        })?;
-
-        match result {
-            (Some(start), Some(end)) => {
-                let start_dt = Utc.timestamp_opt(start, 0).single();
-                let end_dt = Utc.timestamp_opt(end, 0).single();
-                Ok(start_dt.and_then(|s| end_dt.map(|e| (s, e))))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    pub fn list_triggers(&self) -> Result<Vec<TriggerInfo>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT t.trigger_uuid, t.name, t.version, t.precondition_json, t.condition_json,
-                 t.next_fire_utc, t.last_result, t.is_paused,
-                 tb.entity_type, tb.entity_uuid, t.action_uuid, t.action_args_json
-               FROM triggers t
-               LEFT JOIN trigger_bindings tb ON tb.trigger_uuid = t.trigger_uuid
-               ORDER BY t.created_at ASC"#,
-        )?;
-
-        let triggers = stmt
-            .query_map([], |row| {
-                let next_fire_ts = row.get::<_, Option<i64>>(5)?;
-                let next_fire = next_fire_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-                let last_result = row.get::<_, Option<i64>>(6)?.map(|value| value != 0);
-                let is_paused = row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0;
-
-                let precondition_json: String = row.get(3)?;
-                let precondition = serde_json::from_str(&precondition_json).unwrap_or_default();
-
-                let condition_json: String = row.get(4)?;
-                let condition = serde_json::from_str(&condition_json).unwrap_or_default();
-                let action_args_json: String = row.get(11)?;
-                let action_args = serde_json::from_str(&action_args_json)
-                    .unwrap_or_else(|_| Value::Object(Default::default()));
-
-                Ok(TriggerInfo {
-                    trigger_id: row.get(0)?,
-                    name: row.get(1)?,
-                    version: row.get(2)?,
-                    precondition,
-                    condition,
-                    next_fire,
-                    last_result,
-                    is_paused,
-                    bind_type: row.get(8)?,
-                    bind_uuid: row.get(9)?,
-                    action_uuid: row.get(10)?,
-                    action_args,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to read trigger list")?;
-
-        Ok(triggers)
-    }
-
-    pub fn list_triggers_for_context_prompt(&self, limit: usize) -> Result<Vec<TriggerInfo>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT t.trigger_uuid, t.name, t.version, t.precondition_json, t.condition_json,
-                 t.next_fire_utc, t.last_result, t.is_paused,
-                 tb.entity_type, tb.entity_uuid, t.action_uuid, t.action_args_json
-               FROM triggers t
-               LEFT JOIN trigger_bindings tb ON tb.trigger_uuid = t.trigger_uuid
-               ORDER BY t.updated_at DESC
-               LIMIT ?1"#,
-        )?;
-
-        let triggers = stmt
-            .query_map([limit as i64], |row| {
-                let next_fire_ts = row.get::<_, Option<i64>>(5)?;
-                let next_fire = next_fire_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-                let last_result = row.get::<_, Option<i64>>(6)?.map(|value| value != 0);
-                let is_paused = row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0;
-
-                let precondition_json: String = row.get(3)?;
-                let precondition = serde_json::from_str(&precondition_json).unwrap_or_default();
-
-                let condition_json: String = row.get(4)?;
-                let condition = serde_json::from_str(&condition_json).unwrap_or_default();
-                let action_args_json: String = row.get(11)?;
-                let action_args = serde_json::from_str(&action_args_json)
-                    .unwrap_or_else(|_| Value::Object(Default::default()));
-
-                Ok(TriggerInfo {
-                    trigger_id: row.get(0)?,
-                    name: row.get(1)?,
-                    version: row.get(2)?,
-                    precondition,
-                    condition,
-                    next_fire,
-                    last_result,
-                    is_paused,
-                    bind_type: row.get(8)?,
-                    bind_uuid: row.get(9)?,
-                    action_uuid: row.get(10)?,
-                    action_args,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to read trigger list (context prompt)")?;
-
-        Ok(triggers)
     }
 
     pub fn seed_builtin_actions(&self, actions: &[ActionDefinition]) -> Result<()> {
@@ -1719,56 +1140,6 @@ impl Storage {
             .optional()
             .context("Failed to fetch latest action invocation")?;
         Ok(record)
-    }
-
-    fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
-        let ts_str: String = row.get(1)?;
-        let timestamp = DateTime::parse_from_rfc3339(&ts_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        let metadata_json: String = row.get(2)?;
-        let metadata: Value = serde_json::from_str(&metadata_json).unwrap_or(Value::Null);
-
-        Ok(StoredEvent {
-            event_type: row.get(0)?,
-            timestamp,
-            metadata,
-        })
-    }
-
-    fn map_trigger_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TriggerLogEntry> {
-        let level_raw: String = row.get(1)?;
-        let level = TriggerLogLevel::from_str(&level_raw).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                Type::Text,
-                Box::new(io::Error::new(io::ErrorKind::InvalidData, err)),
-            )
-        })?;
-        let fire_time_ts: i64 = row.get(3)?;
-        let created_ts: i64 = row.get(4)?;
-        let run_type_raw: String = row.get(5)?;
-        let run_type = TriggerRunType::from_str(&run_type_raw).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                Type::Text,
-                Box::new(io::Error::new(io::ErrorKind::InvalidData, err)),
-            )
-        })?;
-        Ok(TriggerLogEntry {
-            trigger_id: row.get(0)?,
-            level,
-            message: row.get(2)?,
-            fire_time: Utc
-                .timestamp_opt(fire_time_ts, 0)
-                .single()
-                .unwrap_or_else(Utc::now),
-            created_at: Utc
-                .timestamp_opt(created_ts, 0)
-                .single()
-                .unwrap_or_else(Utc::now),
-            run_type,
-        })
     }
 
     // ===== Things (Automerge local-first) =====
@@ -2064,146 +1435,6 @@ impl Storage {
         Ok(rows)
     }
 
-    // ===== Trigger Bindings =====
-
-    /// Record a binding between a trigger and a thing/collection.
-    ///
-    /// The UNIQUE constraint on (entity_type, entity_uuid) ensures that each entity
-    /// can only be bound to one trigger at a time. If a binding already exists for
-    /// the entity, it will be replaced with the new trigger_uuid (rebinding scenario).
-    pub fn upsert_trigger_binding(
-        &self,
-        trigger_uuid: &str,
-        entity_type: &str,
-        entity_uuid: &str,
-    ) -> Result<()> {
-        let conn = self.connection()?;
-        let now = Utc::now().timestamp();
-        conn.execute(
-            r#"INSERT INTO trigger_bindings (trigger_uuid, entity_type, entity_uuid, created_at)
-               VALUES (?1, ?2, ?3, ?4)
-               ON CONFLICT(entity_type, entity_uuid) DO UPDATE SET
-                   trigger_uuid = excluded.trigger_uuid,
-                   created_at = excluded.created_at"#,
-            params![trigger_uuid, entity_type, entity_uuid, now],
-        )
-        .context("Failed to upsert trigger binding")?;
-        Ok(())
-    }
-
-    /// Remove a binding for a specific entity
-    pub fn delete_trigger_binding(&self, entity_type: &str, entity_uuid: &str) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute(
-            "DELETE FROM trigger_bindings WHERE entity_type = ?1 AND entity_uuid = ?2",
-            params![entity_type, entity_uuid],
-        )
-        .context("Failed to delete trigger binding")?;
-        Ok(())
-    }
-
-    /// List all trigger bindings.
-    pub fn list_trigger_bindings(&self) -> Result<Vec<(String, String, String)>> {
-        let conn = self.connection()?;
-        let mut stmt =
-            conn.prepare("SELECT trigger_uuid, entity_type, entity_uuid FROM trigger_bindings")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to list trigger bindings")?;
-        Ok(rows)
-    }
-
-    /// Get all trigger UUIDs that are bound to at least one entity
-    pub fn list_bound_trigger_uuids(&self) -> Result<Vec<String>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare("SELECT DISTINCT trigger_uuid FROM trigger_bindings")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to list bound trigger UUIDs")?;
-        Ok(rows)
-    }
-
-    /// Check if a trigger is bound to any entity
-    pub fn is_trigger_bound(&self, trigger_uuid: &str) -> Result<bool> {
-        let conn = self.connection()?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM trigger_bindings WHERE trigger_uuid = ?1",
-                params![trigger_uuid],
-                |row| row.get(0),
-            )
-            .context("Failed to check if trigger is bound")?;
-        Ok(count > 0)
-    }
-
-    /// Get the trigger UUID currently bound to a specific entity, if any.
-    /// This supplements the CRDT snapshot and handles edge cases where the CRDT
-    /// may not reflect the current binding state.
-    pub fn get_trigger_for_entity(
-        &self,
-        entity_type: &str,
-        entity_uuid: &str,
-    ) -> Result<Option<String>> {
-        let conn = self.connection()?;
-        let result = conn.query_row(
-            "SELECT trigger_uuid FROM trigger_bindings WHERE entity_type = ?1 AND entity_uuid = ?2",
-            params![entity_type, entity_uuid],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(uuid) => Ok(Some(uuid)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("Failed to get trigger for entity: {}", e)),
-        }
-    }
-
-    /// Get all entities bound to a specific trigger
-    pub fn get_entities_for_trigger(&self, trigger_uuid: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT entity_type, entity_uuid FROM trigger_bindings WHERE trigger_uuid = ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![trigger_uuid], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to get entities for trigger")?;
-        Ok(rows)
-    }
-
-    /// Remove ALL trigger_bindings rows whose trigger_uuid matches.
-    pub fn delete_all_bindings_for_trigger(&self, trigger_uuid: &str) -> Result<usize> {
-        let conn = self.connection()?;
-        let rows_affected = conn
-            .execute(
-                "DELETE FROM trigger_bindings WHERE trigger_uuid = ?1",
-                params![trigger_uuid],
-            )
-            .context("Failed to delete all trigger bindings")?;
-        Ok(rows_affected)
-    }
-
-    /// Remove a specific trigger if it exists
-    pub fn delete_trigger(&self, trigger_uuid: &str) -> Result<bool> {
-        let conn = self.connection()?;
-        let rows_affected = conn
-            .execute(
-                "DELETE FROM triggers WHERE trigger_uuid = ?1",
-                params![trigger_uuid],
-            )
-            .context("Failed to delete trigger")?;
-        Ok(rows_affected > 0)
-    }
-
     // ===== Chat Sessions =====
 
     /// Create or update a chat session
@@ -2405,6 +1636,18 @@ impl Storage {
             .query_map([agent_id], Self::map_agent_version_row)?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to list agent versions")?;
+        Ok(versions)
+    }
+
+    pub(crate) fn list_all_agent_versions(&self) -> Result<Vec<AgentVersion>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT version_id, agent_id, name, raw_markdown, created_at, updated_at, applied_at FROM agent_versions ORDER BY updated_at DESC, created_at DESC",
+        )?;
+        let versions = stmt
+            .query_map([], Self::map_agent_version_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list all agent versions")?;
         Ok(versions)
     }
 
@@ -2896,6 +2139,25 @@ impl Storage {
         }
 
         Ok(messages)
+    }
+
+    pub(crate) fn list_all_chat_messages(&self) -> Result<Vec<StoredChatMessage>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, message_id, created_at_ms, message_json FROM chat_messages ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredChatMessage {
+                    session_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    created_at_ms: row.get(2)?,
+                    message_json: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list all chat messages")?;
+        Ok(rows)
     }
 
     /// Delete all chat messages for a session.

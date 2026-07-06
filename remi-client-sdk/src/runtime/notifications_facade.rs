@@ -1,26 +1,6 @@
 use super::*;
 
-impl TriggerSdk {
-    pub fn list_trigger_logs_json(
-        &self,
-        trigger_uuid: &str,
-        limit: Option<u32>,
-        run_type: Option<TriggerRunType>,
-    ) -> Result<String> {
-        let logs = self
-            .storage
-            .list_trigger_logs(trigger_uuid, limit, run_type)?;
-        to_string(&logs).context("Failed to serialize trigger logs")
-    }
-    pub fn export_trigger_logs_json(
-        &self,
-        trigger_uuid: &str,
-        run_type: Option<TriggerRunType>,
-    ) -> Result<String> {
-        let logs = self.storage.export_trigger_logs(trigger_uuid, run_type)?;
-        to_string(&logs).context("Failed to serialize trigger logs for export")
-    }
-
+impl RemiSdk {
     // ===== Notification queries =====
 
     pub fn list_notifications_grouped_json(&self, limit: u32) -> Result<String> {
@@ -60,6 +40,9 @@ impl TriggerSdk {
 
     pub fn mark_notification_read(&self, notification_id: i64) -> Result<()> {
         self.storage.mark_notification_read(notification_id)?;
+        if let Some(notification) = self.storage.get_notification(notification_id)? {
+            self.enqueue_search_document(SearchDocument::from_notification(&notification));
+        }
         self.emit_notification_event(NotificationEvent::Read { notification_id });
         Ok(())
     }
@@ -71,6 +54,9 @@ impl TriggerSdk {
     ) -> Result<()> {
         self.storage
             .record_notification_response(notification_id, &action)?;
+        if let Some(notification) = self.storage.get_notification(notification_id)? {
+            self.enqueue_search_document(SearchDocument::from_notification(&notification));
+        }
         self.emit_notification_event(NotificationEvent::Responded {
             notification_id,
             action,
@@ -94,6 +80,10 @@ impl TriggerSdk {
 
     pub fn delete_notifications_by_category(&self, category: &str) -> Result<()> {
         self.storage.delete_notifications_by_category(category)?;
+        self.enqueue_search_actions(vec![SearchIngestAction::DeleteByParent {
+            kind: crate::search::SearchEntityKind::Notification,
+            parent_id: category.to_string(),
+        }]);
         self.emit_notification_event(NotificationEvent::CategoryDeleted {
             category: category.to_string(),
         });

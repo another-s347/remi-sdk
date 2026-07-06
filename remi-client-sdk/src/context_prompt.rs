@@ -1,5 +1,4 @@
 use crate::things_crdt::{ThingEntry, ThingsSnapshot};
-use crate::types::TriggerInfo;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,7 +58,6 @@ pub const EVENT_TYPES: &[EventTypeInfo] = &[
 const MAX_COLLECTIONS: usize = 20;
 const MAX_THINGS_PER_COLLECTION: usize = 50;
 const MAX_SUB_THINGS_PER_THING: usize = 10;
-const MAX_TRIGGERS: usize = 50;
 
 fn yaml_quote(s: &str) -> String {
     let escaped = s
@@ -159,7 +157,7 @@ fn build_enabled_events_section(granted_permissions: &[String]) -> String {
     out
 }
 
-fn build_user_data_overview(snapshot: &ThingsSnapshot, triggers: &[TriggerInfo]) -> String {
+fn build_user_data_overview(snapshot: &ThingsSnapshot) -> String {
     let mut collections = snapshot.collections.clone();
     collections.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     collections.truncate(MAX_COLLECTIONS);
@@ -203,14 +201,6 @@ fn build_user_data_overview(snapshot: &ThingsSnapshot, triggers: &[TriggerInfo])
                 yaml_quote(&t.title),
                 yaml_quote(&t.uuid)
             ));
-            if let Some(trigger_uuid) = t.trigger_uuid.as_ref() {
-                if !trigger_uuid.is_empty() {
-                    out.push_str(&format!(
-                        "        trigger_uuid: {}\n",
-                        yaml_quote(trigger_uuid)
-                    ));
-                }
-            }
 
             let mut sub: Vec<ThingEntry> = things_by_collection
                 .get(&c.uuid)
@@ -230,29 +220,9 @@ fn build_user_data_overview(snapshot: &ThingsSnapshot, triggers: &[TriggerInfo])
                         yaml_quote(&st.title),
                         yaml_quote(&st.uuid)
                     ));
-                    if let Some(trigger_uuid) = st.trigger_uuid.as_ref() {
-                        if !trigger_uuid.is_empty() {
-                            out.push_str(&format!(
-                                "            trigger_uuid: {}\n",
-                                yaml_quote(trigger_uuid)
-                            ));
-                        }
-                    }
                 }
             }
         }
-    }
-
-    out.push_str("\ntriggers:\n");
-    for trg in triggers.iter().take(MAX_TRIGGERS) {
-        // Best-effort: local triggers don't currently persist a dedicated `user_request`.
-        // We surface `name` for both `title` and `user_request` so the agent has a human hint.
-        out.push_str(&format!(
-            "  - title: {}\n    uuid: {}\n    user_request: {}\n",
-            yaml_quote(&trg.name),
-            yaml_quote(&trg.trigger_id),
-            yaml_quote(&trg.name)
-        ));
     }
 
     out.push_str("```");
@@ -268,13 +238,7 @@ fn resolve_active_context_virtual_fs_paths(
         "collection" => Some(json!({
             "dir": format!("/collection/{uuid}"),
             "name": format!("/collection/{uuid}/name"),
-            "trigger": format!("/collection/{uuid}/trigger"),
             "things": format!("/collection/{uuid}/things"),
-        })),
-        "trigger" => Some(json!({
-            "dir": format!("/trigger/{uuid}"),
-            "name": format!("/trigger/{uuid}/name"),
-            "rule": format!("/trigger/{uuid}/rule.json"),
         })),
         "thing" => snapshot
             .things
@@ -288,7 +252,6 @@ fn resolve_active_context_virtual_fs_paths(
                 json!({
                     "dir": dir,
                     "name": format!("{dir}/name"),
-                    "trigger": format!("{dir}/trigger"),
                     "status": format!("{dir}/status"),
                     "content": format!("{dir}/content.md"),
                     "things": format!("{dir}/things"),
@@ -381,11 +344,10 @@ pub(crate) fn build_active_context_section(
 pub fn build_context_prompt_markdown(
     granted_permissions: &[String],
     snapshot: &ThingsSnapshot,
-    triggers: &[TriggerInfo],
     active_context_json: Option<&str>,
 ) -> Result<String> {
     let enabled_events = build_enabled_events_section(granted_permissions);
-    let user_data = build_user_data_overview(snapshot, triggers);
+    let user_data = build_user_data_overview(snapshot);
     let active_context = build_active_context_section(snapshot, active_context_json)?;
 
     let mut sections = vec![enabled_events, user_data];
@@ -405,7 +367,7 @@ mod tests {
             collections: vec![],
             things: vec![],
         };
-        let out = build_context_prompt_markdown(&[], &snapshot, &[], None).unwrap();
+        let out = build_context_prompt_markdown(&[], &snapshot, None).unwrap();
         assert!(out.contains("## Enabled Events"));
         assert!(out.contains("目前仅可依赖时间与其他api判断"));
     }
@@ -419,7 +381,6 @@ mod tests {
                 collection_type: Default::default(),
                 app_id: None,
                 archived_at: None,
-                trigger_uuid: Some("tr-1".to_string()),
                 card_jsx: None,
                 created_at: crate::things_crdt::parse_domain_datetime("2026-04-01T00:00:00Z")
                     .unwrap(),
@@ -436,7 +397,6 @@ mod tests {
                 data: json!({}),
                 collection_uuid: "c1".to_string(),
                 parent_uuid: None,
-                trigger_uuid: Some("tr-2".to_string()),
                 archived_at: None,
                 archived_from_collection_uuid: None,
                 created_at: crate::things_crdt::parse_domain_datetime("2026-04-01T00:00:00Z")
@@ -453,7 +413,7 @@ mod tests {
 
         let section = build_active_context_section(
             &snapshot,
-            Some(r#"{"viewing":[{"type":"thing","uuid":"t1","title":"Buy milk"},{"type":"collection","uuid":"c1","title":"Inbox"},{"type":"trigger","uuid":"tr-9","title":"Wake Up"}]}"#),
+            Some(r#"{"viewing":[{"type":"thing","uuid":"t1","title":"Buy milk"},{"type":"collection","uuid":"c1","title":"Inbox"}]}"#),
         )
         .expect("section should build")
         .expect("section should exist");
@@ -462,6 +422,5 @@ mod tests {
         assert!(section.contains("/collection/c1/things/t1"));
         assert!(section.contains("/collection/c1/things/t1/content.md"));
         assert!(section.contains("/collection/c1/name"));
-        assert!(section.contains("/trigger/tr-9/rule.json"));
     }
 }

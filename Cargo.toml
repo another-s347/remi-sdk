@@ -2,7 +2,6 @@
 members = [
     "remi-client-sdk",
     "remi-things-crdt",
-    "rule-trigger-engine",
 ]
 resolver = "2"
 

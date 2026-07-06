@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use super::TriggerSdk;
+use super::RemiSdk;
 use crate::things_crdt::{DocumentKey, DocumentState, ThingCollectionUpsert, ThingsDocumentSet};
 use crate::things_events::{ThingsDocumentKind, ThingsEvent};
 
@@ -11,7 +11,7 @@ fn things_watch_since_recovers_events_after_reopen() -> Result<()> {
     let db_path = db_path.to_string_lossy().to_string();
     let device_id = "device-events";
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     sdk.things_upsert_collection(
         device_id,
         ThingCollectionUpsert {
@@ -19,8 +19,6 @@ fn things_watch_since_recovers_events_after_reopen() -> Result<()> {
             title: "Events".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -46,7 +44,7 @@ fn things_watch_since_recovers_events_after_reopen() -> Result<()> {
     let last_event_id = snapshot_events.last().unwrap().event_id;
 
     drop(sdk);
-    let reopened = TriggerSdk::initialize(&db_path)?;
+    let reopened = RemiSdk::initialize(&db_path)?;
     assert!(
         reopened
             .things_watch_since(device_id, last_event_id, 100)?
@@ -63,7 +61,7 @@ fn wipe_all_data_records_durable_data_wiped_event_for_device() -> Result<()> {
     let db_path = db_path.to_string_lossy().to_string();
     let device_id = "device-data-wiped";
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     sdk.things_upsert_collection(
         device_id,
         ThingCollectionUpsert {
@@ -71,8 +69,6 @@ fn wipe_all_data_records_durable_data_wiped_event_for_device() -> Result<()> {
             title: "Before wipe".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -100,7 +96,7 @@ fn remote_apply_does_not_clear_existing_local_dirty_documents() -> Result<()> {
     let db_path = db_path.to_string_lossy().to_string();
     let device_id = "device-remote-apply";
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     sdk.things_upsert_collection(
         device_id,
         ThingCollectionUpsert {
@@ -108,8 +104,6 @@ fn remote_apply_does_not_clear_existing_local_dirty_documents() -> Result<()> {
             title: "Local Dirty".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -146,7 +140,7 @@ fn local_mutation_broadcasts_from_pipeline() -> Result<()> {
     let db_path = db_path.to_string_lossy().to_string();
     let device_id = "device-local-broadcast";
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     let mut rx = sdk.things_subscribe();
     sdk.things_upsert_collection(
         device_id,
@@ -155,8 +149,6 @@ fn local_mutation_broadcasts_from_pipeline() -> Result<()> {
             title: "Broadcast".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -192,7 +184,7 @@ fn remote_apply_broadcasts_from_pipeline() -> Result<()> {
     let db_path = db_path.to_string_lossy().to_string();
     let device_id = "device-remote-broadcast";
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     let mut rx = sdk.things_subscribe();
     let remote_doc =
         remi_things_crdt::Schema::init_thing_markdown_doc("remote-device", "remote-thing")?;
@@ -238,14 +230,13 @@ fn remote_apply_collection_doc_emits_created_event_from_snapshot_diff() -> Resul
         collection_uuid,
         Some("Remote Created".to_string()),
         None,
-        remi_things_crdt::TriggerUpdate::Noop,
     )?;
     let remote_collection_state = remote_doc_set
         .get(&DocumentKey::collection(collection_uuid))
         .expect("remote collection doc should exist")
         .clone();
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     sdk.things_apply_remote_document(
         device_id,
         "sync-run-created",
@@ -287,7 +278,6 @@ fn remote_apply_documents_batch_emits_events_and_marks_clean() -> Result<()> {
         collection_uuid,
         Some("Remote Batch".to_string()),
         None,
-        remi_things_crdt::TriggerUpdate::Noop,
     )?;
     let remote_root_state = remote_doc_set
         .get(&DocumentKey::root())
@@ -298,7 +288,7 @@ fn remote_apply_documents_batch_emits_events_and_marks_clean() -> Result<()> {
         .expect("remote collection doc should exist")
         .clone();
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     let event_range = sdk.things_apply_remote_documents(
         device_id,
         "sync-run-batch",
@@ -344,7 +334,7 @@ fn save_synced_clean_doc_emits_update_event_when_canonical_doc_changes_snapshot(
     let device_id = "device-synced-clean-event";
     let collection_uuid = "synced-clean-collection";
 
-    let sdk = TriggerSdk::initialize(&db_path)?;
+    let sdk = RemiSdk::initialize(&db_path)?;
     sdk.things_upsert_collection(
         device_id,
         ThingCollectionUpsert {
@@ -352,8 +342,6 @@ fn save_synced_clean_doc_emits_update_event_when_canonical_doc_changes_snapshot(
             title: "Local Title".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -375,7 +363,6 @@ fn save_synced_clean_doc_emits_update_event_when_canonical_doc_changes_snapshot(
         collection_uuid,
         Some("Server Title".to_string()),
         None,
-        remi_things_crdt::TriggerUpdate::Noop,
     )?;
     let canonical_collection_state = canonical_doc_set
         .get(&DocumentKey::collection(collection_uuid))

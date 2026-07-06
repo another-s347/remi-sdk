@@ -16,7 +16,7 @@ pub(super) struct PullMissingDocumentsOutput {
 }
 
 pub(super) fn build_local_reachability_filters(
-    sdk: &TriggerSdk,
+    sdk: &RemiSdk,
     device_id: &str,
 ) -> Result<LocalReachabilityFilters> {
     let has_synced_non_root_documents = sdk
@@ -158,7 +158,7 @@ fn update_reachability_from_downloaded_doc(
 /// Phase 1b (receive): Existing local documents whose canonical head differs from the
 ///   server's current head are re-synced to receive changes made by other devices.
 pub(super) async fn pull_missing_documents<T>(
-    sdk: &TriggerSdk,
+    sdk: &RemiSdk,
     client: &mut T,
     device_id: &str,
     sync_run_id: &str,

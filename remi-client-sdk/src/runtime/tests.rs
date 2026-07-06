@@ -1,8 +1,6 @@
 use super::*;
 use crate::things_crdt::ThingDatatype;
 use crate::types::EntityActionBinding;
-use chrono::TimeZone;
-use croner::Cron;
 #[cfg(feature = "quickjs")]
 use std::io::{Read, Write};
 #[cfg(feature = "quickjs")]
@@ -12,7 +10,7 @@ use std::thread;
 use tempfile::tempdir;
 
 #[cfg(feature = "quickjs")]
-fn seed_test_action(sdk: &TriggerSdk, action_uuid: &str, title: &str, script_source: &str) {
+fn seed_test_action(sdk: &RemiSdk, action_uuid: &str, title: &str, script_source: &str) {
     sdk.storage
         .seed_builtin_actions(&[ActionDefinition {
             action_uuid: action_uuid.to_string(),
@@ -58,7 +56,7 @@ fn spawn_test_http_server() -> (String, thread::JoinHandle<()>) {
 }
 
 fn seed_markdown_thing(
-    sdk: &TriggerSdk,
+    sdk: &RemiSdk,
     device_id: &str,
     collection_id: &str,
     thing_id: &str,
@@ -71,8 +69,6 @@ fn seed_markdown_thing(
             title: "Test Collection".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -87,8 +83,6 @@ fn seed_markdown_thing(
             datatype: ThingDatatype::Markdown,
             data: Some(json!({"markdown": markdown})),
             collection_uuid: collection_id.to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -98,209 +92,10 @@ fn seed_markdown_thing(
 }
 
 #[test]
-fn test_extract_cron_from_preconditions() {
-    let preconditions = vec![TriggerRule {
-        rule: "cron('0 18 * * *')".to_string(),
-        description: "Every day at 6 PM".to_string(),
-    }];
-    assert_eq!(
-        extract_cron_from_preconditions(&preconditions),
-        Some("0 18 * * *".to_string())
-    );
-
-    let no_cron = vec![TriggerRule {
-        rule: "in_time_range('09:00', '17:00')".to_string(),
-        description: "Business hours".to_string(),
-    }];
-    assert_eq!(extract_cron_from_preconditions(&no_cron), None);
-}
-
-#[test]
-fn test_extract_cron_with_double_quotes() {
-    let preconditions = vec![TriggerRule {
-        rule: r#"cron("0 9 * * *")"#.to_string(),
-        description: "Morning".to_string(),
-    }];
-    assert_eq!(
-        extract_cron_from_preconditions(&preconditions),
-        Some("0 9 * * *".to_string())
-    );
-}
-
-#[test]
-fn test_croner_accepts_posix_sunday_zero() {
-    assert!(Cron::from_str("0 10 * * 0,6").is_ok());
-}
-
-#[test]
-fn test_network_change_trigger_is_marked_due_on_connectivity_event() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
-
-    let trigger_uuid = "trg-network-change".to_string();
-    sdk.register_trigger(TriggerRegistration {
-        trigger_uuid: trigger_uuid.clone(),
-        name: "Network change trigger".to_string(),
-        version: "v1".to_string(),
-        precondition: vec![TriggerRule {
-            rule: "event('Connectivity')".to_string(),
-            description: "On connectivity change".to_string(),
-        }],
-        condition: vec![TriggerRule {
-            rule: "true".to_string(),
-            description: "Always true".to_string(),
-        }],
-        action_uuid: None,
-        action_args: json!({}),
-    })
-    .expect("register trigger");
-
-    // Event-driven triggers should not be due until an event arrives.
-    let before = sdk
-        .storage
-        .fetch_due_triggers(Utc::now())
-        .expect("fetch due triggers");
-    assert!(
-        before.iter().all(|t| t.trigger_uuid != trigger_uuid),
-        "event trigger must not be due immediately after registration"
-    );
-
-    let event_ts = Utc::now();
-    sdk.record_event(EventPayload {
-        event_type: "Connectivity".to_string(),
-        timestamp: event_ts,
-        metadata: serde_json::json!({
-            "message": "Update connectivity: wifi",
-            "states": ["wifi"]
-        }),
-    })
-    .expect("record connectivity event");
-
-    let after = sdk
-        .storage
-        .fetch_due_triggers(event_ts + chrono::Duration::seconds(1))
-        .expect("fetch due triggers after event");
-    assert!(
-        after.iter().any(|t| t.trigger_uuid == trigger_uuid),
-        "event trigger must be marked due after Connectivity event"
-    );
-}
-
-#[test]
-fn test_timer_trigger_is_due_after_registration_anchor() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
-
-    let trigger_uuid = "trg-timer".to_string();
-    sdk.register_trigger(TriggerRegistration {
-        trigger_uuid: trigger_uuid.clone(),
-        name: "Timer trigger".to_string(),
-        version: "v1".to_string(),
-        precondition: vec![TriggerRule {
-            rule: "timer('1s')".to_string(),
-            description: "One second after registration".to_string(),
-        }],
-        condition: vec![TriggerRule {
-            rule: "true".to_string(),
-            description: "Always true".to_string(),
-        }],
-        action_uuid: None,
-        action_args: json!({}),
-    })
-    .expect("register trigger");
-
-    let stored = sdk
-        .storage
-        .fetch_trigger(&trigger_uuid)
-        .expect("fetch trigger")
-        .expect("trigger exists");
-    assert!(
-        stored.next_fire.is_some(),
-        "timer trigger should have next_fire"
-    );
-    let stored_preconditions: Vec<TriggerRule> =
-        serde_json::from_str(&stored.precondition_json).expect("decode preconditions");
-    assert_eq!(stored_preconditions.len(), 1);
-    assert!(
-        stored_preconditions[0].rule.starts_with("timer(\"")
-            && stored_preconditions[0].rule.contains('T')
-            && !stored_preconditions[0].rule.contains("1s"),
-        "timer precondition should be normalized to an absolute RFC3339 timestamp: {}",
-        stored_preconditions[0].rule
-    );
-}
-
-#[test]
-fn test_events_list_between_json_accepts_local_naive_timestamps() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
-
-    let timestamp = Utc.with_ymd_and_hms(2026, 4, 2, 1, 15, 0).single().unwrap();
-    sdk.record_event(EventPayload {
-        event_type: "DesktopAppFocus".to_string(),
-        timestamp,
-        metadata: json!({ "window_title": "VSCode" }),
-    })
-    .expect("record event");
-
-    let output = sdk
-        .events_list_between_json("2026-04-02 09:00:00", "2026-04-02 09:30:00")
-        .expect("events between");
-    let events: Vec<EventPayload> = serde_json::from_str(&output).expect("parse events json");
-
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_type, "DesktopAppFocus");
-}
-
-#[test]
-fn test_events_abstract_json_reports_recorded_events() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
-
-    sdk.record_event(EventPayload {
-        event_type: "DesktopAppFocus".to_string(),
-        timestamp: Utc.with_ymd_and_hms(2026, 4, 2, 1, 0, 0).single().unwrap(),
-        metadata: json!({ "window_title": "VSCode" }),
-    })
-    .expect("record focus");
-    sdk.record_event(EventPayload {
-        event_type: "DesktopNetworkOnline".to_string(),
-        timestamp: Utc.with_ymd_and_hms(2026, 4, 2, 1, 5, 0).single().unwrap(),
-        metadata: json!({ "connected": true }),
-    })
-    .expect("record network");
-
-    let output = sdk.events_abstract_json(3).expect("abstract events");
-    let summary: serde_json::Value = serde_json::from_str(&output).expect("parse summary");
-    let hours = summary
-        .get("hours")
-        .and_then(|value| value.as_array())
-        .expect("hours array");
-
-    assert!(
-        !hours.is_empty(),
-        "abstract summary should include recorded hours"
-    );
-    let total_events = hours
-        .iter()
-        .map(|hour| {
-            hour.get("total_events")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0)
-        })
-        .sum::<u64>();
-    assert_eq!(total_events, 2);
-}
-
-#[test]
 fn document_set_cache_returns_fresh_result_after_same_sdk_write() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -337,8 +132,8 @@ fn document_set_cache_returns_fresh_result_after_same_sdk_write() {
 fn document_set_cache_invalidates_after_external_sdk_write() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk_reader = TriggerSdk::initialize(&db_path).expect("reader sdk init");
-    let sdk_writer = TriggerSdk::initialize(&db_path).expect("writer sdk init");
+    let sdk_reader = RemiSdk::initialize(&db_path).expect("reader sdk init");
+    let sdk_writer = RemiSdk::initialize(&db_path).expect("writer sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -376,7 +171,7 @@ fn document_set_cache_invalidates_after_external_sdk_write() {
 fn json_object_cache_returns_fresh_result_after_same_sdk_write_and_delete() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -484,8 +279,8 @@ fn json_object_cache_returns_fresh_result_after_same_sdk_write_and_delete() {
 fn json_object_cache_invalidates_after_external_sdk_write_and_delete() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk_reader = TriggerSdk::initialize(&db_path).expect("reader sdk init");
-    let sdk_writer = TriggerSdk::initialize(&db_path).expect("writer sdk init");
+    let sdk_reader = RemiSdk::initialize(&db_path).expect("reader sdk init");
+    let sdk_writer = RemiSdk::initialize(&db_path).expect("writer sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -558,7 +353,7 @@ fn json_object_cache_invalidates_after_external_sdk_write_and_delete() {
 fn things_upsert_thing_restores_json_object_entries_from_snapshot_payload() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -598,8 +393,6 @@ fn things_upsert_thing_restores_json_object_entries_from_snapshot_payload() {
             datatype: thing_snapshot.datatype.clone(),
             data: Some(thing_snapshot.data.clone()),
             collection_uuid: thing_snapshot.collection_uuid.clone(),
-            trigger_uuid: thing_snapshot.trigger_uuid.clone(),
-            trigger_uuid_patch: Default::default(),
             parent_uuid: thing_snapshot.parent_uuid.clone(),
             created_at: None,
             updated_at: None,
@@ -622,7 +415,7 @@ fn things_upsert_thing_restores_json_object_entries_from_snapshot_payload() {
 fn bootstrap_stash_round_trip_preserves_json_object_content_docs() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -708,7 +501,7 @@ fn bootstrap_stash_round_trip_preserves_json_object_content_docs() {
 fn bootstrap_stash_still_runs_after_done_flag_when_new_local_docs_exist() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -783,7 +576,7 @@ fn bootstrap_stash_still_runs_after_done_flag_when_new_local_docs_exist() {
 fn sdk_seeds_builtin_actions_and_exposes_action_vfs() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let actions = sdk.list_actions().expect("list actions");
 
     assert!(!actions.is_empty());
@@ -797,7 +590,7 @@ fn sdk_seeds_builtin_actions_and_exposes_action_vfs() {
     let metadata = sdk
         .read_virtual_path("device-test", "/action/builtin.echo_json/metadata.json")
         .expect("read action metadata");
-    assert!(metadata.content.contains("supports_trigger"));
+    assert!(metadata.content.contains("supports_manual"));
 }
 
 #[cfg(feature = "quickjs")]
@@ -805,7 +598,7 @@ fn sdk_seeds_builtin_actions_and_exposes_action_vfs() {
 fn actions_can_use_http_host_api() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let (url, server) = spawn_test_http_server();
 
     seed_test_action(
@@ -851,7 +644,7 @@ reply: response.body_json?.reply ?? null,
 fn actions_can_send_notifications_and_emit_events() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let mut notification_rx = sdk.notifications_subscribe();
 
     seed_test_action(
@@ -912,132 +705,10 @@ latestTitle: listed.items[0]?.title ?? null,
 }
 
 #[test]
-fn unbound_trigger_uses_default_notification_action() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
-    let trigger_id = "trigger-default-notify".to_string();
-
-    sdk.register_trigger(TriggerRegistration {
-        trigger_uuid: trigger_id.clone(),
-        name: "Water Plants".to_string(),
-        version: "v1".to_string(),
-        precondition: vec![TriggerRule {
-            rule: "event('ManualTest')".to_string(),
-            description: "manual test timing".to_string(),
-        }],
-        condition: Vec::new(),
-        action_uuid: None,
-        action_args: json!({}),
-    })
-    .expect("register trigger");
-
-    let trigger = sdk
-        .storage
-        .fetch_trigger(&trigger_id)
-        .expect("fetch trigger")
-        .expect("trigger exists");
-    let fire_time = Utc
-        .with_ymd_and_hms(2026, 4, 15, 10, 30, 0)
-        .single()
-        .unwrap();
-    let summary = sdk
-        .execute_trigger(&trigger, fire_time, TriggerRunType::Manual)
-        .expect("execute trigger");
-
-    assert!(summary.result);
-    assert!(summary.notification_id.is_some());
-
-    let invocation = sdk
-        .storage
-        .latest_action_invocation(DEFAULT_TRIGGER_NOTIFICATION_ACTION_UUID)
-        .expect("latest action invocation")
-        .expect("default notification invocation exists");
-    assert_eq!(invocation.source_kind, ActionInvocationSourceKind::Trigger);
-    assert_eq!(
-        invocation.source_entity_uuid.as_deref(),
-        Some(trigger_id.as_str())
-    );
-
-    let invocation_notification_id = invocation
-        .result_json
-        .as_ref()
-        .and_then(|value| value.get("notification_id"))
-        .and_then(Value::as_i64);
-    assert_eq!(summary.notification_id, invocation_notification_id);
-
-    let notifications = sdk
-        .storage
-        .list_notifications_by_category(&trigger_id, 10)
-        .expect("list notifications");
-    assert_eq!(notifications.len(), 1);
-    assert_eq!(
-        notifications[0].source,
-        crate::types::NotificationSource::Trigger
-    );
-    assert_eq!(notifications[0].title, "Water Plants");
-    assert_eq!(
-        notifications[0].body,
-        "触发器「Water Plants」已于 18:30 触发"
-    );
-}
-
-#[test]
-fn explicit_trigger_action_overrides_default_notification_action() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
-    let trigger_id = "trigger-custom-action".to_string();
-
-    sdk.register_trigger(TriggerRegistration {
-        trigger_uuid: trigger_id.clone(),
-        name: "Echo Trigger".to_string(),
-        version: "v1".to_string(),
-        precondition: vec![TriggerRule {
-            rule: "event('ManualTest')".to_string(),
-            description: "manual test timing".to_string(),
-        }],
-        condition: Vec::new(),
-        action_uuid: Some("builtin.echo_json".to_string()),
-        action_args: json!({ "scope": "custom-trigger" }),
-    })
-    .expect("register trigger");
-
-    let trigger = sdk
-        .storage
-        .fetch_trigger(&trigger_id)
-        .expect("fetch trigger")
-        .expect("trigger exists");
-    let summary = sdk
-        .execute_trigger(&trigger, Utc::now(), TriggerRunType::Manual)
-        .expect("execute trigger");
-
-    assert!(summary.result);
-    assert_eq!(summary.notification_id, None);
-
-    let notifications = sdk
-        .storage
-        .list_notifications_by_category(&trigger_id, 10)
-        .expect("list notifications");
-    assert!(notifications.is_empty());
-
-    let invocation = sdk
-        .storage
-        .latest_action_invocation("builtin.echo_json")
-        .expect("latest echo invocation")
-        .expect("echo invocation exists");
-    assert_eq!(invocation.source_kind, ActionInvocationSourceKind::Trigger);
-    assert_eq!(
-        invocation.source_entity_uuid.as_deref(),
-        Some(trigger_id.as_str())
-    );
-}
-
-#[test]
 fn collection_and_thing_action_bindings_are_exposed_and_invokable() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -1121,39 +792,13 @@ fn collection_and_thing_action_bindings_are_exposed_and_invokable() {
 fn virtual_fs_create_and_edit_support_action_bindings() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
-    let trigger_id = "trigger-test";
 
     seed_markdown_thing(&sdk, device_id, collection_id, thing_id, "before");
-    sdk.register_trigger(TriggerRegistration {
-        trigger_uuid: trigger_id.to_string(),
-        name: "Test Trigger".to_string(),
-        version: "v1".to_string(),
-        precondition: vec![TriggerRule {
-            rule: "true".to_string(),
-            description: "always".to_string(),
-        }],
-        condition: Vec::new(),
-        action_uuid: None,
-        action_args: json!({}),
-    })
-    .expect("register trigger");
 
-    sdk.create_virtual_path(
-        device_id,
-        &format!("/trigger/{trigger_id}"),
-        "action_binding",
-        Some("builtin.echo_json"),
-        None,
-        Some(r#"{"scope":"trigger"}"#),
-        None,
-        None,
-        None,
-    )
-    .expect("create trigger action binding");
     sdk.create_virtual_path(
         device_id,
         &format!("/collection/{collection_id}"),
@@ -1179,12 +824,6 @@ fn virtual_fs_create_and_edit_support_action_bindings() {
     )
     .expect("create thing action binding");
 
-    let trigger_action = sdk
-        .read_virtual_path(device_id, &format!("/trigger/{trigger_id}/action.json"))
-        .expect("read trigger action binding");
-    assert!(trigger_action.content.contains("builtin.echo_json"));
-    assert!(trigger_action.content.contains("scope"));
-
     sdk.edit_virtual_path(
         device_id,
         &format!("/collection/{collection_id}/actions.json"),
@@ -1201,16 +840,6 @@ fn virtual_fs_create_and_edit_support_action_bindings() {
         None,
     )
     .expect("edit collection action bindings");
-    sdk.edit_virtual_path(
-        device_id,
-        &format!("/trigger/{trigger_id}/action.json"),
-        "overwrite",
-        Some(&json!(null)),
-        None,
-        None,
-        None,
-    )
-    .expect("clear trigger action binding");
 
     let updated_collection_actions = sdk
         .read_virtual_path(
@@ -1223,9 +852,4 @@ fn virtual_fs_create_and_edit_support_action_bindings() {
             .content
             .contains("Collection Echo Updated")
     );
-
-    let cleared_trigger_action = sdk
-        .read_virtual_path(device_id, &format!("/trigger/{trigger_id}/action.json"))
-        .expect("read cleared trigger action binding");
-    assert_eq!(cleared_trigger_action.content.trim(), "null");
 }

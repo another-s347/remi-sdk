@@ -70,8 +70,6 @@ impl<'a> ThingsLocalService<'a> {
             events.extend(doc_set.delete_thing(old_collection, &upsert.uuid)?);
         }
 
-        let trigger =
-            crate::things_crdt::trigger_update_from_field_patch(upsert.trigger_uuid_patch());
         events.extend(doc_set.upsert_thing_meta_with_timestamps(
             &upsert.collection_uuid,
             &upsert.uuid,
@@ -79,7 +77,6 @@ impl<'a> ThingsLocalService<'a> {
             None,
             Some(upsert.title.clone()),
             upsert.parent_uuid.clone(),
-            trigger,
             upsert.created_at.clone(),
             upsert.updated_at.clone(),
         )?);
@@ -257,7 +254,6 @@ impl<'a> ThingsLocalService<'a> {
             Some(status_str.to_string()),
             None,
             None,
-            remi_things_crdt::TriggerUpdate::Noop,
         )?;
         let mut result =
             self.pipeline
@@ -358,7 +354,6 @@ impl<'a> ThingsLocalService<'a> {
                 Some(item.status.clone()),
                 Some(item.title.clone()),
                 target_parent_uuid,
-                crate::things_crdt::trigger_update_from_field_patch(item.trigger_uuid_patch()),
             )?);
             for entry in entries {
                 events.extend(doc_set.add_content_entry(
@@ -582,7 +577,6 @@ impl<'a> ThingsLocalService<'a> {
                 Some(item.status.clone()),
                 Some(item.title.clone()),
                 target_parent,
-                crate::things_crdt::trigger_update_from_field_patch(item.trigger_uuid_patch()),
             )?);
             for entry in entries {
                 events.extend(doc_set.add_content_entry(&target_collection, &item.uuid, entry)?);
@@ -698,7 +692,6 @@ impl<'a> ThingsLocalService<'a> {
             Some(thing.status.clone()),
             Some(thing.title.clone()),
             target_parent_uuid.clone(),
-            crate::things_crdt::trigger_update_from_field_patch(thing.trigger_uuid_patch()),
         )?);
 
         for entry in entries {
@@ -769,8 +762,6 @@ impl<'a> ThingsLocalService<'a> {
             datatype: datatype.unwrap_or(moved.datatype),
             data: None,
             collection_uuid: moved.collection_uuid,
-            trigger_uuid: moved.trigger_uuid,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: moved.parent_uuid,
             created_at: None,
             updated_at: None,
@@ -837,7 +828,6 @@ impl<'a> ThingsLocalService<'a> {
             Some(status_str.to_string()),
             None,
             None,
-            remi_things_crdt::TriggerUpdate::Noop,
         )?;
         let value = format!("Status updated: {} -> {}", thing_title, status_str);
         let mut result =

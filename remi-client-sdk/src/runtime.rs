@@ -1,99 +1,60 @@
 use crate::context_prompt;
-use crate::events_events::EventsEvent;
 use crate::notification_events::NotificationEvent;
 use crate::realtime::{RemiRealtimeEvent, SupabaseRealtimeManager};
+use crate::search::{
+    SearchChange, SearchConfig, SearchDocument, SearchIndexStatus, SearchIngestAction,
+    SearchIngestProvider, SearchQuery, SearchResult, SearchService,
+};
 use crate::storage::Storage;
 use crate::things_crdt::{
-    ContentEntry, ContentEntryUpdate, FieldPatch, ThingCollectionEntry, ThingCollectionUpsert,
-    ThingDatatype, ThingEntry, ThingUpsert, ThingsSnapshot, ThingsSnapshotState,
+    ContentEntry, ContentEntryUpdate, ThingCollectionEntry, ThingCollectionUpsert, ThingDatatype,
+    ThingEntry, ThingUpsert, ThingsSnapshot, ThingsSnapshotState,
 };
 use crate::things_events::ThingsEvent;
 use crate::things_local::{DirtyPolicy, ThingsMutationContext, ThingsMutationPipeline};
-use crate::trigger_events::TriggerEvent;
 use crate::types::{
-    ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, EventPayload,
-    NotificationResponseAction, StoredTrigger, ThingsChangeLogEntry, ThingsContentSnapshot,
-    ThingsUndoExecution, ThingsUndoPreview, TriggerExecutionSummary, TriggerInfo, TriggerLogLevel,
-    TriggerRegistration, TriggerReplaySummary, TriggerRule, TriggerRunType,
+    ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind,
+    NotificationResponseAction, ThingsChangeLogEntry, ThingsContentSnapshot, ThingsUndoExecution,
+    ThingsUndoPreview,
 };
 use anyhow::{Context, Result, anyhow};
 #[cfg(feature = "quickjs")]
 use base64::Engine;
-use chrono::{DateTime, Datelike, FixedOffset, Local, TimeZone, Timelike, Utc};
-use rule_trigger_engine::{
-    EvaluationContext, MonitoringEvent, PreconditionPolicy, Rule as EngineRule, TriggerConfig,
-};
+use chrono::Utc;
 use serde_json::to_string;
 use serde_json::{Value, json};
 use std::path::Path;
+#[cfg(feature = "quickjs")]
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 mod chat_facade;
 mod notifications_facade;
 mod path_tools;
-mod scheduling;
 mod things_documents;
 mod things_facade;
 pub use path_tools::VirtualFsCatResult;
-#[cfg(test)]
-use scheduling::extract_cron_from_preconditions;
-use scheduling::{
-    build_trigger_occurrences, describe_timing_sources, extract_repeat_frequency_from_conditions,
-    extract_timings_from_rules, filter_events_at_time, normalize_timer_preconditions,
-    repeat_min_gap, resolve_post_run_next_fire, resolve_registration_next_fire,
-    select_current_event,
-};
-
-const DEFAULT_TRIGGER_NOTIFICATION_ACTION_UUID: &str = "builtin.trigger_notification";
 
 #[cfg(feature = "quickjs")]
 const DEFAULT_ACTION_HTTP_TIMEOUT_MS: u64 = 30_000;
 
-const DEFAULT_TIMEZONE_OFFSET: &str = "+08:00";
-
-fn default_timezone() -> FixedOffset {
-    FixedOffset::from_str(DEFAULT_TIMEZONE_OFFSET).unwrap_or_else(|_| {
-        FixedOffset::east_opt(8 * 3600).expect("UTC+08:00 offset must be valid")
-    })
-}
-
-fn local_timezone_offset_string() -> String {
-    let seconds = Local::now().offset().local_minus_utc();
-    format_offset_seconds(seconds)
-}
-
-fn format_offset_seconds(total_seconds: i32) -> String {
-    let sign = if total_seconds < 0 { '-' } else { '+' };
-    let abs = total_seconds.abs();
-    let hours = abs / 3600;
-    let minutes = (abs % 3600) / 60;
-    format!("{sign}{hours:02}:{minutes:02}")
-}
-
-#[cfg(feature = "quickjs")]
-fn default_action_notification_source(
-    source_kind: &ActionInvocationSourceKind,
-) -> crate::types::NotificationSource {
-    match source_kind {
-        ActionInvocationSourceKind::Trigger => crate::types::NotificationSource::Trigger,
-        ActionInvocationSourceKind::CollectionManual
-        | ActionInvocationSourceKind::ThingManual
-        | ActionInvocationSourceKind::System => crate::types::NotificationSource::System,
-    }
-}
-
 #[cfg(feature = "quickjs")]
 fn parse_notification_source(value: &str) -> Result<crate::types::NotificationSource> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "trigger" => Ok(crate::types::NotificationSource::Trigger),
         "push" => Ok(crate::types::NotificationSource::Push),
         "system" => Ok(crate::types::NotificationSource::System),
         "chat" => Ok(crate::types::NotificationSource::Chat),
         other => anyhow::bail!("Unsupported notification source '{other}'"),
     }
+}
+
+#[cfg(feature = "quickjs")]
+fn default_action_notification_source(
+    _source_kind: &ActionInvocationSourceKind,
+) -> crate::types::NotificationSource {
+    crate::types::NotificationSource::System
 }
 
 #[cfg(feature = "quickjs")]
@@ -107,6 +68,7 @@ fn action_http_request_handler(action_uuid: String) -> crate::quickjs::QuickJsHo
 fn action_notify_send_handler(
     storage: Storage,
     notification_event_tx: broadcast::Sender<NotificationEvent>,
+    search: SearchService,
     action_uuid: String,
     source_kind: ActionInvocationSourceKind,
 ) -> crate::quickjs::QuickJsHostHandler {
@@ -138,6 +100,9 @@ fn action_notify_send_handler(
                 .unwrap_or_else(|| default_source.clone());
 
             let notification_id = storage.insert_notification(&source, &category, title, body)?;
+            if let Some(notification) = storage.get_notification(notification_id)? {
+                search.enqueue_document(SearchDocument::from_notification(&notification))?;
+            }
             let _ = notification_event_tx.send(NotificationEvent::Added {
                 notification_id,
                 category: category.clone(),
@@ -209,6 +174,7 @@ fn action_notify_list_handler(storage: Storage) -> crate::quickjs::QuickJsHostHa
 fn action_notify_mark_read_handler(
     storage: Storage,
     notification_event_tx: broadcast::Sender<NotificationEvent>,
+    search: SearchService,
 ) -> crate::quickjs::QuickJsHostHandler {
     Arc::new(move |request| {
         let result: Result<Value> = (|| {
@@ -218,6 +184,9 @@ fn action_notify_mark_read_handler(
                 .and_then(Value::as_i64)
                 .ok_or_else(|| anyhow!("notify.markRead requires notificationId"))?;
             storage.mark_notification_read(notification_id)?;
+            if let Some(notification) = storage.get_notification(notification_id)? {
+                search.enqueue_document(SearchDocument::from_notification(&notification))?;
+            }
             let _ = notification_event_tx.send(NotificationEvent::Read { notification_id });
             Ok(json!({ "notification_id": notification_id, "read": true }))
         })();
@@ -268,6 +237,7 @@ fn action_notify_mark_all_read_handler(
 fn action_notify_delete_category_handler(
     storage: Storage,
     notification_event_tx: broadcast::Sender<NotificationEvent>,
+    search: SearchService,
 ) -> crate::quickjs::QuickJsHostHandler {
     Arc::new(move |request| {
         let result: Result<Value> = (|| {
@@ -278,6 +248,10 @@ fn action_notify_delete_category_handler(
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("notify.deleteCategory requires category"))?;
             storage.delete_notifications_by_category(category)?;
+            search.enqueue_actions(vec![SearchIngestAction::DeleteByParent {
+                kind: crate::search::SearchEntityKind::Notification,
+                parent_id: category.to_string(),
+            }])?;
             let _ = notification_event_tx.send(NotificationEvent::CategoryDeleted {
                 category: category.to_string(),
             });
@@ -410,6 +384,7 @@ fn execute_action_http_request(action_uuid: &str, request: Value) -> Result<Valu
 fn build_action_quickjs_bindings(
     storage: &Storage,
     notification_event_tx: &broadcast::Sender<NotificationEvent>,
+    search: &SearchService,
     action: &ActionDefinition,
     execution_input: &Value,
 ) -> crate::quickjs::QuickJsHostBindings {
@@ -420,12 +395,14 @@ fn build_action_quickjs_bindings(
         .and_then(|value| ActionInvocationSourceKind::from_str(value).ok())
         .unwrap_or(ActionInvocationSourceKind::System);
     let storage = storage.clone();
+    let search = search.clone();
 
     crate::quickjs::QuickJsHostBindings {
         http_request: Some(action_http_request_handler(action.action_uuid.clone())),
         notify_send: Some(action_notify_send_handler(
             storage.clone(),
             notification_event_tx.clone(),
+            search.clone(),
             action.action_uuid.clone(),
             source_kind.clone(),
         )),
@@ -433,6 +410,7 @@ fn build_action_quickjs_bindings(
         notify_mark_read: Some(action_notify_mark_read_handler(
             storage.clone(),
             notification_event_tx.clone(),
+            search.clone(),
         )),
         notify_mark_category_read: Some(action_notify_mark_category_read_handler(
             storage.clone(),
@@ -445,146 +423,46 @@ fn build_action_quickjs_bindings(
         notify_delete_category: Some(action_notify_delete_category_handler(
             storage,
             notification_event_tx.clone(),
+            search,
         )),
     }
 }
 
-fn default_trigger_notification_args(trigger: &StoredTrigger, fire_time: DateTime<Utc>) -> Value {
-    json!({
-        "title": trigger.name,
-        "body": format!(
-            "触发器「{}」已于 {} 触发",
-            trigger.name,
-            fire_time.with_timezone(&default_timezone()).format("%H:%M")
-        ),
-        "category": trigger.trigger_uuid,
-        "source": "trigger",
-    })
-}
-
-fn notification_id_from_action_result(result: Option<&Value>) -> Option<i64> {
-    result
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("notification_id"))
-        .and_then(Value::as_i64)
-}
-
-fn parse_event_query_datetime(input: &str, end_of_day: bool) -> Result<DateTime<Utc>> {
-    let input = input.trim();
-    if input.is_empty() {
-        anyhow::bail!("timestamp must not be empty");
-    }
-
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(input) {
-        return Ok(parsed.with_timezone(&Utc));
-    }
-
-    let local_offset = FixedOffset::from_str(&local_timezone_offset_string())
-        .unwrap_or_else(|_| default_timezone());
-
-    if let Ok(parsed) = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d") {
-        let naive = if end_of_day {
-            parsed.and_hms_milli_opt(23, 59, 59, 999)
-        } else {
-            parsed.and_hms_opt(0, 0, 0)
-        }
-        .ok_or_else(|| anyhow!("Failed to resolve local date: {input}"))?;
-
-        return local_offset
-            .from_local_datetime(&naive)
-            .single()
-            .map(|dt| dt.with_timezone(&Utc))
-            .ok_or_else(|| {
-                anyhow!(
-                    "Failed to resolve local date with offset {}: {input}",
-                    local_offset
-                )
-            });
-    }
-
-    for pattern in [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(input, pattern) {
-            return local_offset
-                .from_local_datetime(&naive)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Failed to resolve local datetime with offset {}: {input}",
-                        local_offset
-                    )
-                });
-        }
-    }
-
-    anyhow::bail!(
-        "Invalid timestamp '{input}'. Expected RFC3339/ISO-8601 or local datetime like 2026-04-02 09:00:00"
-    )
-}
-
-pub trait TriggerCallback: Send + Sync {
-    fn on_trigger(&self, summary: &TriggerExecutionSummary) -> Result<()>;
-}
-
 pub struct NotificationCallback;
 
-impl TriggerCallback for NotificationCallback {
-    fn on_trigger(&self, summary: &TriggerExecutionSummary) -> Result<()> {
-        let fired_at_local = summary.fired_at.with_timezone(&default_timezone());
-        info!(
-            trigger_id = %summary.trigger_id,
-            name = %summary.name,
-            result = summary.result,
-            fired_at_utc = %summary.fired_at,
-            fired_at_local = %fired_at_local,
-            "Trigger fired"
-        );
-        Ok(())
-    }
-}
-
-pub struct TriggerSdk {
+pub struct RemiSdk {
     storage: Storage,
     things_event_tx: broadcast::Sender<ThingsEvent>,
-    trigger_event_tx: broadcast::Sender<TriggerEvent>,
-    events_event_tx: broadcast::Sender<EventsEvent>,
     notification_event_tx: broadcast::Sender<NotificationEvent>,
     realtime: Arc<SupabaseRealtimeManager>,
+    search: SearchService,
 }
 
-impl TriggerSdk {
+impl RemiSdk {
     pub fn initialize(db_path: impl AsRef<Path>) -> Result<Self> {
+        Self::initialize_with_search_config(db_path, SearchConfig::default())
+    }
+
+    pub fn initialize_with_search_config(
+        db_path: impl AsRef<Path>,
+        search_config: SearchConfig,
+    ) -> Result<Self> {
         let storage = Storage::new(db_path)?;
         storage.seed_builtin_actions(&crate::action_builtin::builtin_actions())?;
+        let search = SearchService::open(storage.clone(), search_config)?;
         let (things_event_tx, _rx) = broadcast::channel(2048);
-        let (trigger_event_tx, _rx) = broadcast::channel(2048);
-        let (events_event_tx, _rx) = broadcast::channel(2048);
         let (notification_event_tx, _rx) = broadcast::channel(2048);
         Ok(Self {
             storage,
             things_event_tx,
-            trigger_event_tx,
-            events_event_tx,
             notification_event_tx,
             realtime: Arc::new(SupabaseRealtimeManager::new()),
+            search,
         })
     }
 
     pub fn things_subscribe(&self) -> broadcast::Receiver<ThingsEvent> {
         self.things_event_tx.subscribe()
-    }
-
-    pub fn triggers_subscribe(&self) -> broadcast::Receiver<TriggerEvent> {
-        self.trigger_event_tx.subscribe()
-    }
-
-    pub fn events_subscribe(&self) -> broadcast::Receiver<EventsEvent> {
-        self.events_event_tx.subscribe()
     }
 
     pub fn notifications_subscribe(&self) -> broadcast::Receiver<NotificationEvent> {
@@ -599,18 +477,65 @@ impl TriggerSdk {
         self.realtime.subscribe()
     }
 
+    pub fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
+        self.search.search(query)
+    }
+
+    pub fn search_json(&self, query_json: &str) -> Result<String> {
+        let query: SearchQuery =
+            serde_json::from_str(query_json).context("Failed to parse search query JSON")?;
+        let results = self.search(query)?;
+        to_string(&results).context("Failed to serialize search results")
+    }
+
+    pub fn search_index_status(&self) -> SearchIndexStatus {
+        self.search.status()
+    }
+
+    pub fn search_index_status_json(&self) -> Result<String> {
+        to_string(&self.search_index_status()).context("Failed to serialize search index status")
+    }
+
+    pub fn register_search_provider(&self, provider: Arc<dyn SearchIngestProvider>) {
+        self.search.register_provider(provider);
+    }
+
+    pub fn enqueue_search_change(&self, change: SearchChange) -> Result<()> {
+        self.search.enqueue_change(change)
+    }
+
+    pub fn flush_search_index(&self) -> Result<()> {
+        self.search.flush()
+    }
+
+    pub fn rebuild_search_index(&self) -> Result<()> {
+        self.search.rebuild()
+    }
+
+    pub fn start_search_index_rebuild(&self) -> Result<()> {
+        self.search.enqueue_rebuild()
+    }
+
+    fn enqueue_search_document(&self, document: SearchDocument) {
+        if let Err(error) = self.search.enqueue_document(document) {
+            warn!(error = %error, "Failed to enqueue search document");
+        }
+    }
+
+    fn enqueue_search_actions(&self, actions: Vec<SearchIngestAction>) {
+        if let Err(error) = self.search.enqueue_actions(actions) {
+            warn!(error = %error, "Failed to enqueue search index actions");
+        }
+    }
+
+    fn enqueue_search_rebuild(&self) {
+        if let Err(error) = self.search.enqueue_rebuild() {
+            warn!(error = %error, "Failed to enqueue search index rebuild");
+        }
+    }
+
     pub(crate) fn things_storage(&self) -> &Storage {
         &self.storage
-    }
-
-    fn emit_trigger_event(&self, event: TriggerEvent) {
-        // Ignore send errors (no active subscribers).
-        let _ = self.trigger_event_tx.send(event);
-    }
-
-    fn emit_events_event(&self, event: EventsEvent) {
-        // Ignore send errors (no active subscribers).
-        let _ = self.events_event_tx.send(event);
     }
 
     fn emit_notification_event(&self, event: NotificationEvent) {
@@ -632,9 +557,8 @@ impl TriggerSdk {
         let context = ThingsMutationContext::maintenance(device_id, DirtyPolicy::MarkClean);
         ThingsMutationPipeline::with_broadcaster(&self.storage, &self.things_event_tx)
             .emit_data_wiped(&context)?;
-        self.emit_trigger_event(TriggerEvent::DataWiped);
-        self.emit_events_event(EventsEvent::DataWiped);
         self.emit_notification_event(NotificationEvent::DataWiped);
+        self.enqueue_search_actions(vec![SearchIngestAction::Clear]);
         info!(device_id = %device_id, "Wiped all local data and notified all event streams");
         Ok(())
     }
@@ -645,178 +569,6 @@ impl TriggerSdk {
         let claimed = self.storage.claim_anonymous_data(user_id)?;
         info!(user_id = %user_id, claimed, "Claimed anonymous data after login");
         Ok(())
-    }
-
-    pub fn register_trigger(&self, params: TriggerRegistration) -> Result<String> {
-        self.register_trigger_inner(params)
-    }
-
-    fn register_trigger_inner(&self, params: TriggerRegistration) -> Result<String> {
-        // UUID must be provided
-        if params.trigger_uuid.is_empty() {
-            anyhow::bail!("Trigger UUID is required but not provided.");
-        }
-
-        let now = Utc::now();
-        let local_timezone_offset = local_timezone_offset_string();
-        let normalized_precondition =
-            normalize_timer_preconditions(&params.precondition, now, &local_timezone_offset)?;
-        let params = TriggerRegistration {
-            precondition: normalized_precondition,
-            ..params
-        };
-
-        let timings = extract_timings_from_rules(&params.precondition, &params.condition)?;
-        let next_fire = resolve_registration_next_fire(&timings, now, &local_timezone_offset)?;
-
-        let trigger_uuid = params.trigger_uuid.clone();
-        let inserted_uuid = self.storage.insert_trigger(params, next_fire)?;
-        self.emit_trigger_event(TriggerEvent::TriggerUpsert { trigger_uuid });
-        Ok(inserted_uuid)
-    }
-
-    pub fn record_event(&self, event: EventPayload) -> Result<()> {
-        let event_type = event.event_type.clone();
-        let event_ts = event.timestamp;
-        self.storage.insert_event(&event)?;
-        self.schedule_event_triggers(&event_type, event_ts)?;
-
-        // Emit event notification to subscribers (e.g. UI).
-        self.emit_events_event(EventsEvent::EventRecorded {
-            event_type: event_type.clone(),
-            timestamp: event_ts.to_rfc3339(),
-        });
-
-        Ok(())
-    }
-
-    /// Schedule triggers that react to Connectivity events.
-    /// Prefer recording a Connectivity event via `record_event`; this shim exists for callers
-    /// that still separate event persistence from trigger scheduling.
-    pub fn schedule_network_change_triggers(&self, due_at: DateTime<Utc>) -> Result<()> {
-        self.schedule_event_triggers("Connectivity", due_at)
-    }
-
-    /// Schedule triggers that react to Location events.
-    /// Prefer recording a Location event via `record_event`; this shim exists for callers
-    /// that still separate event persistence from trigger scheduling.
-    pub fn schedule_location_change_triggers(&self, due_at: DateTime<Utc>) -> Result<()> {
-        self.schedule_event_triggers("Location", due_at)
-    }
-
-    fn schedule_event_triggers(&self, event_type: &str, due_at: DateTime<Utc>) -> Result<()> {
-        let triggers = self.storage.list_triggers()?;
-        for trigger in triggers {
-            let timings = extract_timings_from_rules(&trigger.precondition, &trigger.condition)
-                .with_context(|| {
-                    format!("Failed to inspect trigger {} timings", trigger.trigger_id)
-                })?;
-            let matches_event = timings.iter().any(|timing| {
-                matches!(
-                    timing,
-                    rule_trigger_engine::TriggerTiming::Event { event_type: configured }
-                        if configured == event_type
-                )
-            });
-            if !matches_event {
-                continue;
-            }
-
-            // Mark due; `run_due_triggers()` will execute it and reschedule appropriately.
-            self.storage
-                .mark_trigger_due(&trigger.trigger_id, due_at)
-                .with_context(|| format!("Failed to mark trigger due: {}", trigger.trigger_id))?;
-        }
-        Ok(())
-    }
-
-    pub fn next_deadline(&self, now_unix: Option<i64>) -> Result<Option<DateTime<Utc>>> {
-        self.storage.next_deadline(now_unix)
-    }
-
-    pub fn list_events_json(&self, limit: Option<u32>, offset: u32) -> Result<String> {
-        let events = self.storage.list_events(limit, offset)?;
-        let payloads: Vec<EventPayload> = events.into_iter().map(EventPayload::from).collect();
-        to_string(&payloads).context("Failed to serialize events")
-    }
-
-    pub fn events_list_between_json(&self, start_time: &str, end_time: &str) -> Result<String> {
-        let start = parse_event_query_datetime(start_time, false).context("Invalid start_time")?;
-        let end = parse_event_query_datetime(end_time, true).context("Invalid end_time")?;
-        if start > end {
-            anyhow::bail!("start_time must be <= end_time");
-        }
-
-        let events = self
-            .storage
-            .list_events_between_utc(start.timestamp(), end.timestamp())?;
-        let payloads: Vec<EventPayload> = events.into_iter().map(EventPayload::from).collect();
-        to_string(&payloads).context("Failed to serialize events")
-    }
-
-    pub fn events_abstract_json(&self, top_n: u32) -> Result<String> {
-        #[derive(Default)]
-        struct Bucket {
-            total: u32,
-            counts: std::collections::BTreeMap<String, u32>,
-        }
-
-        // For now, read all events and bucket by UTC hour.
-        // If needed, we can optimize with SQL aggregation.
-        let events = self.storage.list_events(None, 0)?;
-        let mut buckets: std::collections::BTreeMap<String, Bucket> =
-            std::collections::BTreeMap::new();
-
-        for ev in events {
-            let dt = ev.timestamp;
-            let hour_key = format!(
-                "{:04}-{:02}-{:02} {:02}:00",
-                dt.year(),
-                dt.month(),
-                dt.day(),
-                dt.hour()
-            );
-
-            let bucket = buckets.entry(hour_key).or_default();
-            bucket.total += 1;
-            let et = ev.event_type.clone();
-            *bucket.counts.entry(et).or_insert(0) += 1;
-        }
-
-        let mut hours_json = Vec::new();
-        for (hour, bucket) in buckets {
-            let mut top: Vec<(String, u32)> = bucket.counts.into_iter().collect();
-            top.sort_by(|a, b| b.1.cmp(&a.1));
-            top.truncate(top_n as usize);
-            let top_types: Vec<serde_json::Value> = top
-                .into_iter()
-                .map(|(t, c)| json!({"type": t, "count": c}))
-                .collect();
-            hours_json.push(json!({
-                "hour": hour,
-                "total_events": bucket.total,
-                "top_types": top_types,
-            }));
-        }
-
-        to_string(&json!({"hours": hours_json, "top_n": top_n})).context("Failed to serialize")
-    }
-
-    pub fn event_count(&self) -> Result<i64> {
-        self.storage.events_count()
-    }
-
-    pub fn event_time_range(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
-        self.storage.events_time_range()
-    }
-
-    pub fn list_triggers(&self) -> Result<Vec<TriggerInfo>> {
-        self.storage.list_triggers()
-    }
-
-    pub fn list_triggers_json(&self) -> Result<String> {
-        let triggers = self.list_triggers()?;
-        to_string(&triggers).context("Failed to serialize triggers")
     }
 
     pub fn list_actions(&self) -> Result<Vec<ActionDefinition>> {
@@ -916,113 +668,6 @@ impl TriggerSdk {
         Ok(record)
     }
 
-    /// Pause or resume a trigger. Returns the updated paused state.
-    pub fn set_trigger_paused(&self, trigger_uuid: &str, paused: bool) -> Result<()> {
-        self.storage.set_trigger_paused(trigger_uuid, paused)
-    }
-
-    /// Record a binding between a trigger and a thing/collection.
-    pub fn upsert_trigger_binding(
-        &self,
-        trigger_uuid: &str,
-        entity_type: &str,
-        entity_uuid: &str,
-    ) -> Result<()> {
-        self.storage
-            .upsert_trigger_binding(trigger_uuid, entity_type, entity_uuid)
-    }
-
-    /// Remove the `trigger_bindings` row for the given entity.
-    ///
-    /// Use this when unbinding a trigger so that `is_trigger_bound` correctly reflects
-    /// the new state before calling `delete_trigger_if_unbound`.
-    pub fn delete_trigger_binding(&self, entity_type: &str, entity_uuid: &str) -> Result<()> {
-        self.storage
-            .delete_trigger_binding(entity_type, entity_uuid)
-    }
-
-    /// Get the trigger UUID currently bound to a specific entity from the trigger_bindings table.
-    ///
-    /// This supplements the CRDT snapshot lookup and catches stale bindings that the CRDT
-    /// may not reflect (e.g., edge cases from migrations or non-CRDT binding paths).
-    pub fn get_trigger_for_entity(
-        &self,
-        entity_type: &str,
-        entity_uuid: &str,
-    ) -> Result<Option<String>> {
-        self.storage
-            .get_trigger_for_entity(entity_type, entity_uuid)
-    }
-
-    /// Delete a trigger definition if it is no longer bound to any entity.
-    ///
-    /// Returns `true` if the trigger was deleted.
-    pub fn delete_trigger_if_unbound(&self, trigger_uuid: &str) -> Result<bool> {
-        if self.storage.is_trigger_bound(trigger_uuid)? {
-            return Ok(false);
-        }
-
-        let deleted = self.storage.delete_trigger(trigger_uuid)?;
-        if deleted {
-            self.emit_trigger_event(TriggerEvent::TriggerDelete {
-                trigger_uuid: trigger_uuid.to_string(),
-            });
-        }
-
-        Ok(deleted)
-    }
-
-    /// Delete a trigger and all its bindings unconditionally.
-    ///
-    /// This is the correct method for an explicit user-initiated delete:
-    /// it clears the CRDT on every bound entity, removes all `trigger_bindings`
-    /// rows, deletes the trigger record, and emits the `TriggerDelete` event.
-    ///
-    /// Returns `true` if the trigger record was found and deleted.
-    pub fn delete_trigger_and_bindings(&self, device_id: &str, trigger_uuid: &str) -> Result<bool> {
-        // 1. Collect every entity currently bound to this trigger.
-        let bound = self.storage.get_entities_for_trigger(trigger_uuid)?;
-
-        // 2. Clear the CRDT trigger_uuid on each bound entity (best-effort).
-        for (entity_type, entity_uuid) in &bound {
-            let result = match entity_type.as_str() {
-                "collection" => self.things_patch_collection_trigger_uuid(
-                    device_id,
-                    entity_uuid,
-                    FieldPatch::Clear,
-                ),
-                "thing" => {
-                    self.things_patch_thing_trigger_uuid(device_id, entity_uuid, FieldPatch::Clear)
-                }
-                other => {
-                    tracing::warn!(entity_type = %other, "Unknown entity_type in trigger_bindings; skipping CRDT clear");
-                    Ok(())
-                }
-            };
-            if let Err(e) = result {
-                tracing::warn!(
-                    entity_type,
-                    entity_uuid,
-                    "Failed to clear CRDT trigger on entity: {e}"
-                );
-            }
-        }
-
-        // 3. Remove all trigger_bindings rows for this trigger.
-        let removed = self.storage.delete_all_bindings_for_trigger(trigger_uuid)?;
-        tracing::debug!(trigger_uuid, removed, "Removed trigger_bindings rows");
-
-        // 4. Delete the trigger record.
-        let deleted = self.storage.delete_trigger(trigger_uuid)?;
-        if deleted {
-            self.emit_trigger_event(TriggerEvent::TriggerDelete {
-                trigger_uuid: trigger_uuid.to_string(),
-            });
-        }
-
-        Ok(deleted)
-    }
-
     pub fn build_session_context(
         &self,
         device_id: &str,
@@ -1056,746 +701,19 @@ impl TriggerSdk {
         );
 
         let t2 = Instant::now();
-        let triggers = self.storage.list_triggers_for_context_prompt(50)?;
-        info!(
-            triggers = triggers.len(),
-            ms = t2.elapsed().as_millis(),
-            "build_session_context: list_triggers_for_context_prompt"
-        );
-
-        let t3 = Instant::now();
         let out = context_prompt::build_context_prompt_markdown(
             granted_permissions,
             &snapshot,
-            &triggers,
             active_context_json,
         )?;
         info!(
             out_bytes = out.len(),
-            ms = t3.elapsed().as_millis(),
+            ms = t2.elapsed().as_millis(),
             total_ms = total.elapsed().as_millis(),
             "build_session_context: build_context_prompt_markdown"
         );
 
         Ok(out)
-    }
-
-    pub fn run_due_triggers<C>(&self, callback: &C) -> Result<Vec<TriggerExecutionSummary>>
-    where
-        C: TriggerCallback,
-    {
-        let now = Utc::now();
-        let due = self.storage.fetch_due_triggers(now)?;
-        let mut summaries = Vec::new();
-
-        for trigger in due {
-            let fire_time = trigger.next_fire.unwrap_or(now);
-            let summary = self.execute_trigger(&trigger, fire_time, TriggerRunType::Automatic)?;
-            callback.on_trigger(&summary)?;
-
-            // Parse rules to determine the next schedule.
-            let precondition: Vec<TriggerRule> = serde_json::from_str(&trigger.precondition_json)
-                .context("Failed to parse precondition JSON")?;
-            let condition: Vec<TriggerRule> = serde_json::from_str(&trigger.condition_json)
-                .context("Failed to parse condition JSON")?;
-            let timings = extract_timings_from_rules(&precondition, &condition)?;
-
-            // Ensure the computed next fire is strictly after "now" even if this run is late.
-            let next_fire =
-                resolve_post_run_next_fire(&timings, fire_time, now, DEFAULT_TIMEZONE_OFFSET)?;
-
-            self.storage.update_next_fire(
-                &trigger.trigger_uuid,
-                summary.fired_at,
-                next_fire,
-                summary.result,
-            )?;
-
-            self.emit_trigger_event(TriggerEvent::TriggerFired {
-                trigger_uuid: trigger.trigger_uuid.clone(),
-                fired_at: summary.fired_at.to_rfc3339(),
-                next_fire: next_fire.map(|dt| dt.to_rfc3339()),
-                result: summary.result,
-            });
-            summaries.push(summary);
-        }
-
-        Ok(summaries)
-    }
-
-    /// Get things and collections bound to a trigger
-    fn get_bound_entities_for_trigger(
-        &self,
-        trigger_uuid: &str,
-    ) -> Result<(Vec<String>, Vec<String>)> {
-        let entities = self.storage.get_entities_for_trigger(trigger_uuid)?;
-        let mut thing_uuids = Vec::new();
-        let mut collection_uuids = Vec::new();
-
-        for (entity_type, entity_uuid) in entities {
-            match entity_type.as_str() {
-                "thing" => thing_uuids.push(entity_uuid),
-                "collection" => collection_uuids.push(entity_uuid),
-                _ => warn!(entity_type = %entity_type, "Unknown entity type in trigger binding"),
-            }
-        }
-
-        Ok((thing_uuids, collection_uuids))
-    }
-
-    /// Public API to get entities bound to a trigger (for FFI/Flutter bridge)
-    pub fn get_bound_entities_for_trigger_api(
-        &self,
-        trigger_uuid: &str,
-    ) -> Result<(Vec<String>, Vec<String>)> {
-        self.get_bound_entities_for_trigger(trigger_uuid)
-    }
-
-    pub fn run_trigger_now<C>(&self, trigger_uuid: &str, callback: &C) -> Result<bool>
-    where
-        C: TriggerCallback,
-    {
-        let trigger = self
-            .storage
-            .fetch_trigger(trigger_uuid)?
-            .ok_or_else(|| anyhow!("Trigger not found: {trigger_uuid}"))?;
-        let fire_time = Utc::now();
-        let summary = self.execute_trigger(&trigger, fire_time, TriggerRunType::Manual)?;
-        callback.on_trigger(&summary)?;
-
-        // Parse rules to determine the next schedule.
-        let precondition: Vec<TriggerRule> = serde_json::from_str(&trigger.precondition_json)
-            .context("Failed to parse precondition JSON")?;
-        let condition: Vec<TriggerRule> = serde_json::from_str(&trigger.condition_json)
-            .context("Failed to parse condition JSON")?;
-        let timings = extract_timings_from_rules(&precondition, &condition)?;
-        let next_fire =
-            resolve_post_run_next_fire(&timings, fire_time, fire_time, DEFAULT_TIMEZONE_OFFSET)?;
-
-        self.storage.update_next_fire(
-            &trigger.trigger_uuid,
-            summary.fired_at,
-            next_fire,
-            summary.result,
-        )?;
-
-        self.emit_trigger_event(TriggerEvent::TriggerFired {
-            trigger_uuid: trigger.trigger_uuid.clone(),
-            fired_at: summary.fired_at.to_rfc3339(),
-            next_fire: next_fire.map(|dt| dt.to_rfc3339()),
-            result: summary.result,
-        });
-
-        Ok(summary.result)
-    }
-
-    /// Simulate time advancing to a specific point and run all due triggers
-    /// Returns summaries of all executed triggers
-    pub fn simulate_time_to<C>(
-        &self,
-        target_time: DateTime<Utc>,
-        callback: &C,
-    ) -> Result<Vec<TriggerExecutionSummary>>
-    where
-        C: TriggerCallback,
-    {
-        let due = self.storage.fetch_due_triggers(target_time)?;
-        let mut summaries = Vec::new();
-
-        for trigger in due {
-            let fire_time = trigger.next_fire.unwrap_or(target_time);
-            let summary = self.execute_trigger(&trigger, fire_time, TriggerRunType::Automatic)?;
-            callback.on_trigger(&summary)?;
-
-            // Parse rules to determine the next schedule.
-            let precondition: Vec<TriggerRule> = serde_json::from_str(&trigger.precondition_json)
-                .context("Failed to parse precondition JSON")?;
-            let condition: Vec<TriggerRule> = serde_json::from_str(&trigger.condition_json)
-                .context("Failed to parse condition JSON")?;
-            let timings = extract_timings_from_rules(&precondition, &condition)?;
-
-            let next_fire = resolve_post_run_next_fire(
-                &timings,
-                fire_time,
-                target_time,
-                DEFAULT_TIMEZONE_OFFSET,
-            )?;
-            self.storage.update_next_fire(
-                &trigger.trigger_uuid,
-                summary.fired_at,
-                next_fire,
-                summary.result,
-            )?;
-
-            self.emit_trigger_event(TriggerEvent::TriggerFired {
-                trigger_uuid: trigger.trigger_uuid.clone(),
-                fired_at: summary.fired_at.to_rfc3339(),
-                next_fire: next_fire.map(|dt| dt.to_rfc3339()),
-                result: summary.result,
-            });
-            summaries.push(summary);
-        }
-
-        Ok(summaries)
-    }
-
-    pub fn replay_trigger(
-        &self,
-        trigger_uuid: &str,
-        start_iso: Option<String>,
-        end_iso: Option<String>,
-    ) -> Result<TriggerReplaySummary> {
-        let trigger = self
-            .storage
-            .fetch_trigger(trigger_uuid)?
-            .ok_or_else(|| anyhow!("Trigger not found: {trigger_uuid}"))?;
-
-        let range = self
-            .storage
-            .events_time_range()?
-            .ok_or_else(|| anyhow!("No events available for replay"))?;
-
-        let start = match start_iso {
-            Some(value) => DateTime::parse_from_rfc3339(&value)
-                .map(|dt| dt.with_timezone(&Utc))
-                .context("Invalid replay start timestamp")?,
-            None => range.0,
-        };
-
-        let end = match end_iso {
-            Some(value) => DateTime::parse_from_rfc3339(&value)
-                .map(|dt| dt.with_timezone(&Utc))
-                .context("Invalid replay end timestamp")?,
-            None => range.1,
-        };
-
-        if end <= start {
-            return Err(anyhow!("Replay window must be positive"));
-        }
-
-        // Parse rules to extract schedule metadata + optional repeat frequency.
-        let precondition: Vec<TriggerRule> = serde_json::from_str(&trigger.precondition_json)
-            .context("Failed to parse precondition JSON")?;
-        let condition: Vec<TriggerRule> = serde_json::from_str(&trigger.condition_json)
-            .context("Failed to parse condition JSON")?;
-        let timings = extract_timings_from_rules(&precondition, &condition)?;
-        let repeat_freq = extract_repeat_frequency_from_conditions(&condition);
-        let events: Vec<MonitoringEvent> = self
-            .storage
-            .list_events_between_utc(start.timestamp(), end.timestamp())?
-            .into_iter()
-            .map(|ev| MonitoringEvent {
-                event_type: ev.event_type,
-                timestamp: ev.timestamp.to_rfc3339(),
-                metadata_json: serde_json::to_string(&ev.metadata)
-                    .unwrap_or_else(|_| "{}".to_string()),
-            })
-            .collect();
-        let occurrences = build_trigger_occurrences(
-            &timings,
-            &events,
-            start,
-            end,
-            start,
-            DEFAULT_TIMEZONE_OFFSET,
-        )?;
-
-        let mut runs_considered = 0;
-        let mut runs_executed = 0;
-        let mut runs_succeeded = 0;
-        let mut last_success: Option<DateTime<Utc>> = None;
-
-        for fire_time in occurrences {
-            runs_considered += 1;
-
-            if let Some(last) = last_success {
-                if let Some(ref freq) = repeat_freq {
-                    if let Some(min_gap) = repeat_min_gap(freq) {
-                        if fire_time - last < min_gap {
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            let summary = self.execute_trigger(&trigger, fire_time, TriggerRunType::Replay)?;
-            runs_executed += 1;
-            if summary.result {
-                runs_succeeded += 1;
-                last_success = Some(summary.fired_at);
-            }
-        }
-
-        Ok(TriggerReplaySummary {
-            trigger_id: trigger.trigger_uuid.clone(),
-            start,
-            end,
-            runs_considered,
-            runs_executed,
-            runs_succeeded,
-        })
-    }
-
-    /// Test a trigger configuration against stored events without registering it.
-    ///
-    /// This is the SDK equivalent of the `trigger-test` CLI tool. It accepts a trigger
-    /// configuration (JSON) and simulates its execution over a time range using local events.
-    ///
-    /// # Arguments
-    /// * `trigger_json` - Full trigger configuration JSON (name, version, precondition, condition)
-    /// * `start_iso` - Optional start time (RFC3339); defaults to first event timestamp
-    /// * `end_iso` - Optional end time (RFC3339); defaults to last event timestamp
-    /// * `manual` - If true, runs once at end time ignoring precondition gates (like --manual flag)
-    ///
-    /// # Returns
-    /// JSON string containing simulation results
-    pub fn trigger_test_json(
-        &self,
-        trigger_json: &str,
-        start_iso: Option<String>,
-        end_iso: Option<String>,
-        manual: bool,
-    ) -> Result<String> {
-        use rule_trigger_engine::TriggerEvaluationReport;
-
-        // Parse the trigger configuration
-        let config = TriggerConfig::from_json(trigger_json)
-            .map_err(|e| anyhow!("Failed to parse trigger config: {e}"))?;
-
-        // Extract timing info from preconditions
-        let timings = config
-            .extract_timing()
-            .map_err(|e| anyhow!("Failed to extract timing: {e}"))?;
-
-        let timing_summary = describe_timing_sources(&timings);
-
-        let repeat_freq = timings.iter().find_map(|t| match t {
-            rule_trigger_engine::TriggerTiming::RepeatFrequency { frequency } => {
-                Some(frequency.clone())
-            }
-            _ => None,
-        });
-
-        // Get event time range
-        let range = self
-            .storage
-            .events_time_range()?
-            .ok_or_else(|| anyhow!("No events available for testing"))?;
-
-        let start_utc = match start_iso {
-            Some(value) => DateTime::parse_from_rfc3339(&value)
-                .map(|dt| dt.with_timezone(&Utc))
-                .context("Invalid start timestamp")?,
-            None => range.0,
-        };
-
-        let end_utc = match end_iso {
-            Some(value) => DateTime::parse_from_rfc3339(&value)
-                .map(|dt| dt.with_timezone(&Utc))
-                .context("Invalid end timestamp")?,
-            None => range.1,
-        };
-
-        if end_utc <= start_utc {
-            return Err(anyhow!("Test window must be positive (start < end)"));
-        }
-
-        // Fetch all events in range for simulation
-        let all_events: Vec<MonitoringEvent> = self
-            .storage
-            .list_events_between_utc(start_utc.timestamp(), end_utc.timestamp())?
-            .into_iter()
-            .map(|ev| MonitoringEvent {
-                event_type: ev.event_type,
-                timestamp: ev.timestamp.to_rfc3339(),
-                metadata_json: serde_json::to_string(&ev.metadata)
-                    .unwrap_or_else(|_| "{}".to_string()),
-            })
-            .collect();
-
-        let tz = default_timezone();
-
-        // Build result structure
-        #[derive(serde::Serialize)]
-        struct TriggerTestResult {
-            trigger_name: String,
-            timing_summary: String,
-            repeat_frequency: Option<String>,
-            start_time: String,
-            end_time: String,
-            mode: String,
-            events_in_window: usize,
-            runs: Vec<TriggerTestRun>,
-            summary: TriggerTestSummary,
-        }
-
-        #[derive(serde::Serialize)]
-        struct TriggerTestRun {
-            trigger_time: String,
-            result: bool,
-            status: String,
-            report: Option<TriggerEvaluationReport>,
-        }
-
-        #[derive(serde::Serialize)]
-        struct TriggerTestSummary {
-            runs_considered: u32,
-            runs_executed: u32,
-            runs_succeeded: u32,
-        }
-
-        let freq_str = repeat_freq.as_ref().map(|f| match f {
-            rule_trigger_engine::RepeatFrequency::PerDay(n) => format!("per_day({n})"),
-            rule_trigger_engine::RepeatFrequency::PerWeek(n) => format!("per_week({n})"),
-        });
-
-        // Manual mode: single evaluation at end time
-        if manual {
-            let visible_events = filter_events_at_time(&all_events, end_utc, 120);
-            let eval_ctx = EvaluationContext {
-                events: &visible_events,
-                current_event: select_current_event(&visible_events, &timings, end_utc),
-                current_time: end_utc.timestamp(),
-                timezone_offset: DEFAULT_TIMEZONE_OFFSET,
-            };
-
-            let report = config.evaluate_detailed(&eval_ctx, PreconditionPolicy::IgnoreGates);
-
-            let run = TriggerTestRun {
-                trigger_time: end_utc.with_timezone(&tz).to_rfc3339(),
-                result: report.overall_result,
-                status: "manual".to_string(),
-                report: Some(report.clone()),
-            };
-
-            let result = TriggerTestResult {
-                trigger_name: config.name,
-                timing_summary,
-                repeat_frequency: freq_str,
-                start_time: start_utc.to_rfc3339(),
-                end_time: end_utc.to_rfc3339(),
-                mode: "manual".to_string(),
-                events_in_window: all_events.len(),
-                runs: vec![run],
-                summary: TriggerTestSummary {
-                    runs_considered: 1,
-                    runs_executed: 1,
-                    runs_succeeded: if report.overall_result { 1 } else { 0 },
-                },
-            };
-
-            return serde_json::to_string(&result).context("Failed to serialize result");
-        }
-
-        let occurrences = build_trigger_occurrences(
-            &timings,
-            &all_events,
-            start_utc,
-            end_utc,
-            start_utc,
-            DEFAULT_TIMEZONE_OFFSET,
-        )?;
-
-        let mut runs = Vec::new();
-        let mut runs_considered = 0u32;
-        let mut runs_executed = 0u32;
-        let mut runs_succeeded = 0u32;
-        let mut last_success: Option<DateTime<Utc>> = None;
-
-        for trigger_time_utc in occurrences {
-            runs_considered += 1;
-
-            // Check repeat frequency gating
-            if let (Some(last), Some(freq)) = (last_success, &repeat_freq) {
-                if let Some(min_gap) = repeat_min_gap(freq) {
-                    if trigger_time_utc - last < min_gap {
-                        runs.push(TriggerTestRun {
-                            trigger_time: trigger_time_utc.with_timezone(&tz).to_rfc3339(),
-                            result: false,
-                            status: "skipped_repeat_frequency".to_string(),
-                            report: None,
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            let visible_events = filter_events_at_time(&all_events, trigger_time_utc, 120);
-            let eval_ctx = EvaluationContext {
-                events: &visible_events,
-                current_event: select_current_event(&visible_events, &timings, trigger_time_utc),
-                current_time: trigger_time_utc.timestamp(),
-                timezone_offset: DEFAULT_TIMEZONE_OFFSET,
-            };
-
-            let report = config.evaluate_detailed(&eval_ctx, PreconditionPolicy::EnforceAsGates);
-
-            let has_error = report
-                .preconditions
-                .iter()
-                .chain(report.conditions.iter())
-                .any(|e| e.error.is_some());
-
-            runs_executed += 1;
-            let fired = report.overall_result;
-            if fired {
-                runs_succeeded += 1;
-                last_success = Some(trigger_time_utc);
-            }
-
-            runs.push(TriggerTestRun {
-                trigger_time: trigger_time_utc.with_timezone(&tz).to_rfc3339(),
-                result: fired,
-                status: if has_error {
-                    "error".to_string()
-                } else if fired {
-                    "fired".to_string()
-                } else {
-                    "not_fired".to_string()
-                },
-                report: Some(report),
-            });
-        }
-
-        let result = TriggerTestResult {
-            trigger_name: config.name,
-            timing_summary,
-            repeat_frequency: freq_str,
-            start_time: start_utc.to_rfc3339(),
-            end_time: end_utc.to_rfc3339(),
-            mode: "automatic".to_string(),
-            events_in_window: all_events.len(),
-            runs,
-            summary: TriggerTestSummary {
-                runs_considered,
-                runs_executed,
-                runs_succeeded,
-            },
-        };
-
-        serde_json::to_string(&result).context("Failed to serialize result")
-    }
-
-    fn execute_trigger(
-        &self,
-        trigger: &StoredTrigger,
-        fire_time: DateTime<Utc>,
-        run_type: TriggerRunType,
-    ) -> Result<TriggerExecutionSummary> {
-        info!(
-            trigger_id = %trigger.trigger_uuid,
-            version = %trigger.version,
-            run_type = %run_type,
-            "Executing trigger with CEL evaluation"
-        );
-
-        const EVENT_LOOKBACK_MINUTES: u32 = 60 * 24 * 7;
-
-        // Parse JSON rules
-        let precondition: Vec<TriggerRule> = match serde_json::from_str(&trigger.precondition_json)
-        {
-            Ok(v) => v,
-            Err(err) => {
-                let payload = json!({
-                    "kind": "trigger_execution_report_v1",
-                    "trigger_uuid": trigger.trigger_uuid,
-                    "trigger_name": trigger.name,
-                    "fired_at": fire_time.to_rfc3339(),
-                    "run_type": run_type.as_str(),
-                    "error": format!("Failed to parse precondition JSON: {err}"),
-                });
-                let message = serde_json::to_string(&payload)
-                    .unwrap_or_else(|_| "{\"kind\":\"trigger_execution_report_v1\",\"error\":\"serialization_failed\"}".to_string());
-                let _ = self.storage.insert_trigger_log(
-                    &trigger.trigger_uuid,
-                    TriggerLogLevel::Error,
-                    &message,
-                    fire_time,
-                    run_type.clone(),
-                );
-                return Err(anyhow!("Failed to parse precondition JSON: {err}"));
-            }
-        };
-        let condition: Vec<TriggerRule> = match serde_json::from_str(&trigger.condition_json) {
-            Ok(v) => v,
-            Err(err) => {
-                let payload = json!({
-                    "kind": "trigger_execution_report_v1",
-                    "trigger_uuid": trigger.trigger_uuid,
-                    "trigger_name": trigger.name,
-                    "fired_at": fire_time.to_rfc3339(),
-                    "run_type": run_type.as_str(),
-                    "error": format!("Failed to parse condition JSON: {err}"),
-                });
-                let message = serde_json::to_string(&payload)
-                    .unwrap_or_else(|_| "{\"kind\":\"trigger_execution_report_v1\",\"error\":\"serialization_failed\"}".to_string());
-                let _ = self.storage.insert_trigger_log(
-                    &trigger.trigger_uuid,
-                    TriggerLogLevel::Error,
-                    &message,
-                    fire_time,
-                    run_type.clone(),
-                );
-                return Err(anyhow!("Failed to parse condition JSON: {err}"));
-            }
-        };
-
-        // Build rule-trigger-engine config
-        let precondition_rules: Vec<EngineRule> = precondition
-            .into_iter()
-            .map(|rule| EngineRule {
-                rule: rule.rule,
-                description: rule.description,
-            })
-            .collect();
-        let condition_rules: Vec<EngineRule> = condition
-            .into_iter()
-            .map(|rule| EngineRule {
-                rule: rule.rule,
-                description: rule.description,
-            })
-            .collect();
-
-        let config = TriggerConfig {
-            name: trigger.name.clone(),
-            version: trigger.version.clone(),
-            precondition: precondition_rules,
-            condition: condition_rules,
-        };
-        let timings = config.extract_timing().unwrap_or_default();
-
-        // Fetch recent events and map to engine event type
-        let recent = self
-            .storage
-            .fetch_events_recent(fire_time, EVENT_LOOKBACK_MINUTES)?;
-        let events: Vec<MonitoringEvent> = recent
-            .into_iter()
-            .map(|event| MonitoringEvent {
-                event_type: event.event_type,
-                timestamp: event.timestamp.to_rfc3339(),
-                metadata_json: serde_json::to_string(&event.metadata)
-                    .unwrap_or_else(|_| "{}".to_string()),
-            })
-            .collect();
-
-        let eval_ctx = EvaluationContext {
-            events: &events,
-            current_event: select_current_event(&events, &timings, fire_time),
-            current_time: fire_time.timestamp(),
-            timezone_offset: DEFAULT_TIMEZONE_OFFSET,
-        };
-
-        let precondition_policy = match run_type {
-            TriggerRunType::Manual => PreconditionPolicy::IgnoreGates,
-            TriggerRunType::Automatic | TriggerRunType::Replay => {
-                PreconditionPolicy::EnforceAsGates
-            }
-        };
-
-        let report = config.evaluate_detailed(&eval_ctx, precondition_policy);
-
-        // Persist one aggregated log entry per execution.
-        let has_errors = report
-            .preconditions
-            .iter()
-            .chain(report.conditions.iter())
-            .any(|e| e.error.is_some());
-        let level = if has_errors {
-            TriggerLogLevel::Error
-        } else {
-            TriggerLogLevel::Info
-        };
-        let payload = json!({
-            "kind": "trigger_execution_report_v1",
-            "trigger_uuid": trigger.trigger_uuid,
-            "trigger_name": trigger.name,
-            "fired_at": fire_time.to_rfc3339(),
-            "run_type": run_type.as_str(),
-            "report": report,
-        });
-        if let Ok(message) = serde_json::to_string(&payload) {
-            if let Err(err) = self.storage.insert_trigger_log(
-                &trigger.trigger_uuid,
-                level,
-                &message,
-                fire_time,
-                run_type.clone(),
-            ) {
-                error!(
-                    error = %err,
-                    trigger_id = %trigger.trigger_uuid,
-                    "Failed to persist trigger execution log entry"
-                );
-            }
-        }
-
-        if has_errors {
-            warn!(
-                trigger_id = %trigger.trigger_uuid,
-                "Trigger execution completed with evaluation errors"
-            );
-        }
-
-        let all_conditions_met = report.overall_result;
-
-        let notification_id = None;
-
-        if all_conditions_met {
-            let explicit_action_uuid = trigger
-                .action_uuid
-                .as_deref()
-                .filter(|value| !value.is_empty());
-            let action_uuid =
-                explicit_action_uuid.unwrap_or(DEFAULT_TRIGGER_NOTIFICATION_ACTION_UUID);
-            let action_args = if explicit_action_uuid.is_some() {
-                serde_json::from_str::<Value>(&trigger.action_args_json)
-                    .unwrap_or_else(|_| Value::Object(Default::default()))
-            } else {
-                default_trigger_notification_args(trigger, fire_time)
-            };
-
-            match self.execute_action_now(
-                action_uuid,
-                ActionInvocationSourceKind::Trigger,
-                Some("trigger"),
-                Some(&trigger.trigger_uuid),
-                action_args,
-                None,
-            ) {
-                Ok(record) => {
-                    let notification_id = if explicit_action_uuid.is_none() {
-                        notification_id_from_action_result(record.result_json.as_ref())
-                    } else {
-                        None
-                    };
-                    return Ok(TriggerExecutionSummary {
-                        trigger_id: trigger.trigger_uuid.clone(),
-                        name: trigger.name.clone(),
-                        fired_at: fire_time,
-                        result: all_conditions_met,
-                        run_type,
-                        notification_id,
-                    });
-                }
-                Err(error) => {
-                    warn!(
-                        trigger_id = %trigger.trigger_uuid,
-                        action_uuid = %action_uuid,
-                        error = %error,
-                        "Trigger fired but action execution failed"
-                    );
-                }
-            }
-        }
-
-        Ok(TriggerExecutionSummary {
-            trigger_id: trigger.trigger_uuid.clone(),
-            name: trigger.name.clone(),
-            fired_at: fire_time,
-            result: all_conditions_met,
-            run_type,
-            notification_id,
-        })
     }
 
     fn run_action_script(
@@ -1814,6 +732,7 @@ impl TriggerSdk {
             let bindings = build_action_quickjs_bindings(
                 &self.storage,
                 &self.notification_event_tx,
+                &self.search,
                 action,
                 execution_input,
             );

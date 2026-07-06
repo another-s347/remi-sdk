@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
-use remi_client_sdk::TriggerSdk;
+use remi_client_sdk::RemiSdk;
 use remi_client_sdk::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
 
 #[test]
 fn local_things_work_without_configuring_remote_transport() -> Result<()> {
     let temp_dir = tempfile::tempdir().context("tempdir")?;
     let db_path = temp_dir.path().join("offline-mode.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).context("init sdk")?;
+    let sdk = RemiSdk::initialize(&db_path).context("init sdk")?;
     let device_id = "offline-device";
 
     sdk.things_upsert_collection(
@@ -16,8 +16,6 @@ fn local_things_work_without_configuring_remote_transport() -> Result<()> {
             title: "Offline Inbox".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -30,8 +28,6 @@ fn local_things_work_without_configuring_remote_transport() -> Result<()> {
             datatype: ThingDatatype::Markdown,
             data: Some(serde_json::json!({ "markdown": "runs without a server" })),
             collection_uuid: "offline-inbox".to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,

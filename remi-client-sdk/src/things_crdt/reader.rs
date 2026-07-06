@@ -45,7 +45,6 @@ impl<'a> ThingsDomainReader<'a> {
                     status: "active".to_string(),
                     edit_clock: remi_things_crdt::view::EditClock::zero(),
                     tombstone: None,
-                    trigger: None,
                     attrs: None,
                 },
                 things: Vec::new(),
@@ -304,7 +303,6 @@ impl<'a> ThingsDomainReader<'a> {
                 continue;
             }
 
-            let trigger_uuid = desired_trigger_uuid(deleted, &coll_view.meta.trigger);
             let collection_timestamps = extract_entity_timestamps(coll_view.meta.attrs.as_ref());
             let collection_attrs = coll_view.meta.attrs.as_ref();
             collections.push(ThingCollectionEntry {
@@ -313,7 +311,6 @@ impl<'a> ThingsDomainReader<'a> {
                 collection_type: collection_type_from_attrs(collection_attrs),
                 app_id: attrs_string(collection_attrs, COLLECTION_APP_ID_ATTR_KEY),
                 archived_at: archived_at_from_attrs(collection_attrs),
-                trigger_uuid,
                 card_jsx: extract_collection_card_jsx(coll_view.meta.attrs.as_ref()),
                 created_at: parse_domain_datetime_or_unix_epoch(
                     &collection_timestamps.created_at.unwrap_or_default(),
@@ -336,7 +333,6 @@ impl<'a> ThingsDomainReader<'a> {
                     continue;
                 }
 
-                let thing_trigger = desired_trigger_uuid(thing_deleted, &thing_meta.trigger);
                 let thing_timestamps = extract_entity_timestamps(thing_meta.attrs.as_ref());
                 let thing_attrs = thing_meta.attrs.as_ref();
                 let content = if options.include_content {
@@ -357,7 +353,6 @@ impl<'a> ThingsDomainReader<'a> {
                     datatype: thing_meta.datatype.clone(),
                     data,
                     collection_uuid: coll_uuid.clone(),
-                    trigger_uuid: thing_trigger,
                     parent_uuid: thing_meta.parent_id.clone(),
                     archived_at: archived_at_from_attrs(thing_attrs),
                     archived_from_collection_uuid: attrs_string(

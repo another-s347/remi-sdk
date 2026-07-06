@@ -2,9 +2,7 @@ use anyhow::Result;
 use automerge::sync::SyncDoc;
 use automerge::{sync, AutoCommit};
 
-use remi_things_crdt::{
-    apply_op, extract_view, Block, Content, FieldPatch, Op, ThingDatatype, TriggerUpdate,
-};
+use remi_things_crdt::{apply_op, extract_view, Block, Content, FieldPatch, Op, ThingDatatype};
 
 fn server_apply_and_reply(
     doc_bytes: &[u8],
@@ -117,7 +115,6 @@ fn scenario_1_fast_cold_start_bootstrap_client_from_server() {
             id: "c1".to_string(),
             title: Some("Inbox".to_string()),
             status: Some("none".to_string()),
-            trigger: TriggerUpdate::Noop,
         },
     )
     .unwrap();
@@ -133,7 +130,6 @@ fn scenario_1_fast_cold_start_bootstrap_client_from_server() {
             status_timestamp_ms: None,
             title: Some("Server Thing".to_string()),
             parent_id: FieldPatch::Noop,
-            trigger: TriggerUpdate::Noop,
             content: Some(Content::Text {
                 blocks: vec![Block {
                     id: "b1".to_string(),
@@ -172,7 +168,6 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
             id: "c1".to_string(),
             title: Some("Inbox".to_string()),
             status: Some("none".to_string()),
-            trigger: TriggerUpdate::Noop,
         },
     )
     .unwrap();
@@ -187,7 +182,6 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
             status_timestamp_ms: None,
             title: Some("Only on server".to_string()),
             parent_id: FieldPatch::Noop,
-            trigger: TriggerUpdate::Noop,
             content: None,
         },
     )
@@ -202,7 +196,6 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
             id: "c1".to_string(),
             title: Some("Inbox".to_string()),
             status: Some("none".to_string()),
-            trigger: TriggerUpdate::Noop,
         },
     )
     .unwrap();
@@ -219,7 +212,6 @@ fn scenario_2_server_has_records_client_adds_before_cold_start_then_sync_merge()
                 status_timestamp_ms: None,
                 title: Some(format!("Client Thing {i}")),
                 parent_id: FieldPatch::Noop,
-                trigger: TriggerUpdate::Noop,
                 content: None,
             },
         )
@@ -254,7 +246,6 @@ fn scenario_3_basic_editing_ops_and_sync() {
             id: "c1".to_string(),
             title: Some("Inbox".to_string()),
             status: Some("none".to_string()),
-            trigger: TriggerUpdate::Noop,
         },
     )
     .unwrap();
@@ -269,7 +260,6 @@ fn scenario_3_basic_editing_ops_and_sync() {
             status_timestamp_ms: None,
             title: Some("Title".to_string()),
             parent_id: FieldPatch::Noop,
-            trigger: TriggerUpdate::Noop,
             content: Some(Content::Text {
                 blocks: vec![Block {
                     id: "b1".to_string(),
@@ -344,7 +334,6 @@ fn scenario_3_basic_editing_ops_and_sync() {
             status_timestamp_ms: None,
             title: None,
             parent_id: FieldPatch::Noop,
-            trigger: TriggerUpdate::Clear,
             content: None,
         },
     )

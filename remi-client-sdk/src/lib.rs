@@ -6,16 +6,17 @@ pub mod chat_client;
 mod context_prompt;
 mod crdt_sync;
 pub mod data_lifecycle;
-pub mod events_events;
 pub mod location_service;
 pub mod notification_events;
 pub mod profile;
+pub mod public_client;
 pub mod push_tokens;
 #[cfg(feature = "quickjs")]
 pub mod quickjs;
 pub mod realtime;
 pub mod remi_uri;
 mod runtime;
+pub mod search;
 #[cfg(feature = "sentry-integration")]
 pub mod sentry_integration;
 mod storage;
@@ -25,8 +26,6 @@ pub mod things_events;
 pub mod things_local;
 pub mod things_sync;
 pub mod transport;
-pub mod trigger_client;
-pub mod trigger_events;
 mod types;
 pub mod uri_resolver;
 
@@ -38,24 +37,25 @@ pub use location_service::{
 };
 pub use notification_events::NotificationEvent;
 pub use profile::{AvatarUploadInfo, MediaUploadInfo, ProfileClient, ProfileInfo};
+pub use public_client::RemiPublicClient;
 #[cfg(feature = "quickjs")]
 pub use quickjs::{QuickJsSmokeError, QuickJsSmokeOutput, quickjs_smoke_eval};
 pub use realtime::{RealtimeConfig, RemiRealtimeEvent, SupabaseRealtimeManager};
 pub use remi_uri::{RemiUri, RemiUriLocation, mime_from_extension};
-pub use runtime::{NotificationCallback, TriggerCallback, TriggerSdk, VirtualFsCatResult};
-pub use trigger_client::{ServerTriggerInfo, TriggerClient};
+pub use runtime::{NotificationCallback, RemiSdk, VirtualFsCatResult};
+pub use search::{
+    SearchBusinessFields, SearchChange, SearchConfig, SearchContentField, SearchDocument,
+    SearchEntityKind, SearchFieldFilter, SearchFilterGroup, SearchFilterLogic, SearchFilterOp,
+    SearchIndexPhase, SearchIndexStatus, SearchIngestAction, SearchIngestContext,
+    SearchIngestProvider, SearchQuery, SearchResult, default_search_index_path,
+};
 pub use types::{
     ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, AgentVersion,
     AgentVersionUpdate, ChatSession, ChatSessionUpdate, CoordinateSystem, EntityActionBinding,
     EvalDataset, EvalDatasetRun, EvalDatasetRunEval, EvalDatasetRunItem, EvalDatasetSession,
-    EvalDatasetUpdate, EventPayload, Location, LocationCacheEntry, NotificationEntry,
-    NotificationGroup, NotificationResponseAction, NotificationSource, ResolvedEntityActionBinding,
+    EvalDatasetUpdate, Location, LocationCacheEntry, NotificationEntry, NotificationGroup,
+    NotificationResponseAction, NotificationSource, ResolvedEntityActionBinding,
     ThingsChangeLogEntry, ThingsContentSnapshot, ThingsOperationType, ThingsUndoConflict,
     ThingsUndoConflictType, ThingsUndoExecution, ThingsUndoPreview, ThingsUndoResolutionOption,
-    TriggerExecutionSummary, TriggerLogEntry, TriggerLogLevel, TriggerRegistration,
-    TriggerReplaySummary, TriggerRule, TriggerRunType, VirtualFsNodeKind, VirtualFsProfileResult,
-    VirtualFsProfileStep, VirtualFsReadResult,
+    VirtualFsNodeKind, VirtualFsProfileResult, VirtualFsProfileStep, VirtualFsReadResult,
 };
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TriggerContext;

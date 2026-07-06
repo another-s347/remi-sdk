@@ -6,7 +6,7 @@ use remi_client_sdk::auth::{
     auth_clear_app_key, auth_get_bearer_auth_mode, auth_insert_bearer_header, auth_set_app_key,
 };
 use remi_client_sdk::transport::{configure_shared_transport, get_shared_transport};
-use remi_client_sdk::{SdkBearerAuthMode, TriggerClient};
+use remi_client_sdk::{RemiPublicClient, SdkBearerAuthMode};
 use serde_json::json;
 
 fn live_transport_config_json() -> String {
@@ -44,17 +44,14 @@ async fn live_app_key_smoke() -> Result<()> {
     );
 
     // Positive path: business RPCs should work in app-key-only mode.
-    let device_id = format!("copilot-app-key-smoke-{}", std::process::id());
-    let mut trigger_client = TriggerClient::new_with_shared_transport(String::new())
+    let mut public_client = RemiPublicClient::new_with_shared_transport(String::new())
         .await
-        .context("failed to create TriggerClient")?;
+        .context("failed to create RemiPublicClient")?;
 
-    let response = trigger_client
-        .list_triggers(device_id, None, 1, 0)
+    let _keys = public_client
+        .list_crdt_document_keys()
         .await
         .context("app key should be accepted for business RPCs")?;
-
-    assert!(response.total_count >= 0);
 
     // SDK boundary: application management helpers should reject app keys before the call.
     let mut app_keys_client = AppKeysClient::new_with_shared_transport(app_key.clone())

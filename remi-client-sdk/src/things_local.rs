@@ -50,7 +50,6 @@ mod undo;
 #[derive(Debug, Clone, Default)]
 pub struct ThingsDeleteCollectionOutcome {
     pub deleted: bool,
-    pub removed_triggers: Vec<String>,
 }
 
 pub type ThingsLocalEvent = ThingsMutationEvent;
@@ -218,7 +217,6 @@ impl<'a> ThingsLocalService<'a> {
             uuid,
             Some(title.to_string()),
             None,
-            remi_things_crdt::ops::TriggerUpdate::Noop,
             None,
             None,
         )?);
@@ -301,7 +299,6 @@ impl<'a> ThingsLocalService<'a> {
             &collection_uuid,
             Some(title),
             None,
-            remi_things_crdt::ops::TriggerUpdate::Noop,
             None,
             None,
         )?);
@@ -661,13 +658,10 @@ fn replay_missing_snapshot_into_document_set(
         }
 
         doc_set.get_or_init_collection(&collection.uuid)?;
-        let trigger =
-            crate::things_crdt::trigger_update_from_field_patch(collection.trigger_uuid_patch());
         events.extend(doc_set.update_collection_meta_with_timestamps(
             &collection.uuid,
             Some(collection.title.clone()),
             None,
-            trigger,
             Some(format_domain_datetime(collection.created_at)),
             Some(format_domain_datetime(collection.updated_at)),
         )?);
@@ -719,7 +713,6 @@ fn replay_snapshot_thing_into_document_set(
 ) -> Result<Vec<ThingsDocumentEvent>> {
     let content_registry = crate::things_crdt::ContentTypeRegistry::new();
     let (markdown, content_entries) = content_registry.extract_thing_snapshot_parts(&thing.data)?;
-    let trigger = crate::things_crdt::trigger_update_from_field_patch(thing.trigger_uuid_patch());
 
     let mut events = doc_set.upsert_thing_meta_with_timestamps(
         &thing.collection_uuid,
@@ -728,7 +721,6 @@ fn replay_snapshot_thing_into_document_set(
         Some(thing.status.as_str().to_string()),
         Some(thing.title.clone()),
         thing.parent_uuid.clone(),
-        trigger,
         Some(format_domain_datetime(thing.created_at)),
         Some(format_domain_datetime(thing.updated_at)),
     )?;

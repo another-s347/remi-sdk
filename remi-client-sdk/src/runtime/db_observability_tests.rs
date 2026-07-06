@@ -1,4 +1,4 @@
-use super::TriggerSdk;
+use super::RemiSdk;
 use crate::storage::{test_sqlite_counters_get, test_sqlite_counters_reset};
 use crate::things_crdt::{ThingCollectionUpsert, ThingDatatype, ThingUpsert};
 use std::time::Instant;
@@ -9,7 +9,7 @@ fn long_overwrite_writes_things_state_once() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
 
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -22,8 +22,6 @@ fn long_overwrite_writes_things_state_once() {
             title: "Test Collection".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -38,8 +36,6 @@ fn long_overwrite_writes_things_state_once() {
             datatype: ThingDatatype::Markdown,
             data: Some(serde_json::json!({"markdown": "hello"})),
             collection_uuid: collection_id.to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -125,7 +121,7 @@ fn long_overwrite_writes_things_state_once() {
 fn things_move_thing_facade_delegates_without_overwriting_content() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-move-facade";
 
     for (uuid, title) in [("source", "Source"), ("target", "Target")] {
@@ -136,8 +132,6 @@ fn things_move_thing_facade_delegates_without_overwriting_content() {
                 title: title.to_string(),
                 collection_type: Default::default(),
                 app_id: None,
-                trigger_uuid: None,
-                trigger_uuid_patch: Default::default(),
                 created_at: None,
                 updated_at: None,
             },
@@ -153,8 +147,6 @@ fn things_move_thing_facade_delegates_without_overwriting_content() {
             datatype: ThingDatatype::Markdown,
             data: Some(serde_json::json!({"markdown": "keep body"})),
             collection_uuid: "source".to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -170,8 +162,6 @@ fn things_move_thing_facade_delegates_without_overwriting_content() {
             datatype: ThingDatatype::Markdown,
             data: Some(serde_json::json!({"markdown": "parent body"})),
             collection_uuid: "target".to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,
@@ -199,7 +189,7 @@ fn long_overwrite_time_breakdown() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("sdk.sqlite3");
 
-    let sdk = TriggerSdk::initialize(&db_path).expect("sdk init");
+    let sdk = RemiSdk::initialize(&db_path).expect("sdk init");
     let device_id = "device-test";
     let collection_id = "col-test";
     let thing_id = "thing-test";
@@ -211,8 +201,6 @@ fn long_overwrite_time_breakdown() {
             title: "Test Collection".to_string(),
             collection_type: Default::default(),
             app_id: None,
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             created_at: None,
             updated_at: None,
         },
@@ -227,8 +215,6 @@ fn long_overwrite_time_breakdown() {
             datatype: ThingDatatype::Markdown,
             data: Some(serde_json::json!({"markdown": "hello"})),
             collection_uuid: collection_id.to_string(),
-            trigger_uuid: None,
-            trigger_uuid_patch: Default::default(),
             parent_uuid: None,
             created_at: None,
             updated_at: None,

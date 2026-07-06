@@ -1,8 +1,6 @@
 use anyhow::Result;
 
-use remi_things_crdt::{
-    apply_op, extract_view, Block, Content, FieldPatch, Op, ThingDatatype, TriggerUpdate,
-};
+use remi_things_crdt::{apply_op, extract_view, Block, Content, FieldPatch, Op, ThingDatatype};
 
 #[test]
 fn batch_upsert_matches_sequential_application() -> Result<()> {
@@ -16,7 +14,6 @@ fn batch_upsert_matches_sequential_application() -> Result<()> {
             id: "c1".to_string(),
             title: Some("Inbox".to_string()),
             status: Some("active".to_string()),
-            trigger: TriggerUpdate::Noop,
         },
     )?;
     doc_seq = apply_op(
@@ -30,7 +27,6 @@ fn batch_upsert_matches_sequential_application() -> Result<()> {
             status_timestamp_ms: None,
             title: Some("Hello".to_string()),
             parent_id: FieldPatch::Noop,
-            trigger: TriggerUpdate::Noop,
             content: Some(Content::Markdown {
                 blocks: vec![Block {
                     id: "main".to_string(),
@@ -52,7 +48,6 @@ fn batch_upsert_matches_sequential_application() -> Result<()> {
                     id: "c1".to_string(),
                     title: Some("Inbox".to_string()),
                     status: Some("active".to_string()),
-                    trigger: TriggerUpdate::Noop,
                 },
                 Op::UpsertThing {
                     id: "t1".to_string(),
@@ -62,7 +57,6 @@ fn batch_upsert_matches_sequential_application() -> Result<()> {
                     status_timestamp_ms: None,
                     title: Some("Hello".to_string()),
                     parent_id: FieldPatch::Noop,
-                    trigger: TriggerUpdate::Noop,
                     content: Some(Content::Markdown {
                         blocks: vec![Block {
                             id: "main".to_string(),

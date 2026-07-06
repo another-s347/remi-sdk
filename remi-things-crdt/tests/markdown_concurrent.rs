@@ -1,6 +1,6 @@
 use remi_things_crdt::{
     apply_op, decode_markdown_only_thing, extract_view, Block, Content, FieldPatch,
-    MarkdownOnlyDecoded, Op, ThingDatatype, TriggerUpdate,
+    MarkdownOnlyDecoded, Op, ThingDatatype,
 };
 
 use anyhow::Result;
@@ -113,7 +113,6 @@ fn concurrent_editing_markdown_converges() {
             id: "c1".to_string(),
             title: Some("Inbox".to_string()),
             status: Some("active".to_string()),
-            trigger: TriggerUpdate::Noop,
         },
     )
     .unwrap();
@@ -129,7 +128,6 @@ fn concurrent_editing_markdown_converges() {
             status_timestamp_ms: None,
             title: Some("Doc".to_string()),
             parent_id: FieldPatch::Noop,
-            trigger: TriggerUpdate::Noop,
             content: Some(Content::Markdown {
                 blocks: vec![Block {
                     id: "b1".to_string(),
