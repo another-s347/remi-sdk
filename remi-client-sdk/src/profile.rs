@@ -1,6 +1,9 @@
 use anyhow::Result;
 use once_cell::sync::OnceCell;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -216,6 +219,7 @@ impl ProfileClient {
 
 static PROFILE_CLIENT: OnceCell<Arc<RwLock<Option<Arc<ProfileClient>>>>> = OnceCell::new();
 static PROFILE_CACHE: OnceCell<Arc<RwLock<Option<CachedProfileEntry>>>> = OnceCell::new();
+static PROFILE_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn profile_client_store() -> &'static Arc<RwLock<Option<Arc<ProfileClient>>>> {
     PROFILE_CLIENT.get_or_init(|| Arc::new(RwLock::new(None)))
@@ -279,6 +283,7 @@ async fn profile_cache_update_avatar_for_current_user(avatar_url: &str) {
 }
 
 pub async fn profile_clear_cache() {
+    PROFILE_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
     *profile_cache_store().write().await = None;
 }
 
@@ -293,16 +298,21 @@ async fn get_profile_client() -> Result<Arc<ProfileClient>, String> {
 pub async fn configure_profile_client(config_json: String) -> Result<(), String> {
     let transport = configure_shared_transport(&config_json).await?;
     let client = Arc::new(ProfileClient::from_transport(transport));
+    PROFILE_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
     let mut guard = profile_client_store().write().await;
     guard.replace(client);
     Ok(())
 }
 
 pub async fn profile_refresh() -> Result<ProfileInfo, String> {
+    let generation = PROFILE_CACHE_GENERATION.load(Ordering::Acquire);
     let client = get_profile_client().await?;
     let resp = client.get_profile().await.map_err(|e| e.to_string())?;
     let profile = profile_info_from_response(resp);
-    profile_cache_set(&profile).await;
+    // An older in-flight refresh must not overwrite a newer update/logout.
+    if PROFILE_CACHE_GENERATION.load(Ordering::Acquire) == generation {
+        profile_cache_set(&profile).await;
+    }
     Ok(profile)
 }
 
@@ -320,6 +330,7 @@ pub async fn profile_update(
     display_name: Option<String>,
     avatar_url: Option<String>,
 ) -> Result<ProfileInfo, String> {
+    PROFILE_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
     let client = get_profile_client().await?;
     let resp = client
         .update_profile(display_name, avatar_url)
