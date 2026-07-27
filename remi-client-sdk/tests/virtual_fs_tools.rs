@@ -458,6 +458,44 @@ fn virtual_fs_returns_friendly_errors_for_invalid_and_unsupported_paths() -> Res
 }
 
 #[test]
+fn virtual_fs_hides_archived_collections_and_reports_repeat_delete() -> Result<()> {
+    let (_dir, sdk) = init_sdk()?;
+    let device_id = "device-archived-collection";
+    sdk.things_upsert_collection(
+        device_id,
+        ThingCollectionUpsert {
+            uuid: "c-archived".to_string(),
+            title: "Untitled collection".to_string(),
+            collection_type: Default::default(),
+            app_id: None,
+            created_at: None,
+            updated_at: None,
+        },
+    )?;
+
+    assert!(
+        sdk.ls_virtual_path(device_id, Some("/collection"))?
+            .contains("c-archived")
+    );
+
+    let first = sdk.delete_virtual_path(device_id, "/collection/c-archived")?;
+    assert_eq!(first["ok"], json!(true));
+    assert!(
+        !sdk.ls_virtual_path(device_id, Some("/collection"))?
+            .contains("c-archived")
+    );
+
+    let second = sdk.delete_virtual_path(device_id, "/collection/c-archived")?;
+    assert_eq!(second["ok"], json!(false));
+    assert_eq!(
+        second["message"],
+        json!("Collection 'c-archived' was already archived")
+    );
+
+    Ok(())
+}
+
+#[test]
 fn virtual_fs_json_object_entry_supports_split_data_schema_and_validation() -> Result<()> {
     let (_dir, sdk) = init_sdk()?;
     let device_id = "device-json";

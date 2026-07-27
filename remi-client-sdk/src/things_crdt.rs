@@ -813,6 +813,17 @@ impl ThingsDocumentSet {
             if deleted {
                 continue;
             }
+            let archived = view
+                .meta
+                .attrs
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|attrs| attrs.get(ARCHIVED_AT_ATTR_KEY))
+                .and_then(Value::as_str)
+                .is_some_and(|archived_at| !archived_at.trim().is_empty());
+            if archived {
+                continue;
+            }
 
             collection_views.push((key.uuid.clone(), view));
         }

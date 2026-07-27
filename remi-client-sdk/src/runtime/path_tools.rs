@@ -533,15 +533,30 @@ impl RemiSdk {
             VirtualPath::CollectionDir {
                 ref collection_uuid,
             } => {
+                let before = self.things_get_collection(device_id, collection_uuid)?;
                 let deleted = self.things_delete_collection(device_id, collection_uuid)?;
+                let message = if deleted {
+                    format!("Deleted collection '{}'", collection_uuid)
+                } else if before
+                    .as_ref()
+                    .is_some_and(|collection| collection.archived_at.is_some())
+                {
+                    format!("Collection '{}' was already archived", collection_uuid)
+                } else if before
+                    .as_ref()
+                    .is_some_and(|collection| collection.is_system_collection())
+                {
+                    format!(
+                        "Collection '{}' is a protected system collection",
+                        collection_uuid
+                    )
+                } else {
+                    format!("Collection '{}' was already absent", collection_uuid)
+                };
                 json!({
                     "ok": deleted,
                     "path": path,
-                    "message": if deleted {
-                        format!("Deleted collection '{}'", collection_uuid)
-                    } else {
-                        format!("Collection '{}' was already absent", collection_uuid)
-                    },
+                    "message": message,
                 })
             }
             VirtualPath::ThingDir {
@@ -1180,23 +1195,20 @@ impl RemiSdk {
             }
             VirtualPath::ActionOutputSchema { action_uuid } => {
                 let action = self.fetch_action_or_err(action_uuid, &display_path(path))?;
-                serde_json::to_string_pretty(
-                    &action.output_schema_json.unwrap_or(JsonValue::Null),
-                )
+                serde_json::to_string_pretty(&action.output_schema_json.unwrap_or(JsonValue::Null))
                     .context("Failed to serialize action output schema")
             }
             VirtualPath::ActionScript { action_uuid } => {
                 let action = self.fetch_action_or_err(action_uuid, &display_path(path))?;
                 Ok(action.script_source)
             }
-            VirtualPath::ActionLatestInvocation { action_uuid } => {
-                self.latest_action_invocation_json(action_uuid)?
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        serde_json::to_string_pretty(&JsonValue::Null)
-                            .context("Failed to serialize empty action invocation")
-                    })
-            }
+            VirtualPath::ActionLatestInvocation { action_uuid } => self
+                .latest_action_invocation_json(action_uuid)?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    serde_json::to_string_pretty(&JsonValue::Null)
+                        .context("Failed to serialize empty action invocation")
+                }),
             VirtualPath::CollectionActions { collection_uuid } => {
                 let bindings =
                     self.resolve_collection_action_bindings(device_id, collection_uuid)?;
