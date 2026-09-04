@@ -38,6 +38,13 @@ sentry = { version = "0.35", default-features = false, features = ["backtrace", 
 uuid = { version = "1.10", features = ["v4", "v5"] }
 async-trait = "0.1"
 rquickjs-core = { version = "0.8.1", default-features = false, features = ["bindgen", "rust-alloc"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
+weaver-core = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
+weaver-crypto = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
+weaver-net = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
+weaver-relay-core = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
+weaver-store = { git = "https://github.com/another-s347/weaver.git", rev = "3aa187501f20e68196cb403867950c3bdb2938b1" }
 
 [features]
 default = []

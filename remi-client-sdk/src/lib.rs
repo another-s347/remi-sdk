@@ -49,6 +49,11 @@ pub use search::{
     SearchIndexPhase, SearchIndexStatus, SearchIngestAction, SearchIngestContext,
     SearchIngestProvider, SearchQuery, SearchResult, default_search_index_path,
 };
+pub use transport::{
+    SharedTransportMode, WeaverEnrollmentOptions, WeaverEnrollmentResult, WeaverNetworkStatus,
+    WeaverTransportOptions, configure_shared_transport_with_weaver, redeem_weaver_invitation,
+    reset_weaver_identity,
+};
 pub use types::{
     ActionDefinition, ActionInvocationRecord, ActionInvocationSourceKind, AgentVersion,
     AgentVersionUpdate, ChatSession, ChatSessionUpdate, CoordinateSystem, EntityActionBinding,

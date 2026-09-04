@@ -31,20 +31,10 @@ impl ChatClient {
         server_url: impl Into<String>,
         bearer_token: impl Into<String>,
     ) -> Result<Self> {
-        let channel = Channel::from_shared(server_url.into())
-            .context("Invalid server URL")?
-            .connect()
+        crate::transport::configure_legacy_tcp_transport(server_url.into())
             .await
-            .context("Failed to connect to server")?;
-
-        let client = PublicServiceClient::new(channel);
-
-        Ok(Self {
-            client,
-            bearer_token: bearer_token.into(),
-            request_timeout: Duration::from_secs(120),
-            device_id: String::new(),
-        })
+            .map_err(anyhow::Error::msg)?;
+        Self::new_with_shared_transport(bearer_token).await
     }
 
     /// Create a chat client that reuses the shared transport configured for auth/telemetry.
